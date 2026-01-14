@@ -1,1 +1,18 @@
 # tenstorrent-python-driver
+
+
+## todos
+- [x] set up mmaps, TLB reads, autogen, ioctls, and other low level stuff
+- [x] get device up and recognized
+- [x] verify device is working with telemetry
+- [x] get harvesting data on the ARC tile using a NoC read 
+- [ ] good NoC abstraction for tensix tiles (can't address harvested columns) 
+- [ ] figure out address space for dram tiles / read and write data in vram 
+- [ ] set up compiler to work with dataflow and compute (SFPI) kernels. extract raw elf, figure out what to upload
+- [ ] figure out address space for tensix tiles 
+  - [ ] where to upload brisc, ncrisc, and trisc0,1,2 code 
+  - [ ] do we have to upload firmware for those cores too? 
+  - [ ] how to set up the CB
+  - [ ] how to kick off the work 
+  - [ ] how to poll for completion 
+- [ ] fast dispatch using the PIN_PAGES ioctl and a command queue on the host. apparently there are some prefetcher cores that aren't documented anywhere that are used for this 

@@ -17,8 +17,8 @@ CSM_START = 0x10000000
 CSM_END = 0x1007FFFF
 
 ## harvesting
-# in firmware, the cores are stored out of order, left edge, right edge, left edge, etc
-# the bitmask stored in firmware (0x1020 for blackhole) is applied to this order
+# in firmware, the cores (tensix tile columns) are stored out of order, left edge, right edge, left edge, etc
+# the bitmask stored in firmware (0x1020 on my p100a) is applied to this order
 HARVESTING_NOC_LOCATIONS = [1, 16, 2, 15, 3, 14, 4, 13, 5, 12, 6, 11, 7, 10]
 
 @dataclass
@@ -28,6 +28,7 @@ class Harvesting:
   the specific Tensix tiles (columns) and DRAM banks turned off vary per card. 
   noc writes and reads have to avoid these columns 
   certain dram banks also cannot be used
+  pcie is less important, but we might need it for something later
   """
   tensix_tile_cols: tuple[int, ...]
   dram_banks: tuple[int, ...]
@@ -36,7 +37,7 @@ class Harvesting:
 
   def __repr__(self) -> str:
     return (
-      "the following items are harvested (disabled): "
+      "the following items are harvested (disabled):\n"
       f"tensix_tile_cols={self.tensix_tile_cols} "
       f"dram_banks={self.dram_banks} "
       # on p100a, there is no ethernet interface
@@ -52,7 +53,6 @@ def _get_bdf_for_path(path: str) -> str | None:
     buf = bytearray(in_sz + out_sz)
     TenstorrentGetDeviceInfoIn.from_buffer(buf).output_size_bytes = out_sz
     fcntl.ioctl(fd, _IO(IOCTL_GET_DEVICE_INFO), buf, True)
-    if DEBUG: print(f"ioctl get device info: output_size_bytes: {out_sz}")
     os.close(fd)
     info = TenstorrentGetDeviceInfoOut.from_buffer(buf, in_sz)
     bdf = info.bus_dev_fn
@@ -70,7 +70,6 @@ class Device:
   def __init__(self, path: str = "/dev/tenstorrent/0"):
     self.path = path
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
-    if DEBUG: print(f"opened {path}, file descriptor {self.fd}")
     self._setup()
     self.harvesting = self.get_harvesting()
     print(self.harvesting)
@@ -168,7 +167,6 @@ class Device:
     if hasattr(self, 'mm0'): self.mm0.close()
     if hasattr(self, 'mm1'): self.mm1.close()
     os.close(self.fd)
-    if DEBUG: print("device closed")
 
   def get_bdf(self):
     in_sz = ctypes.sizeof(TenstorrentGetDeviceInfoIn)
@@ -195,10 +193,6 @@ class Device:
     # we don't need to mmap global vram (4+5), that is done through the dram tiles and the NoC
     self.mm0 = mmap.mmap(self.fd, bars[0].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[0].mapping_base)
     self.mm1 = mmap.mmap(self.fd, bars[2].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[2].mapping_base)
-
-    if DEBUG:
-      print(f"mapped bar 0 (0x{bars[0].mapping_size:x} bytes) at address 0x{bars[0].mapping_base:x}")
-      print(f"mapped bar 1 (0x{bars[2].mapping_size:x} bytes) at address 0x{bars[2].mapping_base:x}")
 
   def reset(self, dmc_reset:bool=False) -> int:
     # mirrors reset logic in tt-kmd/tools/reset.c
