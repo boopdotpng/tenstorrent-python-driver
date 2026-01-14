@@ -19,7 +19,7 @@ class TLBMode(Enum):
 
 @dataclass
 class TLBConfig:
-  addr: int # 64-bit offset into the target tile's local address space (l1 for tensix, bank offset for dram)
+  addr: int # 64-bit offset into the target tile's local address space (l1 for tensix, bank offset for dram, for example)
   start: Tuple[int, int] # start NoC coordinates
   end: Tuple[int, int] # end coordinates in NoC grid
   noc: Literal[0, 1] = 0
@@ -30,33 +30,32 @@ class TLBConfig:
     if (self.start == self.end) and self.mcast: print("warning: cannot multicast to one tile")
     ordering, static_vc = self.mode.value
     cfg = NocTlbConfig()
-    cfg.addr = self.addr
+    cfg.addr = self.addr #! you must align this with the size of the TLB window. 2MB or 4GB
     cfg.x_start, cfg.y_start = self.start
     cfg.x_end, cfg.y_end = self.end
     cfg.noc = self.noc
     cfg.mcast = int(self.mcast)
     cfg.ordering = ordering
     cfg.static_vc = static_vc
-    cfg.linked = 0  # never set this
+    cfg.linked = 0  # never modify this
     return cfg 
 
-class TLBSize:
+class TLBSize(Enum):
   MiB_2 = 1 << 21  # BAR 0: 201 available, for L1/registers
   GiB_4 = 1 << 32  # BAR 4: 8 available, for GDDR6 banks
 
 class TLBWindow:
-  def __init__(self, fd: int, size: int, config: TLBConfig):
+  def __init__(self, fd: int, size: TLBSize, config: TLBConfig):
     self.fd = fd
-    self.size = size
+    self.size = size.value
     self._allocate(size)
     self._mmap()
     self.configure(config)
 
-  def _allocate(self, size: int):
-    assert size in (TLBSize.MiB_2, TLBSize.GiB_4), "only 2 MiB and 4 GiB TLB sizes supported"
+  def _allocate(self, size: TLBSize):
     buf = bytearray(ctypes.sizeof(AllocateTlbIn) + ctypes.sizeof(AllocateTlbOut))
     cfg = AllocateTlbIn.from_buffer(buf)
-    cfg.size = size
+    cfg.size = size.value
     fcntl.ioctl(self.fd, _IO(IOCTL_ALLOCATE_TLB), buf, True)
     out = AllocateTlbOut.from_buffer(buf, ctypes.sizeof(AllocateTlbIn))
     self.tlb_id = out.tlb_id
@@ -71,16 +70,35 @@ class TLBWindow:
                         prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=self._mmap_offset_wc)
 
   def configure(self, config: TLBConfig):
+    assert (config.addr & (self.size - 1)) == 0, f"tlb addr must be {self.size}-aligned"
     buf = bytearray(ctypes.sizeof(ConfigureTlbIn) + ctypes.sizeof(NocTlbConfig))
     cfg = ConfigureTlbIn.from_buffer(buf)
     cfg.tlb_id = self.tlb_id
     cfg.config = config.to_struct()
     fcntl.ioctl(self.fd, _IO(IOCTL_CONFIGURE_TLB), buf, False)
 
-  def read32(self, offset: int) -> int:
+  def readi32(self, offset: int) -> int:
+    """
+    i32 read from the UC mmap
+    
+    :param self: Description
+    :param offset: Description
+    :type offset: int
+    :return: Description
+    :rtype: int
+    """
     return int.from_bytes(self.uc[offset:offset+4], 'little')
 
-  def write32(self, offset: int, value: int):
+  def writei32(self, offset: int, value: int):
+    """
+    i32 write to the UC mmap
+    
+    :param self: Description
+    :param offset: Description
+    :type offset: int
+    :param value: Description
+    :type value: int
+    """
     self.uc[offset:offset+4] = value.to_bytes(4, 'little')
 
   def free(self):
