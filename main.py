@@ -1,4 +1,5 @@
 from device import Device
+import sys
 
 def main():
   device = Device()

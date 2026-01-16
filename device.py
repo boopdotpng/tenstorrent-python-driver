@@ -1,25 +1,11 @@
+from __future__ import annotations
 import ctypes, fcntl, mmap, os, time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import ClassVar
 from autogen import *
 from tlb import TLBConfig, TLBWindow, TLBMode, TLBSize
-from helpers import DEBUG, _IO, align_down
-
-# device constants, shared between p100 and p150
-
-## ARC tile constants
-ARC_CORE = (8, 0) # from NoC 0
-ARC_NOC_BASE = 0x80000000 # arc noc xbar base (from tt-umd)
-SCRATCH_RAM_13 = 0x30434 # scratch_ram_13. u32 pointer to the telemetry struct table in csm
-# (core/control system memory) used by firmware 
-
-# memory bounds used by firmware on blackhole
-CSM_START = 0x10000000 
-CSM_END = 0x1007FFFF
-
-## harvesting
-# in firmware, the cores (tensix tile columns) are stored out of order, left edge, right edge, left edge, etc
-# the bitmask stored in firmware (0x1020 on my p100a) is applied to this order
-HARVESTING_NOC_LOCATIONS = [1, 16, 2, 15, 3, 14, 4, 13, 5, 12, 6, 11, 7, 10]
+from helpers import DEBUG, _IO, align_down, find_dev_by_bdf
+from configs import Arc, Dram, HARVESTING_NOC_LOCATIONS
 
 @dataclass
 class Harvesting:
@@ -45,26 +31,56 @@ class Harvesting:
       f"pcie={self.pcie}"
     )
 
-def _get_bdf_for_path(path: str) -> str | None:
-  try:
-    fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-    in_sz = ctypes.sizeof(TenstorrentGetDeviceInfoIn)
-    out_sz = ctypes.sizeof(TenstorrentGetDeviceInfoOut)
-    buf = bytearray(in_sz + out_sz)
-    TenstorrentGetDeviceInfoIn.from_buffer(buf).output_size_bytes = out_sz
-    fcntl.ioctl(fd, _IO(IOCTL_GET_DEVICE_INFO), buf, True)
-    os.close(fd)
-    info = TenstorrentGetDeviceInfoOut.from_buffer(buf, in_sz)
-    bdf = info.bus_dev_fn
-    return f"{info.pci_domain:04x}:{(bdf >> 8) & 0xFF:02x}:{(bdf >> 3) & 0x1F:02x}.{bdf & 0x7}"
-  except: return None
+@dataclass
+class TileGrid:
+  ARC: ClassVar[tuple[int, int]] = (8, 0)     # ARC tile on both boards
+  tensix: list[tuple[int, int]]               # all valid tensix (x, y) for unicast
+  tensix_mcast: list[tuple[int, int]]         # contiguous x-ranges for multicast: [(start_x, end_x), ...]
+  dram: list[tuple[int, int, int]]            # (bank_id, x, y) in bank order
+  _dram_by_bank: dict[int, list[tuple[int, int]]] = field(default_factory=dict, repr=False)
 
-def find_dev_by_bdf(target_bdf: str) -> str | None:
-  for entry in os.listdir("/dev/tenstorrent"):
-    if not entry.isdigit(): continue
-    path = f"/dev/tenstorrent/{entry}"
-    if _get_bdf_for_path(path) == target_bdf: return path
-  return None
+  @property
+  def dram_by_bank(self) -> dict[int, list[tuple[int, int]]]:
+    if not self._dram_by_bank:
+      for bank, x, y in self.dram:
+        self._dram_by_bank.setdefault(bank, []).append((x, y))
+    return self._dram_by_bank
+
+  @classmethod
+  def from_harvesting(cls, harvesting: Harvesting) -> TileGrid:
+    p100a = not harvesting.eth_cores
+    max_x = 14 if p100a else 16
+    dram_cols, l2cpu_col = (0, 9), 8
+
+    # valid tensix columns (exclude dram, l2cpu, and harvested)
+    disabled = set(harvesting.tensix_tile_cols)
+    tensix_cols = [x for x in range(max_x + 1) if x not in dram_cols and x != l2cpu_col and x not in disabled]
+
+    # unicast: all valid (x, y) pairs, y=2..11 for tensix
+    tensix = [(x, y) for x in tensix_cols for y in range(2, 12)]
+
+    # multicast: contiguous x-ranges
+    tensix_mcast = []
+    if tensix_cols:
+      start = prev = tensix_cols[0]
+      for x in tensix_cols[1:]:
+        if x != prev + 1:
+          tensix_mcast.append((start, prev))
+          start = x
+        prev = x
+      tensix_mcast.append((start, prev))
+
+    # dram tiles in bank order
+    dram = []
+    for bank in range(Dram.BANK_COUNT):
+      if bank in harvesting.dram_banks: continue
+      col = Dram.BANK_X[bank]
+      dram.extend((bank, col, y) for y in Dram.BANK_TILE_YS[bank])
+
+    return cls(tensix=tensix, tensix_mcast=tensix_mcast, dram=dram)
+
+# we have to upload firmware to the risc v cores inside the tensix tile every fresh boot,
+# since l1 is volatile 
 
 class Device:
   def __init__(self, path: str = "/dev/tenstorrent/0"):
@@ -72,24 +88,24 @@ class Device:
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
     self._setup()
     self.harvesting = self.get_harvesting()
-    print(self.harvesting)
+    self.tiles = TileGrid.from_harvesting(self.harvesting)
 
   def get_harvesting(self) -> Harvesting:
     tlb_config = TLBConfig(
-      addr = ARC_NOC_BASE,
-      start = ARC_CORE,
-      end = ARC_CORE,
+      addr = Arc.NOC_BASE,
+      start = TileGrid.ARC,
+      end = TileGrid.ARC,
       noc = 0,
       mcast = False,
       mode = TLBMode.STRICT
     )
 
     with TLBWindow(self.fd, TLBSize.MiB_2, tlb_config) as arc:
-      telem_struct_addr = arc.readi32(SCRATCH_RAM_13)
+      telem_struct_addr = arc.readi32(Arc.SCRATCH_RAM_13)
 
       if telem_struct_addr == 0:
         raise RuntimeError("telemetry struct address is 0 (ARC not ready)")
-      if not (CSM_START <= telem_struct_addr <= CSM_END):
+      if not (Arc.CSM_START <= telem_struct_addr <= Arc.CSM_END):
         raise RuntimeError(f"invalid telemetry struct address: 0x{telem_struct_addr:08x}")
 
       csm_base, csm_offset = align_down(telem_struct_addr, TLBSize.MiB_2.value)
@@ -111,10 +127,10 @@ class Device:
         off = tag_to_offset.get(tag)
         return default if off is None else arc.readi32(data_base + off * 4) 
 
-      tensix_enabled = read_tag(34, 0x3FFF)
-      eth_enabled = read_tag(35, 0x3FFF)
-      gddr_enabled = read_tag(36, 0xFF)
-      pcie_usage = read_tag(38, 0x5)
+      tensix_enabled = read_tag(Arc.TAG_TENSIX_ENABLED, 0x3FFF)
+      eth_enabled = read_tag(Arc.TAG_ETH_ENABLED, 0x3FFF)
+      gddr_enabled = read_tag(Arc.TAG_GDDR_ENABLED, 0xFF)
+      pcie_usage = read_tag(Arc.TAG_PCIE_USAGE, 0x5)
 
       pcie_disabled = tuple(
         i for i in (0, 1)
@@ -127,7 +143,7 @@ class Device:
       ))
 
       dram_banks = tuple(
-        bank for bank in range(8)
+        bank for bank in range(Dram.BANK_COUNT)
         if ((gddr_enabled >> bank) & 1) == 0
       )
 
