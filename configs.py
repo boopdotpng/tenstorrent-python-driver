@@ -1,21 +1,33 @@
 # Blackhole tile memory maps and constants
 # All addresses are offsets within the tile's local address space
 
+from enum import Enum
+
+class TLBSize(Enum):
+  MiB_2 = 1 << 21  # BAR 0: 201 available, for L1/registers
+  GiB_4 = 1 << 32  # BAR 4: 8 available, for GDDR6 banks
+
 class TensixL1:
   """Tensix tile L1 memory map (1536 KiB)"""
   SIZE = 0x180000
 
-  # Firmware regions
-  FIRMWARE_BASE = 0x000000
-  ZEROS_BASE = 0x002100
-  NCRISC_FIRMWARE_BASE = 0x005000
+  # Firmware + system-reserved regions (Blackhole, from tt-metal dev_mem_map.h)
+  MAILBOX_BASE = 0x000060
+  MAILBOX_SIZE = 0x0031e0  # 12768
+  ZEROS_BASE = 0x003240
+  ZEROS_SIZE = 0x000200
+  LLK_DEBUG_BASE = 0x003440
+  LLK_DEBUG_SIZE = 0x000400
+
+  BRISC_FIRMWARE_BASE = 0x003840
+  NCRISC_FIRMWARE_BASE = 0x005440
   NCRISC_L1_CODE_BASE = 0x009000
   NCRISC_LOCAL_MEM_BASE = 0x00c000
-  TRISC0_BASE = 0x00d000
+  TRISC0_BASE = 0x005a40
   TRISC0_LOCAL_MEM_BASE = 0x011000
-  TRISC1_BASE = 0x012000
+  TRISC1_BASE = 0x006040
   TRISC1_LOCAL_MEM_BASE = 0x015000
-  TRISC2_BASE = 0x016000
+  TRISC2_BASE = 0x006640
   TRISC2_LOCAL_MEM_BASE = 0x01a000
 
   # Runtime config
@@ -35,11 +47,22 @@ class TensixL1:
   DATA_BUFFER_SPACE_BASE = 0x037000
   L1_BARRIER_BASE = 0x16dfc0
 
-  # MMIO regions (tile-local view)
+  # Init scratch used for local-mem relocation (tt-metal dev_mem_map.h)
+  INIT_LOCAL_MAP_END = 0x0082b0
+  BRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x0082b0
+  NCRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x00a2b0
+  TRISC0_INIT_LOCAL_L1_BASE_SCRATCH = 0x00c2b0
+  TRISC1_INIT_LOCAL_L1_BASE_SCRATCH = 0x00d2b0
+  TRISC2_INIT_LOCAL_L1_BASE_SCRATCH = 0x00e2b0
+
+class TensixMMIO:
+  """Tensix tile-local MMIO / register space (tile-local view)"""
   LOCAL_RAM_START = 0xFFB00000
   LOCAL_RAM_END = 0xFFB01FFF
   NOC0_NIU_START = 0xFFB20000
   NOC1_NIU_START = 0xFFB30000
+  RISCV_DEBUG_REG_SOFT_RESET_0 = 0xFFB121B0
+  SOFT_RESET_ALL = 0x47800  # reset all 5 RISC-V cores (brisc, ncrisc, trisc0-2)
 
 
 class Arc:
@@ -62,6 +85,12 @@ class Arc:
   TAG_ETH_ENABLED = 35
   TAG_GDDR_ENABLED = 36
   TAG_PCIE_USAGE = 38
+
+  # Default telemetry values (all enabled)
+  DEFAULT_TENSIX_ENABLED = 0x3FFF  # 14 tensix columns
+  DEFAULT_ETH_ENABLED = 0x3FFF    # 14 ethernet cores
+  DEFAULT_GDDR_ENABLED = 0xFF     # 8 DRAM banks
+  DEFAULT_PCIE_USAGE = 0x5        # both PCIe instances enabled
 
 
 class Dram:

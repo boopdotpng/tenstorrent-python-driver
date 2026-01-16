@@ -1,4 +1,4 @@
-from helpers import TT_HOME
+from helpers import TT_HOME, DEBUG
 import subprocess 
 from enum import Enum, auto
 from dataclasses import dataclass
@@ -38,8 +38,5 @@ class Compiler:
   def compile_kernel(self, kern: str, processor: Processor):
     pass
 
-  """
-
-  """
   def compile_trisc(self, kern: str):
     pass

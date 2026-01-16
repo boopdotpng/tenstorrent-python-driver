@@ -21,3 +21,8 @@
 ## bring-up steps 
 1. open device, mmap bars, set up TLB windows 
 2. check if firmware is loaded (not sure how) and load the firmware for the RISC cores inside each tensix tile
+
+## tt-metal interop
+`TT_METAL_SKIP_LOADING_FW=1` skips tt-metal firmware writes, but tt-metal/UMD still puts the device into `LONG_IDLE` and asserts RISC resets on close, so firmware loaded by this repo may not persist between tt-metal runs. Use:
+- `python main.py` (upload firmware), then run your tt-metal/ttnn command
+- `python with_fw.py -- <cmd ...>` to upload firmware and exec a command in one step

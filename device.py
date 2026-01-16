@@ -4,38 +4,29 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 from autogen import *
 from tlb import TLBConfig, TLBWindow, TLBMode, TLBSize
-from helpers import DEBUG, _IO, align_down, find_dev_by_bdf
-from configs import Arc, Dram, HARVESTING_NOC_LOCATIONS
+from helpers import DEBUG, _IO, align_down, dprint, find_dev_by_bdf, format_bdf, load_pt_load
+from configs import Arc, Dram, HARVESTING_NOC_LOCATIONS, TensixL1, TensixMMIO
+from pathlib import Path
 
 @dataclass
 class Harvesting:
-  """
-  determine harvesting, very important
-  the specific Tensix tiles (columns) and DRAM banks turned off vary per card. 
-  noc writes and reads have to avoid these columns 
-  certain dram banks also cannot be used
-  pcie is less important, but we might need it for something later
-  """
-  tensix_tile_cols: tuple[int, ...]
-  dram_banks: tuple[int, ...]
-  eth_cores: bool
-  pcie: tuple[int, ...]
+  tensix_cols: tuple[int, ...]   # disabled tensix column x-coords
+  dram_banks: tuple[int, ...]    # disabled DRAM bank indices (0-7)
+  all_eth_disabled: bool         # True if all ethernet cores are disabled (p100a)
+  pcie: tuple[int, ...]          # disabled PCIe instances (0 or 1)
 
   def __repr__(self) -> str:
     return (
-      "the following items are harvested (disabled):\n"
-      f"tensix_tile_cols={self.tensix_tile_cols} "
-      f"dram_banks={self.dram_banks} "
-      # on p100a, there is no ethernet interface
-      f"eth_cores={"none" if self.eth_cores else "all"} "
-      f"pcie={self.pcie}"
+      f"Harvesting(tensix_cols={self.tensix_cols}, dram_banks={self.dram_banks}, "
+      f"eth={'disabled' if self.all_eth_disabled else 'enabled'}, pcie={self.pcie})"
     )
 
 @dataclass
 class TileGrid:
   ARC: ClassVar[tuple[int, int]] = (8, 0)     # ARC tile on both boards
+  TENSIX_Y: ClassVar[tuple[int, int]] = (2, 11)
   tensix: list[tuple[int, int]]               # all valid tensix (x, y) for unicast
-  tensix_mcast: list[tuple[int, int]]         # contiguous x-ranges for multicast: [(start_x, end_x), ...]
+  tensix_mcast: list[tuple[int, int]]         # multicast x-ranges: [(x0, x1), ...] (y is always TENSIX_Y)
   dram: list[tuple[int, int, int]]            # (bank_id, x, y) in bank order
   _dram_by_bank: dict[int, list[tuple[int, int]]] = field(default_factory=dict, repr=False)
 
@@ -48,16 +39,16 @@ class TileGrid:
 
   @classmethod
   def from_harvesting(cls, harvesting: Harvesting) -> TileGrid:
-    p100a = not harvesting.eth_cores
-    max_x = 14 if p100a else 16
     dram_cols, l2cpu_col = (0, 9), 8
+    max_x = 16  # blackhole physical X is always 0..16
 
     # valid tensix columns (exclude dram, l2cpu, and harvested)
-    disabled = set(harvesting.tensix_tile_cols)
+    disabled = set(harvesting.tensix_cols)
     tensix_cols = [x for x in range(max_x + 1) if x not in dram_cols and x != l2cpu_col and x not in disabled]
 
-    # unicast: all valid (x, y) pairs, y=2..11 for tensix
-    tensix = [(x, y) for x in tensix_cols for y in range(2, 12)]
+    # unicast: all valid (x, y) pairs
+    y0, y1 = cls.TENSIX_Y
+    tensix = [(x, y) for x in tensix_cols for y in range(y0, y1 + 1)]
 
     # multicast: contiguous x-ranges
     tensix_mcast = []
@@ -79,16 +70,78 @@ class TileGrid:
 
     return cls(tensix=tensix, tensix_mcast=tensix_mcast, dram=dram)
 
-# we have to upload firmware to the risc v cores inside the tensix tile every fresh boot,
-# since l1 is volatile 
-
 class Device:
   def __init__(self, path: str = "/dev/tenstorrent/0"):
     self.path = path
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
     self._setup()
     self.harvesting = self.get_harvesting()
+    dprint(self.harvesting)
     self.tiles = TileGrid.from_harvesting(self.harvesting)
+    dprint(f"tensix tiles: {len(self.tiles.tensix)}")
+
+    self.upload_firmware()
+  
+  def _load_firmware_elfs(self):
+    fw_dir = Path(__file__).parent / "riscv-firmware" / self.arch
+    names = ("brisc.elf", "ncrisc.elf", "trisc0.elf", "trisc1.elf", "trisc2.elf")
+    paths = [fw_dir / n for n in names]
+    for p in paths: assert p.is_file(), f"missing firmware ELF: {p}"
+    return [(p.name, load_pt_load(p)) for p in paths]
+
+  # we have to upload firmware to the risc v cores inside the tensix tile every fresh boot
+  def upload_firmware(self):
+    fw = self._load_firmware_elfs()
+
+    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
+
+    expected_base = {
+      "brisc.elf": TensixL1.BRISC_FIRMWARE_BASE,
+      "ncrisc.elf": TensixL1.NCRISC_FIRMWARE_BASE,
+      "trisc0.elf": TensixL1.TRISC0_BASE,
+      "trisc1.elf": TensixL1.TRISC1_BASE,
+      "trisc2.elf": TensixL1.TRISC2_BASE,
+    }
+
+    local_init = {
+      "brisc.elf": TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
+      "ncrisc.elf": TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH,
+      "trisc0.elf": TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH,
+      "trisc1.elf": TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH,
+      "trisc2.elf": TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
+    }
+
+    for name, segs in fw:
+      assert any(s.paddr == expected_base[name] for s in segs), f"{name}: missing expected pt_load base"
+
+    dprint(f"writing firmware to all tensix tiles ({len(self.tiles.tensix)} tiles)")
+    for name in expected_base:
+      dprint(f"- {name}: expected_base=0x{expected_base[name]:x} local_init=0x{local_init[name]:x}")
+
+    cfg = TLBConfig(addr=reg_base, noc=0, mcast=True, mode=TLBMode.STRICT)
+    with TLBWindow(self.fd, TLBSize.MiB_2) as win:
+      y0, y1 = self.tiles.TENSIX_Y
+      for x0, x1 in self.tiles.tensix_mcast:
+        cfg.start, cfg.end, cfg.mode, cfg.addr = (x0, y0), (x1, y1), TLBMode.STRICT, reg_base
+        win.configure(cfg)
+        win.writei32(reg_off, TensixMMIO.SOFT_RESET_ALL)
+
+        cfg.mode = TLBMode.ORDERED_BULK
+        for name, segs in fw:
+          init_base = local_init[name]
+          for seg in segs:
+            if not seg.data: continue
+
+            addr = seg.paddr
+            if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
+              addr = (addr - TensixMMIO.LOCAL_RAM_START) + init_base
+              assert 0 <= addr < TensixL1.SIZE
+
+            win.write(addr, seg.data, restore=False)
+
+        cfg.mode, cfg.addr = TLBMode.STRICT, reg_base
+        win.configure(cfg)
+        win.writei32(reg_off, 0x0)
 
   def get_harvesting(self) -> Harvesting:
     tlb_config = TLBConfig(
@@ -108,7 +161,7 @@ class Device:
       if not (Arc.CSM_START <= telem_struct_addr <= Arc.CSM_END):
         raise RuntimeError(f"invalid telemetry struct address: 0x{telem_struct_addr:08x}")
 
-      csm_base, csm_offset = align_down(telem_struct_addr, TLBSize.MiB_2.value)
+      csm_base, csm_offset = align_down(telem_struct_addr, TLBSize.MiB_2)
       
       # change base address so we can read the where the pointer points
       tlb_config.addr = csm_base
@@ -127,17 +180,17 @@ class Device:
         off = tag_to_offset.get(tag)
         return default if off is None else arc.readi32(data_base + off * 4) 
 
-      tensix_enabled = read_tag(Arc.TAG_TENSIX_ENABLED, 0x3FFF)
-      eth_enabled = read_tag(Arc.TAG_ETH_ENABLED, 0x3FFF)
-      gddr_enabled = read_tag(Arc.TAG_GDDR_ENABLED, 0xFF)
-      pcie_usage = read_tag(Arc.TAG_PCIE_USAGE, 0x5)
+      tensix_enabled = read_tag(Arc.TAG_TENSIX_ENABLED, Arc.DEFAULT_TENSIX_ENABLED)
+      eth_enabled = read_tag(Arc.TAG_ETH_ENABLED, Arc.DEFAULT_ETH_ENABLED)
+      gddr_enabled = read_tag(Arc.TAG_GDDR_ENABLED, Arc.DEFAULT_GDDR_ENABLED)
+      pcie_usage = read_tag(Arc.TAG_PCIE_USAGE, Arc.DEFAULT_PCIE_USAGE)
 
       pcie_disabled = tuple(
         i for i in (0, 1)
         if ((pcie_usage >> (i * 2)) & 0x3) != 1
       )
 
-      tensix_tile_cols = tuple(sorted(
+      tensix_cols = tuple(sorted(
         loc for pos, loc in enumerate(HARVESTING_NOC_LOCATIONS)
         if ((tensix_enabled >> pos) & 1) == 0
       ))
@@ -147,19 +200,13 @@ class Device:
         if ((gddr_enabled >> bank) & 1) == 0
       )
 
-      # blackhole p100a has all eth cores disabled, p150a has all on.
-      # check this info
-      eth_mask = (eth_enabled & ((1<<14) - 1)) != 0
+      all_eth_disabled = (eth_enabled & Arc.DEFAULT_ETH_ENABLED) == 0
 
     return Harvesting(
-      # disabled tensix columns in sorted noc x order.
-      tensix_tile_cols = tuple(tensix_tile_cols),
-      # disabled dram banks (0-7).
-      dram_banks = tuple(dram_banks),
-      # disabled ethernet cores (0-13).
-      eth_cores = eth_mask,
-      # disabled PCIe instances: 0 or 1.
-      pcie = tuple(pcie_disabled),
+      tensix_cols=tensix_cols,
+      dram_banks=dram_banks,
+      all_eth_disabled=all_eth_disabled,
+      pcie=pcie_disabled,
     )
 
   def _setup(self, retried: bool = False):
@@ -176,7 +223,7 @@ class Device:
       raise SystemExit("exiting")
 
 
-    print(f"opened blackhole {self.arch} at {self.get_bdf()}")
+    dprint(f"opened blackhole {self.arch} at {self.get_bdf()}")
     self._map_bars()
 
   def _close(self):
@@ -184,18 +231,14 @@ class Device:
     if hasattr(self, 'mm1'): self.mm1.close()
     os.close(self.fd)
 
-  def get_bdf(self):
+  def get_bdf(self) -> str:
     in_sz = ctypes.sizeof(TenstorrentGetDeviceInfoIn)
     out_sz = ctypes.sizeof(TenstorrentGetDeviceInfoOut)
     buf = bytearray(in_sz + out_sz)
     TenstorrentGetDeviceInfoIn.from_buffer(buf).output_size_bytes = out_sz
-
     fcntl.ioctl(self.fd, _IO(IOCTL_GET_DEVICE_INFO), buf, True)
-    # we only really care about the bdf
-    bdf = TenstorrentGetDeviceInfoOut.from_buffer(buf, in_sz).bus_dev_fn
-    pci_domain = TenstorrentGetDeviceInfoOut.from_buffer(buf, in_sz).pci_domain
-
-    return f"{pci_domain:04x}:{(bdf >> 8) & 0xFF:02x}:{(bdf >> 3) & 0x1F:02x}.{bdf & 0x7}"
+    info = TenstorrentGetDeviceInfoOut.from_buffer(buf, in_sz)
+    return format_bdf(info.pci_domain, info.bus_dev_fn)
 
   def _map_bars(self):
     in_sz = ctypes.sizeof(QueryMappingsIn)
@@ -210,20 +253,20 @@ class Device:
     self.mm0 = mmap.mmap(self.fd, bars[0].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[0].mapping_base)
     self.mm1 = mmap.mmap(self.fd, bars[2].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[2].mapping_base)
 
-  def reset(self, dmc_reset:bool=False) -> int:
-    # mirrors reset logic in tt-kmd/tools/reset.c
+  def reset(self, dmc_reset: bool = False) -> int:
     bdf = self.get_bdf()
-    print(f"resetting device {bdf}")
+    dprint(f"resetting device {bdf}")
     in_sz, out_sz = ctypes.sizeof(ResetDeviceIn), ctypes.sizeof(ResetDeviceOut)
 
     buf = bytearray(in_sz + out_sz)
     view = ResetDeviceIn.from_buffer(buf)
-    view.output_size_bytes, view.flags = out_sz, (TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET if dmc_reset else TENSTORRENT_RESET_DEVICE_ASIC_RESET)
+    view.output_size_bytes = out_sz
+    view.flags = TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET if dmc_reset else TENSTORRENT_RESET_DEVICE_ASIC_RESET
     fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
     self._close()
 
-    # poll for device to come back by bus, device, function from get_device_info (up to 10s)
-    print("waiting for device to come back...")
+    # poll for device to come back (up to 10s)
+    dprint("waiting for device to come back...")
     for _ in range(50):
       time.sleep(0.2)
       if (path := find_dev_by_bdf(bdf)):
@@ -232,18 +275,16 @@ class Device:
     else:
       raise RuntimeError(f"device {bdf} didn't come back after reset")
 
-    print(f"device back at {self.path}")
-
-    # open fd first, then POST_RESET to reinit hardware, then finish setup
+    dprint(f"device back at {self.path}")
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
 
-    # post reset: without this, the device doesn't init again
+    # POST_RESET reinits hardware
     buf = bytearray(in_sz + out_sz)
     view = ResetDeviceIn.from_buffer(buf)
     view.output_size_bytes, view.flags = out_sz, TENSTORRENT_RESET_DEVICE_POST_RESET
     fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
     result = ResetDeviceOut.from_buffer(buf, in_sz).result
-    print(f"reset complete, result={result}")
+    dprint(f"reset complete, result={result}")
 
     self._setup(retried=True)
     return result
