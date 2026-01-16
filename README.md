@@ -22,6 +22,20 @@
 1. open device, mmap bars, set up TLB windows 
 2. check if firmware is loaded (not sure how) and load the firmware for the RISC cores inside each tensix tile
 
+## debug levels
+Set `DEBUG=N` to control verbosity:
+| Level | Output |
+|-------|--------|
+| 0 | errors/warnings only |
+| 1 | progress (device opened, reset complete, writing firmware) |
+| 2 | details (harvesting, tile counts, fw map, mcast ranges) |
+| 3 | data (segment writes, TLB alloc/free, BAR sizes) |
+| 4 | trace (all ioctls, all TLB configures, memory writes) |
+
+```bash
+DEBUG=2 python main.py
+```
+
 ## tt-metal interop
 `TT_METAL_SKIP_LOADING_FW=1` skips tt-metal firmware writes, but tt-metal/UMD still puts the device into `LONG_IDLE` and asserts RISC resets on close, so firmware loaded by this repo may not persist between tt-metal runs. Use:
 - `python main.py` (upload firmware), then run your tt-metal/ttnn command

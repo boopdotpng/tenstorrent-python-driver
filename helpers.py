@@ -10,13 +10,24 @@ from configs import TLBSize
 # will test this later
 # used by default
 # SLOW_DISPATCH = int(os.environ.get("TT_SLOW_DISPATCH", 0)) == 1
-DEBUG = int(os.environ.get("DEBUG", 0)) >= 1
+DEBUG = int(os.environ.get("DEBUG", 0))
 TT_HOME = Path(os.environ.get("TT_HOME", ""))
 
-def dprint(*args, **kwargs):
-  if not DEBUG: return
-  kwargs.setdefault("file", sys.stderr)
-  print(*args, **kwargs)
+# DEBUG levels:
+#   0: errors/prompts only
+#   1: progress (device opened, reset complete, major ops)
+#   2: details (harvesting, tile counts, fw map, mcast ranges)
+#   3: data (segment writes, TLB alloc/free)
+#   4: trace (all ioctls, all TLB configures, memory writes)
+
+IOCTL_NAMES = {
+  0: "GET_DEVICE_INFO", 2: "QUERY_MAPPINGS", 6: "RESET_DEVICE",
+  7: "PIN_PAGES", 10: "UNPIN_PAGES", 11: "ALLOCATE_TLB",
+  12: "FREE_TLB", 13: "CONFIGURE_TLB",
+}
+
+def trace_ioctl(nr: int, extra: str = ""):
+  if DEBUG >= 4: print(f"ioctl: {IOCTL_NAMES.get(nr, nr)}{' ' + extra if extra else ''}")
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 

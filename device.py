@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 from autogen import *
 from tlb import TLBConfig, TLBWindow, TLBMode, TLBSize
-from helpers import DEBUG, _IO, align_down, dprint, find_dev_by_bdf, format_bdf, load_pt_load
+from helpers import DEBUG, _IO, align_down, find_dev_by_bdf, format_bdf, load_pt_load, trace_ioctl
 from configs import Arc, Dram, HARVESTING_NOC_LOCATIONS, TensixL1, TensixMMIO
 from pathlib import Path
 
@@ -76,9 +76,9 @@ class Device:
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
     self._setup()
     self.harvesting = self.get_harvesting()
-    dprint(self.harvesting)
+    if DEBUG >= 2: print(self.harvesting)
     self.tiles = TileGrid.from_harvesting(self.harvesting)
-    dprint(f"tensix tiles: {len(self.tiles.tensix)}")
+    if DEBUG >= 2: print(f"tensix tiles: {len(self.tiles.tensix)}")
 
     self.upload_firmware()
   
@@ -89,57 +89,53 @@ class Device:
     for p in paths: assert p.is_file(), f"missing firmware ELF: {p}"
     return [(p.name, load_pt_load(p)) for p in paths]
 
-  # we have to upload firmware to the risc v cores inside the tensix tile every fresh boot
+  # upload firmware to risc-v cores inside tensix tiles (required every fresh boot)
   def upload_firmware(self):
     fw = self._load_firmware_elfs()
-
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
 
-    expected_base = {
-      "brisc.elf": TensixL1.BRISC_FIRMWARE_BASE,
-      "ncrisc.elf": TensixL1.NCRISC_FIRMWARE_BASE,
-      "trisc0.elf": TensixL1.TRISC0_BASE,
-      "trisc1.elf": TensixL1.TRISC1_BASE,
-      "trisc2.elf": TensixL1.TRISC2_BASE,
-    }
-
-    local_init = {
-      "brisc.elf": TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
-      "ncrisc.elf": TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH,
-      "trisc0.elf": TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH,
-      "trisc1.elf": TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH,
-      "trisc2.elf": TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
+    # (expected_base, local_init_scratch) for each core
+    fw_map = {
+      "brisc.elf":  (TensixL1.BRISC_FIRMWARE_BASE,  TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH),
+      "ncrisc.elf": (TensixL1.NCRISC_FIRMWARE_BASE, TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH),
+      "trisc0.elf": (TensixL1.TRISC0_BASE,          TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH),
+      "trisc1.elf": (TensixL1.TRISC1_BASE,          TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH),
+      "trisc2.elf": (TensixL1.TRISC2_BASE,          TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH),
     }
 
     for name, segs in fw:
-      assert any(s.paddr == expected_base[name] for s in segs), f"{name}: missing expected pt_load base"
+      exp_base, _ = fw_map[name]
+      assert any(s.paddr == exp_base for s in segs), f"{name}: missing expected pt_load base"
 
-    dprint(f"writing firmware to all tensix tiles ({len(self.tiles.tensix)} tiles)")
-    for name in expected_base:
-      dprint(f"- {name}: expected_base=0x{expected_base[name]:x} local_init=0x{local_init[name]:x}")
+    if DEBUG >= 1: print(f"writing firmware to {len(self.tiles.tensix)} tensix tiles")
+    for name, (base, init) in fw_map.items():
+      if DEBUG >= 2: print(f"{name}: base=0x{base:x} init=0x{init:x}")
+
+    def remap_addr(addr: int, init_base: int) -> int:
+      if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
+        addr = (addr - TensixMMIO.LOCAL_RAM_START) + init_base
+        assert 0 <= addr < TensixL1.SIZE
+      return addr
 
     cfg = TLBConfig(addr=reg_base, noc=0, mcast=True, mode=TLBMode.STRICT)
+    y0, y1 = self.tiles.TENSIX_Y
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
-      y0, y1 = self.tiles.TENSIX_Y
       for x0, x1 in self.tiles.tensix_mcast:
-        cfg.start, cfg.end, cfg.mode, cfg.addr = (x0, y0), (x1, y1), TLBMode.STRICT, reg_base
+        if DEBUG >= 2: print(f"mcast x=[{x0},{x1}] y=[{y0},{y1}]")
+        cfg.start, cfg.end, cfg.addr, cfg.mode = (x0, y0), (x1, y1), reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.writei32(reg_off, TensixMMIO.SOFT_RESET_ALL)
 
         cfg.mode = TLBMode.ORDERED_BULK
         for name, segs in fw:
-          init_base = local_init[name]
+          _, init_base = fw_map[name]
           for seg in segs:
             if not seg.data: continue
-
-            addr = seg.paddr
-            if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
-              addr = (addr - TensixMMIO.LOCAL_RAM_START) + init_base
-              assert 0 <= addr < TensixL1.SIZE
-
+            addr = remap_addr(seg.paddr, init_base)
+            if DEBUG >= 3: print(f"{name}: 0x{seg.paddr:x} -> 0x{addr:x} ({len(seg.data)} bytes)")
             win.write(addr, seg.data, restore=False)
 
-        cfg.mode, cfg.addr = TLBMode.STRICT, reg_base
+        cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.writei32(reg_off, 0x0)
 
@@ -223,7 +219,7 @@ class Device:
       raise SystemExit("exiting")
 
 
-    dprint(f"opened blackhole {self.arch} at {self.get_bdf()}")
+    if DEBUG >= 1: print(f"opened blackhole {self.arch} at {self.get_bdf()}")
     self._map_bars()
 
   def _close(self):
@@ -236,6 +232,7 @@ class Device:
     out_sz = ctypes.sizeof(TenstorrentGetDeviceInfoOut)
     buf = bytearray(in_sz + out_sz)
     TenstorrentGetDeviceInfoIn.from_buffer(buf).output_size_bytes = out_sz
+    trace_ioctl(IOCTL_GET_DEVICE_INFO)
     fcntl.ioctl(self.fd, _IO(IOCTL_GET_DEVICE_INFO), buf, True)
     info = TenstorrentGetDeviceInfoOut.from_buffer(buf, in_sz)
     return format_bdf(info.pci_domain, info.bus_dev_fn)
@@ -245,6 +242,7 @@ class Device:
     out_sz = ctypes.sizeof(TenstorrentMapping)
     buf = bytearray(in_sz + 6 * out_sz)
     QueryMappingsIn.from_buffer(buf).output_mapping_count = 6
+    trace_ioctl(IOCTL_QUERY_MAPPINGS)
     fcntl.ioctl(self.fd, _IO(IOCTL_QUERY_MAPPINGS), buf, True)
     bars = list((TenstorrentMapping * 6).from_buffer(buf, in_sz))
 
@@ -252,21 +250,23 @@ class Device:
     # we don't need to mmap global vram (4+5), that is done through the dram tiles and the NoC
     self.mm0 = mmap.mmap(self.fd, bars[0].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[0].mapping_base)
     self.mm1 = mmap.mmap(self.fd, bars[2].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[2].mapping_base)
+    if DEBUG >= 3: print(f"mmap bar0: {bars[0].mapping_size:#x} bytes, bar2: {bars[2].mapping_size:#x} bytes")
 
   def reset(self, dmc_reset: bool = False) -> int:
     bdf = self.get_bdf()
-    dprint(f"resetting device {bdf}")
+    if DEBUG >= 1: print(f"resetting device {bdf}")
     in_sz, out_sz = ctypes.sizeof(ResetDeviceIn), ctypes.sizeof(ResetDeviceOut)
 
     buf = bytearray(in_sz + out_sz)
     view = ResetDeviceIn.from_buffer(buf)
     view.output_size_bytes = out_sz
     view.flags = TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET if dmc_reset else TENSTORRENT_RESET_DEVICE_ASIC_RESET
+    trace_ioctl(IOCTL_RESET_DEVICE, "ASIC_DMC_RESET" if dmc_reset else "ASIC_RESET")
     fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
     self._close()
 
     # poll for device to come back (up to 10s)
-    dprint("waiting for device to come back...")
+    if DEBUG >= 2: print("waiting for device to come back...")
     for _ in range(50):
       time.sleep(0.2)
       if (path := find_dev_by_bdf(bdf)):
@@ -275,16 +275,17 @@ class Device:
     else:
       raise RuntimeError(f"device {bdf} didn't come back after reset")
 
-    dprint(f"device back at {self.path}")
+    if DEBUG >= 2: print(f"device back at {self.path}")
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
 
     # POST_RESET reinits hardware
     buf = bytearray(in_sz + out_sz)
     view = ResetDeviceIn.from_buffer(buf)
     view.output_size_bytes, view.flags = out_sz, TENSTORRENT_RESET_DEVICE_POST_RESET
+    trace_ioctl(IOCTL_RESET_DEVICE, "POST_RESET")
     fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
     result = ResetDeviceOut.from_buffer(buf, in_sz).result
-    dprint(f"reset complete, result={result}")
+    if DEBUG >= 1: print(f"reset complete, result={result}")
 
     self._setup(retried=True)
     return result
