@@ -6,9 +6,9 @@
 - [x] get device up and recognized
 - [x] verify device is working with telemetry
 - [x] get harvesting data on the ARC tile using a NoC read 
-- [ ] good NoC abstraction for tensix tiles (can't address harvested columns) 
-- [ ] load firmware for Tensix tiles on device (not present after fresh boot), check if firmware is present
-- [ ] figure out address space for dram tiles / read and write data in vram 
+- [x] good NoC abstraction for tensix tiles (can't address harvested columns) 
+- [x] load firmware for Tensix tiles on device (not present after fresh boot), check if firmware is present
+- [x] figure out address space for dram tiles / read and write data in vram 
 - [ ] set up compiler to work with dataflow and compute (SFPI) kernels. extract raw elf, figure out what to upload
 - [ ] figure out address space for tensix tiles 
   - [ ] where to upload brisc, ncrisc, and trisc0,1,2 code 
@@ -36,10 +36,3 @@ Set `DEBUG=N` to control verbosity:
 ```bash
 DEBUG=2 python main.py
 ```
-
-## tt-metal interop
-`TT_METAL_SKIP_LOADING_FW=1` skips tt-metal firmware writes, but tt-metal/UMD still puts the device into
-`LONG_IDLE` and asserts RISC resets on close, so firmware loaded by this repo may not persist between
-tt-metal runs. Use:
-- `python main.py` (upload firmware), then run your tt-metal/ttnn command
-- `python with_fw.py -- <cmd ...>` to upload firmware and exec a command in one step
