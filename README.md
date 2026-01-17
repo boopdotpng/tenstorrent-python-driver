@@ -1,5 +1,5 @@
-# tenstorrent-python-driver
-
+# blackhole-py
+Replacing tenstorrent's software with 100% Python! No dependencies! 
 
 ## todos
 - [x] set up mmaps, TLB reads, autogen, ioctls, and other low level stuff

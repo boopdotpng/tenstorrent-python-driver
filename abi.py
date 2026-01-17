@@ -15,6 +15,10 @@ TENSTORRENT_RESET_DEVICE_ASIC_RESET = 4
 TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET = 5
 TENSTORRENT_RESET_DEVICE_POST_RESET = 6
 
+TENSTORRENT_PIN_PAGES_CONTIGUOUS = 1
+TENSTORRENT_PIN_PAGES_NOC_DMA = 2
+TENSTORRENT_PIN_PAGES_NOC_TOP_DOWN = 4
+
 class QueryMappingsIn(S):
   _fields_ = [("output_mapping_count", u32), ("reserved", u32)]
 
@@ -157,3 +161,291 @@ class GoMsg(ctypes.Union):
     ("all", u32),
     ("bits", GoMsgBits),
   ]
+
+class FastDispatch:
+  CQ_CMD_ALIGN = 16
+  L1_ALIGNMENT = 16
+  PCIE_ALIGNMENT = 64
+  DRAM_ALIGNMENT = 64
+
+  NOC_ADDR_NODE_ID_BITS = 6
+  NOC_XY_ENCODING_SHIFT = NOC_ADDR_NODE_ID_BITS
+  PCIE_NOC_BASE = 1 << 60
+
+  MAX_HUGEPAGE_SIZE = 1 << 30
+  MAX_DEV_CHANNEL_SIZE = 1 << 28
+  DEVICES_PER_UMD_CHANNEL = MAX_HUGEPAGE_SIZE // MAX_DEV_CHANNEL_SIZE
+
+  # tt-metal/tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_tensix.cpp
+  BH_TENSIX_DEFAULT_UNRESERVED = 0x196B0
+
+  # Device CQ L1 layout (tt-metal/tt_metal/impl/dispatch/command_queue_common.hpp,
+  # dispatch_settings.cpp, dispatch_mem_map.cpp). Relative to DEFAULT_UNRESERVED.
+  BH_PREFETCH_Q_RD_PTR_OFF = 0x00
+  BH_PREFETCH_Q_PCIE_RD_PTR_OFF = 0x04
+  BH_COMPLETION_Q_WR_PTR_OFF = 0x10
+  BH_COMPLETION_Q_RD_PTR_OFF = 0x20
+  BH_COMPLETION_Q0_LAST_EVENT_PTR_OFF = 0x30
+  BH_COMPLETION_Q1_LAST_EVENT_PTR_OFF = 0x40
+  BH_DISPATCH_S_SYNC_SEM_OFF = 0x50
+  BH_FABRIC_HEADER_RB_OFF = 0xD0
+  BH_FABRIC_SYNC_STATUS_OFF = 0x150
+  BH_UNRESERVED_OFF = 0x180
+
+  # Host CQ sysmem layout (CommandQueueHostAddrType * PCIE_ALIGNMENT).
+  HOST_ISSUE_Q_RD_OFF = 0 * PCIE_ALIGNMENT
+  HOST_ISSUE_Q_WR_OFF = 1 * PCIE_ALIGNMENT
+  HOST_COMPLETION_Q_WR_OFF = 2 * PCIE_ALIGNMENT
+  HOST_COMPLETION_Q_RD_OFF = 3 * PCIE_ALIGNMENT
+  HOST_UNRESERVED_OFF = 4 * PCIE_ALIGNMENT
+
+  # Default worker settings (tt-metal/tt_metal/impl/dispatch/util/dispatch_settings.cpp).
+  PREFETCH_Q_ENTRY_BYTES = 2  # uint16_t
+  PREFETCH_Q_ENTRIES_WORKER_DEFAULT = 1534
+  PREFETCH_MAX_CMD_SIZE = 128 * 1024
+  PREFETCH_CMDDAT_Q_SIZE = 256 * 1024
+  PREFETCH_SCRATCH_DB_SIZE = 128 * 1024
+  PREFETCH_RINGBUFFER_SIZE = 1024 * 1024
+
+class CQPrefetchCmdId:
+  ILLEGAL = 0
+  RELAY_LINEAR = 1
+  RELAY_LINEAR_H = 2
+  RELAY_PAGED = 3
+  RELAY_PAGED_PACKED = 4
+  RELAY_INLINE = 5
+  RELAY_INLINE_NOFLUSH = 6
+  EXEC_BUF = 7
+  EXEC_BUF_END = 8
+  STALL = 9
+  DEBUG = 10
+  TERMINATE = 11
+  PAGED_TO_RINGBUFFER = 12
+  SET_RINGBUFFER_OFFSET = 13
+  RELAY_RINGBUFFER = 14
+
+class CQDispatchCmdId:
+  ILLEGAL = 0
+  WRITE_LINEAR = 1
+  WRITE_LINEAR_H = 2
+  WRITE_LINEAR_H_HOST = 3
+  WRITE_PAGED = 4
+  WRITE_PACKED = 5
+  WRITE_PACKED_LARGE = 6
+  WAIT = 7
+  SINK = 8
+  DEBUG = 9
+  DELAY = 10
+  EXEC_BUF_END = 11
+  SET_WRITE_OFFSET = 12
+  TERMINATE = 13
+  SEND_GO_SIGNAL = 14
+  NOTIFY_SUBORDINATE_GO_SIGNAL = 15
+  SET_NUM_WORKER_SEMS = 16
+  SET_GO_SIGNAL_NOC_DATA = 17
+
+CQ_PREFETCH_RELAY_PAGED_START_PAGE_MASK = 0xFF
+CQ_PREFETCH_RELAY_PAGED_IS_DRAM_SHIFT = 15
+CQ_PREFETCH_RELAY_PAGED_LENGTH_ADJUST_MASK = 0x7FFF
+
+class CQGenericDebugCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad", u8), ("key", u16), ("size", u32), ("stride", u32)]
+
+class CQPrefetchRelayLinearCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u16), ("length", u64), ("noc_xy_addr", u32), ("addr", u64)]
+
+class CQPrefetchRelayLinearHCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("noc_xy_addr", u32), ("addr", u64), ("length", u32)]
+
+class CQPrefetchRelayPagedCmd(S):
+  _pack_ = 1
+  _fields_ = [
+    ("start_page", u8),
+    ("is_dram_and_length_adjust", u16),
+    ("base_addr", u32),
+    ("page_size", u32),
+    ("pages", u32),
+  ]
+
+class CQPrefetchRelayPagedPackedCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("count", u16), ("total_length", u32), ("stride", u32)]
+
+class CQPrefetchRelayPagedPackedSubCmd(S):
+  _pack_ = 1
+  _fields_ = [("start_page", u16), ("log_page_size", u16), ("base_addr", u32), ("length", u32)]
+
+class CQPrefetchRelayInlineCmd(S):
+  _pack_ = 1
+  _fields_ = [("dispatcher_type", u8), ("pad", u16), ("length", u32), ("stride", u32)]
+
+class CQPrefetchExecBufCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("base_addr", u32), ("log_page_size", u32), ("pages", u32)]
+
+CQ_PREFETCH_PAGED_TO_RING_BUFFER_FLAG_RESET_TO_START = 1
+
+class CQPrefetchPagedToRingbufferCmd(S):
+  _pack_ = 1
+  _fields_ = [
+    ("flags", u8),
+    ("log2_page_size", u8),
+    ("start_page", u8),
+    ("wp_offset_update", u32),
+    ("base_addr", u32),
+    ("length", u32),
+  ]
+
+class CQPrefetchSetRingbufferOffsetCmd(S):
+  _pack_ = 1
+  _fields_ = [("offset", u32), ("pad1", u16), ("pad2", u8), ("update_wp", u8)]
+
+class CQPrefetchRelayRingbufferCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("count", u16), ("stride", u32)]
+
+class CQPrefetchRelayRingbufferSubCmd(S):
+  _pack_ = 1
+  _fields_ = [("start", u32), ("length", u32)]
+
+class CQPrefetchCmdPayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [
+    ("relay_paged", CQPrefetchRelayPagedCmd),
+    ("relay_paged_packed", CQPrefetchRelayPagedPackedCmd),
+    ("relay_inline", CQPrefetchRelayInlineCmd),
+    ("exec_buf", CQPrefetchExecBufCmd),
+    ("debug", CQGenericDebugCmd),
+    ("paged_to_ringbuffer", CQPrefetchPagedToRingbufferCmd),
+    ("set_ringbuffer_offset", CQPrefetchSetRingbufferOffsetCmd),
+    ("relay_ringbuffer", CQPrefetchRelayRingbufferCmd),
+    ("raw", u8 * 15),
+  ]
+
+class CQPrefetchCmd(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQPrefetchCmdPayload)]
+
+class CQPrefetchCmdLargePayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [
+    ("relay_linear_h", CQPrefetchRelayLinearHCmd),
+    ("relay_linear", CQPrefetchRelayLinearCmd),
+    ("raw", u8 * 31),
+  ]
+
+class CQPrefetchCmdLarge(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQPrefetchCmdLargePayload)]
+
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE = 0x00
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_MCAST = 0x01
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE = 0x02
+
+CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT = 4
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_MASK = 0xF << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_RTA = 0x1 << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_LAUNCH = 0x2 << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_SEMS = 0x3 << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_EVENT = 0x4 << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_GO_MSG_INDEX = 0x5 << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT
+
+CQ_DISPATCH_CMD_WAIT_FLAG_NONE = 0x00
+CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER = 0x01
+CQ_DISPATCH_CMD_WAIT_FLAG_NOTIFY_PREFETCH = 0x02
+CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_MEMORY = 0x04
+CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM = 0x08
+CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM = 0x10
+
+CQ_DISPATCH_MAX_WRITE_OFFSETS = 4
+CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET = 0xFF
+
+class CQDispatchWriteCmd(S):
+  _pack_ = 1
+  _fields_ = [
+    ("num_mcast_dests", u8),
+    ("write_offset_index", u8),
+    ("pad1", u8),
+    ("noc_xy_addr", u32),
+    ("addr", u64),
+    ("length", u64),
+  ]
+
+class CQDispatchWriteHostCmd(S):
+  _pack_ = 1
+  _fields_ = [("is_event", u8), ("pad1", u16), ("pad2", u32), ("length", u64)]
+
+class CQDispatchWritePagedCmd(S):
+  _pack_ = 1
+  _fields_ = [("is_dram", u8), ("start_page", u16), ("base_addr", u32), ("page_size", u32), ("pages", u32)]
+
+class CQDispatchWritePackedCmd(S):
+  _pack_ = 1
+  _fields_ = [("flags", u8), ("count", u16), ("write_offset_index", u16), ("size", u16), ("addr", u32)]
+
+class CQDispatchWaitCmd(S):
+  _pack_ = 1
+  _fields_ = [("flags", u8), ("stream", u16), ("addr", u32), ("count", u32)]
+
+class CQDispatchDelayCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("delay", u32)]
+
+class CQDispatchSetWriteOffsetCmd(S):
+  _pack_ = 1
+  _fields_ = [("offset_count", u8), ("program_host_id", u16)]
+
+class CQDispatchGoSignalMcastCmd(S):
+  _pack_ = 1
+  _fields_ = [
+    ("go_signal", u32),
+    ("multicast_go_offset", u8),
+    ("num_unicast_txns", u8),
+    ("noc_data_start_index", u8),
+    ("wait_count", u32),
+    ("wait_stream", u32),
+  ]
+
+class CQDispatchNotifySubordinateGoSignalCmd(S):
+  _pack_ = 1
+  _fields_ = [("wait", u8), ("index_bitmask", u16), ("pad3", u32)]
+
+class CQDispatchSetNumWorkerSemsCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("num_worker_sems", u32)]
+
+class CQDispatchSetGoSignalNocDataCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("num_words", u32)]
+
+class CQDispatchCmdPayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [
+    ("write_linear_host", CQDispatchWriteHostCmd),
+    ("write_paged", CQDispatchWritePagedCmd),
+    ("write_packed", CQDispatchWritePackedCmd),
+    ("wait", CQDispatchWaitCmd),
+    ("debug", CQGenericDebugCmd),
+    ("delay", CQDispatchDelayCmd),
+    ("set_write_offset", CQDispatchSetWriteOffsetCmd),
+    ("mcast", CQDispatchGoSignalMcastCmd),
+    ("notify_dispatch_s_go_signal", CQDispatchNotifySubordinateGoSignalCmd),
+    ("set_num_worker_sems", CQDispatchSetNumWorkerSemsCmd),
+    ("set_go_signal_noc_data", CQDispatchSetGoSignalNocDataCmd),
+    ("raw", u8 * 15),
+  ]
+
+class CQDispatchCmd(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdPayload)]
+
+class CQDispatchCmdLargePayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [("write_linear", CQDispatchWriteCmd), ("raw", u8 * 31)]
+
+class CQDispatchCmdLarge(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdLargePayload)]

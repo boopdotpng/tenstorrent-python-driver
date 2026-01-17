@@ -16,11 +16,6 @@ class DramBuffer:
   page_size: int   # bytes per page (interleave granule)
 
 class DramAllocator:
-  """Manages interleaved DRAM allocation across banks.
-
-  Data is striped across banks in page-sized chunks for parallelism.
-  All tiles per bank expose the same 4GB, so we use one tile per bank.
-  """
   def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]]):
     self.fd = fd
     self.bank_tiles = dram_tiles[::Dram.TILES_PER_BANK]  # one tile per bank (all tiles expose same 4GB)
@@ -43,9 +38,10 @@ class DramAllocator:
     self.write(buf, data)
     return buf
 
-  def _for_each_page(self, buf: DramBuffer, size: int, mode: TLBMode,
-                     fn: Callable[[int, int], None]) -> list[tuple[int, int, int]]:
-    """Iterate pages across banks, calling fn(bank_local_addr, data_offset) for each."""
+  def _for_each_page(
+      self, buf: DramBuffer, size: int, mode: TLBMode,
+      fn: Callable[[int, int], None]
+    ) -> list[tuple[int, int, int]]:
     num_banks = len(self.bank_tiles)
     pages = (size + buf.page_size - 1) // buf.page_size
     touched = []

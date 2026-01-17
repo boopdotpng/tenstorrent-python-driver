@@ -101,7 +101,6 @@ class PTLoad:
   memsz: int
 
 def load_pt_load(path: str | os.PathLike[str]) -> list[PTLoad]:
-  """Parse ELF32 and extract PT_LOAD segments for firmware upload."""
   with open(os.fspath(path), "rb") as f: elf = f.read()
   e_phoff = struct.unpack_from("<I", elf, 28)[0]
   e_phentsize, e_phnum = struct.unpack_from("<HH", elf, 42)
@@ -116,7 +115,6 @@ def load_pt_load(path: str | os.PathLike[str]) -> list[PTLoad]:
   return segs
 
 def pack_xip_elf(path: str | os.PathLike[str]) -> tuple[bytes, int]:
-  """Pack all PT_LOAD segments contiguously (tt-metal CONTIGUOUS_XIP style)."""
   segs = load_pt_load(path)
   if not segs: raise ValueError("no PT_LOAD segments")
   pad4 = lambda b: b + b"\0" * (-len(b) & 3)

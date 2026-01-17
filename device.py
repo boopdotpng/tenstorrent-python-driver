@@ -1,3 +1,4 @@
+from __future__ import annotations
 import ctypes, fcntl, mmap, os, time
 from dataclasses import dataclass
 from typing import ClassVar
@@ -61,6 +62,20 @@ class Device:
     self.upload_firmware()
 
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram)
+  
+  def upload_kernels(self):
+    # Load elfs for all the cores 
+    # perform the XIP transformation (execute in place) 
+    # write kernels to all the tiles requested by the kernel
+    # setup CB config 
+    kern_dir = Path(__file__).parent / "kernels" / self.arch
+    for name in os.listdir(kern_dir):
+      pass
+  
+  def run(self):
+    # send launch_msg_t to start the compute 
+    # read go_msg_t.signal until it becomes done
+    pass
   
   # upload firmware to risc-v cores inside tensix tiles (required every fresh boot)
   # if tt-metal runs, it will erase the firmware

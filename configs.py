@@ -78,17 +78,6 @@ class TensixMMIO:
   RISCV_DEBUG_REG_NCRISC_RESET_PC = 0xFFB12238
   SOFT_RESET_ALL = 0x47800  # reset all 5 RISC-V cores (brisc, ncrisc, trisc0-2)
 
-class DevMsgs:
-  RUN_MSG_INIT = 0x40
-  RUN_MSG_GO = 0x80
-  RUN_MSG_RESET_READ_PTR = 0xC0
-  RUN_MSG_RESET_READ_PTR_FROM_HOST = 0xE0
-  RUN_MSG_DONE = 0x00
-
-  DISPATCH_MODE_DEV = 0
-  DISPATCH_MODE_HOST = 1
-
-
 class Arc:
   NOC_BASE = 0x80000000  # ARC NoC xbar base
 
