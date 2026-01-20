@@ -5,7 +5,7 @@ from typing import ClassVar
 from abi import *
 from tlb import TLBConfig, TLBWindow, TLBMode, TLBSize
 from helpers import _IO, align_down, dbg, find_dev_by_bdf, format_bdf, generate_jal_instruction, ioctl, load_pt_load, trace_ioctl
-from configs import Arc, Dram, TensixL1, TensixMMIO
+from configs import Arc, Dram, NocNIU, TensixL1, TensixMMIO
 from pathlib import Path
 from dram import DramAllocator
 
@@ -273,7 +273,19 @@ class Device:
         cfg.addr, cfg.mode = 0, TLBMode.ORDERED_BULK
         win.configure(cfg)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
-      dbg(2, "fw", f"bank tables written to 0x{TensixL1.MEM_BANK_TO_NOC_SCRATCH:x}")
+
+      # Verify tables were written to first tile (flush + sanity check)
+      cfg.start, cfg.end = test_tile, test_tile
+      cfg.addr, cfg.mode = 0, TLBMode.STRICT
+      cfg.mcast = False
+      win.configure(cfg)
+      verify = win.uc[TensixL1.MEM_BANK_TO_NOC_SCRATCH:TensixL1.MEM_BANK_TO_NOC_SCRATCH + 4]
+      expected = bank_tables[:4]
+      if bytes(verify) != expected:
+        dbg(1, "fw", f"bank table verify FAILED: got {bytes(verify).hex()} expected {expected.hex()}")
+      else:
+        dbg(2, "fw", f"bank tables verified at 0x{TensixL1.MEM_BANK_TO_NOC_SCRATCH:x}")
+      cfg.mcast = True
 
       # Phase 2: Release BRISC on ALL tiles (after all firmware is written)
       for x0, x1 in self.tiles.tensix_mcast:
@@ -311,25 +323,38 @@ class Device:
     NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
     GRID_X, GRID_Y = 17, 12
 
-    # DRAM coordinates: use subchannel 0 for all banks (matches DramAllocator)
-    # All subchannels access the same 4GB DRAM, subchannel 0 is first in BANK_TILE_YS
-    # Bank 0-3 at x=0, Bank 4-7 at x=9
+    # DRAM coordinates from blackhole_140_arch.yaml
+    # Format: DRAM_COORDS[channel] = [(x,y) for subchannel 0, 1, 2]
     DRAM_COORDS = {
-      0: (0, 0), 1: (0, 2), 2: (0, 4), 3: (0, 5),
-      4: (9, 0), 5: (9, 2), 6: (9, 4), 7: (9, 5),
-    }  # Matches Dram.BANK_TILE_YS[bank][0] and Dram.BANK_X[bank]
+      0: [(0, 0), (0, 1), (0, 11)],
+      1: [(0, 2), (0, 10), (0, 3)],
+      2: [(0, 9), (0, 4), (0, 8)],
+      3: [(0, 5), (0, 7), (0, 6)],
+      4: [(9, 0), (9, 1), (9, 11)],
+      5: [(9, 2), (9, 10), (9, 3)],
+      6: [(9, 9), (9, 4), (9, 8)],
+      7: [(9, 5), (9, 7), (9, 6)],
+    }
+    # worker_endpoint[channel] = [noc0_subchannel, noc1_subchannel]
+    WORKER_EP = {
+      0: [2, 1], 1: [0, 1], 2: [0, 1], 3: [0, 1],
+      4: [2, 1], 5: [2, 1], 6: [2, 1], 7: [2, 1],
+    }
 
     def noc_coord(noc: int, grid_size: int, coord: int) -> int:
-      """NoC coordinate transformation.
+      """Apply NOC coordinate transformation. NOC1 mirrors coordinates."""
+      return coord if noc == 0 else (grid_size - 1 - coord)
 
-      On Blackhole with COORDINATE_VIRTUALIZATION_ENABLED, the NOC hardware
-      handles coordinate translation. Since pure-py doesn't set up the full
-      translation tables like tt-metal does, use raw physical coordinates
-      for both NoCs.
+    def get_dram_coord(ch: int, noc: int) -> tuple[int, int]:
+      """Get DRAM coordinate for channel and NOC.
+
+      Use subchannel 0 for both NOCs (same physical endpoint as host TLB writes).
+      Apply NOC1 mirroring for physical coordinates.
       """
-      # TODO: If this doesn't work, may need to set up NOC translation tables
-      # or match tt-metal's virtualization logic more closely
-      return coord  # Use raw coordinates for both NoCs
+      raw_x, raw_y = DRAM_COORDS[ch][0]  # Always subchannel 0
+      x = noc_coord(noc, GRID_X, raw_x)
+      y = noc_coord(noc, GRID_Y, raw_y)
+      return (x, y)
 
     def pack_xy(x: int, y: int) -> int:
       """Pack (x, y) into 16-bit NoC XY encoding: (y << 6) | x"""
@@ -343,13 +368,12 @@ class Device:
     dram_xy = []
     for noc in range(NUM_NOCS):
       for ch in channels:
-        raw_x, raw_y = DRAM_COORDS[ch]
-        x = noc_coord(noc, GRID_X, raw_x)
-        y = noc_coord(noc, GRID_Y, raw_y)
+        x, y = get_dram_coord(ch, noc)
         dram_xy.append(pack_xy(x, y))
 
     # l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS]
     # Simplified mapping: distribute banks across tensix cores in row-major order
+    # Apply NOC1 mirroring for physical coordinates
     tensix_cols = list(TileGrid.TENSIX_X_P100A)
     l1_xy = []
     for noc in range(NUM_NOCS):
@@ -376,6 +400,12 @@ class Device:
 
     dbg(2, "noc", f"bank tables: dram_xy={len(dram_xy)*2}B l1_xy={len(l1_xy)*2}B "
                   f"dram_off={len(dram_offsets)*4}B l1_off={len(l1_offsets)*4}B total={len(blob)}B")
+    # Debug: show DRAM coordinates and raw values for first few banks
+    for noc in range(NUM_NOCS):
+      values = dram_xy[noc*NUM_DRAM_BANKS:(noc+1)*NUM_DRAM_BANKS]
+      coords = [(xy & 0x3F, (xy >> 6) & 0x3F) for xy in values]
+      dbg(2, "noc", f"dram_bank_to_noc_xy[{noc}] = {coords[:4]}... (x,y) raw={[hex(v) for v in values[:4]]}")
+    dbg(3, "noc", f"bank table first 32 bytes: {blob[:32].hex()}")
     return blob
 
   def _read_arc_boot_status(self) -> int:
@@ -474,6 +504,41 @@ class Device:
     dbg(3, "mmap",
         f"bar0 base={bars[0].mapping_base:#x} size={bars[0].mapping_size:#x} "
         f"bar2 base={bars[2].mapping_base:#x} size={bars[2].mapping_size:#x}")
+
+  def bar0_read32(self, addr: int) -> int:
+    return struct.unpack_from("<I", self.mm0, addr)[0]
+
+  def bar0_write32(self, addr: int, val: int):
+    struct.pack_into("<I", self.mm0, addr, val)
+
+  def get_noc_translation_enabled(self) -> bool:
+    """Read NIU_CFG_0 and check if NOC translation is enabled (bit 14)."""
+    niu_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC0_BAR)
+    return ((niu_cfg >> NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN) & 1) != 0
+
+  def debug_noc_niu(self):
+    """Print NOC0 and NOC1 NIU configuration for debugging."""
+    noc0_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC0_BAR)
+    noc1_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC1_BAR)
+    dbg(1, "noc", f"NIU_CFG_0: NOC0=0x{noc0_cfg:08x} NOC1=0x{noc1_cfg:08x}")
+    dbg(1, "noc", f"  NOC0: CG_EN={noc0_cfg & 1} TRANSLATE_EN={(noc0_cfg >> 14) & 1}")
+    dbg(1, "noc", f"  NOC1: CG_EN={noc1_cfg & 1} TRANSLATE_EN={(noc1_cfg >> 14) & 1}")
+
+  def set_noc_translation_enabled(self, enable: bool):
+    """Enable or disable NOC coordinate translation on both NOC0 and NOC1.
+
+    When enabled, NOC1 coordinates are automatically translated so firmware
+    can use the same logical coordinates for both NOCs.
+    """
+    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
+    for bar_addr in (NocNIU.NIU_CFG_NOC0_BAR, NocNIU.NIU_CFG_NOC1_BAR):
+      niu_cfg = self.bar0_read32(bar_addr)
+      if enable:
+        niu_cfg |= bit
+      else:
+        niu_cfg &= ~bit
+      self.bar0_write32(bar_addr, niu_cfg)
+    dbg(2, "noc", f"noc_translation_enabled={enable}")
 
   def reset(self, dmc_reset: bool = False) -> int:
     bdf = self.get_bdf()

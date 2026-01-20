@@ -151,6 +151,8 @@ def main(argv: list[str] | None = None):
   if not ns.run: return
 
   device = Device()
+  device.set_noc_translation_enabled(False)
+  device.debug_noc_niu()
   try:
     core = (1, 2) if (1, 2) in device.tiles.tensix else device.tiles.tensix[0]
 
@@ -159,6 +161,18 @@ def main(argv: list[str] | None = None):
     src_buf = device.dram.alloc_write(src, name="src", page_size=tile_size_bytes)
     dst = bytes(tile_size_bytes * N_TILES)
     dst_buf = device.dram.alloc_write(dst, name="dst", page_size=tile_size_bytes)
+
+    # Verify host can read back what it wrote
+    readback = device.dram.read(src_buf)
+    if readback != src:
+      for i in range(min(len(src), len(readback))):
+        if src[i] != readback[i]:
+          print(f"DRAM readback mismatch at byte {i}: wrote 0x{src[i]:02x} read 0x{readback[i]:02x}")
+          break
+      else:
+        print(f"DRAM readback length mismatch: wrote {len(src)} read {len(readback)}")
+      raise SystemExit("DRAM readback failed - host write/read not working")
+    print(f"DRAM readback OK: {len(readback)} bytes verified")
 
     rt_args = {
       "brisc": [dst_buf.addr],

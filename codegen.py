@@ -193,7 +193,10 @@ class Compiler:
       debug = ["-g"] if self.debug_info else []
       src = build_dir/"dm_entry.cc" if self.dm_wrapper == "minimal" else TT_HOME/"tt_metal"/"hw"/"firmware"/"src"/"tt-1xx"/f"{target}k.cc"
       opt = "-O2" if self.dm_wrapper == "tt-metal" else "-Os"
-      noc_index = 0 if is_brisc else 1
+      # Use NOC0 for both BRISC and NCRISC.
+      # NOC1 requires translation tables to be programmed correctly, which pure-py doesn't control.
+      # See boop-docs/tt-metal/noc1-translation.md for details.
+      noc_index = 0
       self._run_compile(
         build_dir, src, obj, opt=opt,
         cflags=[*self.COMMON_CFLAGS, *debug, *mcpu],

@@ -90,6 +90,19 @@ class TensixMMIO:
   # Keep TRISC/NCRISC in reset, release only BRISC (BRISC brings up others)
   SOFT_RESET_BRISC_ONLY_RUN = SOFT_RESET_TRISCS | SOFT_RESET_NCRISC  # 0x47000
 
+class NocNIU:
+  # BAR0 addresses for NIU_CFG registers (Blackhole)
+  NIU_CFG_NOC0_BAR = 0x1FD04100
+  NIU_CFG_NOC1_BAR = 0x1FD14100
+
+  # ARC-relative addresses (for JTAG access)
+  NIU_CFG_NOC0_ARC = 0x80050100
+  NIU_CFG_NOC1_ARC = 0x80058100
+
+  # NIU_CFG_0 bit definitions
+  NIU_CFG_0_CG_EN = 0              # Clock gating enable
+  NIU_CFG_0_NOC_ID_TRANSLATE_EN = 14  # NOC coordinate translation enable
+
 class Arc:
   NOC_BASE = 0x80000000  # ARC NoC xbar base
 
