@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from abi import *
 from configs import TLBSize
-from helpers import _IO, dbg, noc1, trace_ioctl, warn
+from helpers import _IO, noc1
 import fcntl, mmap
 
 class TLBMode(Enum):
@@ -26,7 +26,6 @@ class TLBConfig:
 
   def to_struct(self) -> NocTlbConfig:
     if self.start is None or self.end is None: raise ValueError("tlb start/end must be set before configure")
-    if (self.start == self.end) and self.mcast: warn("tlb", "warning: cannot multicast to one tile")
     ordering, static_vc = self.mode.value
     start = noc1(*self.start) if self.noc == 1 else self.start
     end = noc1(*self.end) if self.noc == 1 else self.end
@@ -54,13 +53,11 @@ class TLBWindow:
     buf = bytearray(sizeof(AllocateTlbIn) + sizeof(AllocateTlbOut))
     cfg = AllocateTlbIn.from_buffer(buf)
     cfg.size = size.value
-    trace_ioctl(IOCTL_ALLOCATE_TLB, f"size={size.value:#x}")
     fcntl.ioctl(self.fd, _IO(IOCTL_ALLOCATE_TLB), buf, True)
     out = AllocateTlbOut.from_buffer(buf, sizeof(AllocateTlbIn))
     self.tlb_id = out.tlb_id
     self._mmap_offset_uc = out.mmap_offset_uc
     self._mmap_offset_wc = out.mmap_offset_wc
-    dbg(3, "tlb", f"alloc id={self.tlb_id} size={size.value:#x} uc_off={self._mmap_offset_uc:#x} wc_off={self._mmap_offset_wc:#x}")
 
   def _mmap(self):
     # UC (uncached) for register access, WC (write-combining) for bulk data
@@ -75,17 +72,12 @@ class TLBWindow:
     cfg = ConfigureTlbIn.from_buffer(buf)
     cfg.tlb_id = self.tlb_id
     cfg.config = config.to_struct()
-    mc = "mcast" if config.mcast else "ucast"
-    dbg(4, "tlb", f"cfg target={config.start}->{config.end} noc={config.noc} addr={config.addr:#x} {mc} mode={config.mode.name}")
-    trace_ioctl(IOCTL_CONFIGURE_TLB)
     fcntl.ioctl(self.fd, _IO(IOCTL_CONFIGURE_TLB), buf, False)
     self.config = config
 
   def write(self, addr: int, data: bytes, use_uc: bool = False, restore: bool = True):
     if not data: return
     if self.config is None: raise RuntimeError("tlb window has no active config")
-    dbg(4, "tlb", f"write addr={addr:#x} bytes={len(data)} view={'uc' if use_uc else 'wc'}")
-
     config = self.config
     prev = config.addr
     try:
@@ -115,8 +107,6 @@ class TLBWindow:
     buf = bytearray(sizeof(FreeTlbIn))
     cfg = FreeTlbIn.from_buffer(buf)
     cfg.tlb_id = self.tlb_id
-    dbg(3, "tlb", f"free id={self.tlb_id}")
-    trace_ioctl(IOCTL_FREE_TLB)
     fcntl.ioctl(self.fd, _IO(IOCTL_FREE_TLB), buf, False)
 
   def __enter__(self): return self

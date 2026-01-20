@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 from abi import *
 from tlb import TLBConfig, TLBWindow, TLBMode, TLBSize
-from helpers import _IO, align_down, dbg, find_dev_by_bdf, format_bdf, generate_jal_instruction, ioctl, load_pt_load, trace_ioctl
+from helpers import _IO, align_down, find_dev_by_bdf, format_bdf, generate_jal_instruction, ioctl, load_pt_load
 from configs import Arc, Dram, NocNIU, TensixL1, TensixMMIO
 from pathlib import Path
 from dram import DramAllocator
@@ -49,9 +49,7 @@ class Device:
     self._setup()
     self._assert_arc_booted()
     self.harvested_dram = self.get_harvested_dram_bank()
-    dbg(2, "dev", f"harvested_dram={self.harvested_dram}")
     self.tiles = TileGrid.p100a(self.harvested_dram)
-    dbg(2, "tiles", f"tensix={len(self.tiles.tensix)} dram={len(self.tiles.dram)} mcast={self.tiles.tensix_mcast}")
     ref_tile = (1, 2) if (1, 2) in self.tiles.tensix else self.tiles.tensix[0]
     detected = self.get_tile_noc_translation_enabled(ref_tile)
     desired = detected.copy()
@@ -62,7 +60,6 @@ class Device:
         if noc in noc_translation_enabled:
           desired[noc] = bool(noc_translation_enabled[noc])
     self.noc_translation_enabled = desired
-    dbg(2, "noc", f"noc_translation_enabled(tile={ref_tile}) detected={detected} desired={self.noc_translation_enabled}")
 
     if upload_firmware: self.upload_firmware()
 
@@ -266,8 +263,6 @@ class Device:
       "trisc2.elf": (TensixL1.TRISC2_BASE,          TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH),
     }
 
-    dbg(1, "fw", f"upload tiles={len(self.tiles.tensix)} mcast_ranges={len(self.tiles.tensix_mcast)} cores={len(fw_map)}")
-
     def stage_spans(name: str, segs) -> list[tuple[int, bytes]]:
       base, init = fw_map[name]
       assert any(s.paddr == base for s in segs), f"{name}: missing text base 0x{base:x}"
@@ -286,8 +281,6 @@ class Device:
         else:
           assert 0 <= addr < TensixL1.SIZE, f"{name}: unexpected paddr 0x{addr:x}"
         spans.append((addr, data))
-
-      dbg(2, "fw", f"core={name.removesuffix('.elf')} base=0x{base:x} init=0x{init:x} spans={len(spans)} bytes={sum(len(d) for _, d in spans)}")
       return spans
 
     staged = {name: stage_spans(name, segs) for name, segs in fws}
@@ -300,7 +293,6 @@ class Device:
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
       # Phase 1: Write firmware to ALL tiles (hold all in reset)
       for x0, x1 in self.tiles.tensix_mcast:
-        dbg(2, "fw", f"mcast x=[{x0},{x1}] y=[{y0},{y1}]")
         cfg.start, cfg.end = (x0, y0), (x1, y1)
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
@@ -309,11 +301,9 @@ class Device:
         cfg.mode = TLBMode.ORDERED_BULK
         for name, spans in staged.items():
           for addr, data in spans:
-            dbg(3, "fw", f"seg core={name.removesuffix('.elf')} addr=0x{addr:x} bytes={len(data)}")
             win.write(addr, data, use_uc=True, restore=False)
 
         # Write JAL instruction at address 0 for BRISC bootstrap
-        dbg(2, "fw", f"JAL at 0x0 -> 0x{TensixL1.BRISC_FIRMWARE_BASE:x} (insn=0x{jal_insn:08x})")
         win.write(0x0, jal_insn.to_bytes(4, "little"), use_uc=True, restore=False)
 
         # Initialize go_msg with signal = RUN_MSG_INIT
@@ -330,7 +320,6 @@ class Device:
         win.writei32(trisc1_pc_off, TensixL1.TRISC1_BASE)
         win.writei32(trisc2_pc_off, TensixL1.TRISC2_BASE)
         win.writei32(ncrisc_pc_off, TensixL1.NCRISC_FIRMWARE_BASE)
-        dbg(2, "fw", f"reset PCs written")
 
       # Verify firmware was written to first tile before releasing
       test_tile = self.tiles.tensix[0]
@@ -338,10 +327,6 @@ class Device:
       cfg.addr, cfg.mode = 0, TLBMode.STRICT
       cfg.mcast = False
       win.configure(cfg)
-      v_jal = win.readi32(0x0)
-      v_go = win.readi32(TensixL1.GO_MSG)
-      v_fw = win.readi32(TensixL1.BRISC_FIRMWARE_BASE)
-      dbg(2, "fw", f"verify tile {test_tile}: JAL=0x{v_jal:08x} GO=0x{v_go:08x} FW=0x{v_fw:08x}")
       cfg.mcast = True
 
       # Write bank-to-NoC tables to scratch area (firmware reads these during init)
@@ -352,17 +337,6 @@ class Device:
         win.configure(cfg)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
 
-      # Verify tables were written to first tile (flush + sanity check)
-      cfg.start, cfg.end = test_tile, test_tile
-      cfg.addr, cfg.mode = 0, TLBMode.STRICT
-      cfg.mcast = False
-      win.configure(cfg)
-      verify = win.uc[TensixL1.MEM_BANK_TO_NOC_SCRATCH:TensixL1.MEM_BANK_TO_NOC_SCRATCH + 4]
-      expected = bank_tables[:4]
-      if bytes(verify) != expected:
-        dbg(1, "fw", f"bank table verify FAILED: got {bytes(verify).hex()} expected {expected.hex()}")
-      else:
-        dbg(2, "fw", f"bank tables verified at 0x{TensixL1.MEM_BANK_TO_NOC_SCRATCH:x}")
       cfg.mcast = True
 
       # Phase 2: Release BRISC on ALL tiles (after all firmware is written)
@@ -372,7 +346,6 @@ class Device:
         win.configure(cfg)
         win.readi32(reg_off)  # flush posted writes
         win.writei32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
-        dbg(2, "fw", f"released BRISC x=[{x0},{x1}]")
 
     self._wait_firmware_ready()
 
@@ -527,14 +500,6 @@ class Device:
     blob += struct.pack(f"<{len(dram_offsets)}i", *dram_offsets)
     blob += struct.pack(f"<{len(l1_offsets)}i", *l1_offsets)
 
-    dbg(2, "noc", f"bank tables: dram_xy={len(dram_xy)*2}B l1_xy={len(l1_xy)*2}B "
-                  f"dram_off={len(dram_offsets)*4}B l1_off={len(l1_offsets)*4}B total={len(blob)}B")
-    # Debug: show DRAM coordinates and raw values for first few banks
-    for noc in range(NUM_NOCS):
-      values = dram_xy[noc*NUM_DRAM_BANKS:(noc+1)*NUM_DRAM_BANKS]
-      coords = [(xy & 0x3F, (xy >> 6) & 0x3F) for xy in values]
-      dbg(2, "noc", f"dram_bank_to_noc_xy[{noc}] = {coords[:4]}... (x,y) raw={[hex(v) for v in values[:4]]}")
-    dbg(3, "noc", f"bank table first 32 bytes: {blob[:32].hex()}")
     return blob
 
   def _read_arc_boot_status(self) -> int:
@@ -602,7 +567,6 @@ class Device:
       os.close(self.fd)
       raise SystemExit(f"unsupported blackhole device {self.arch}; p100a only for now")
 
-    dbg(1, "dev", f"open arch={self.arch} bdf={self.get_bdf()} path={self.path}")
     self._map_bars()
 
   def _close(self):
@@ -612,7 +576,6 @@ class Device:
     os.close(self.fd)
 
   def get_bdf(self) -> str:
-    trace_ioctl(IOCTL_GET_DEVICE_INFO)
     info = ioctl(self.fd, IOCTL_GET_DEVICE_INFO, TenstorrentGetDeviceInfoIn,
                  TenstorrentGetDeviceInfoOut, output_size_bytes=ctypes.sizeof(TenstorrentGetDeviceInfoOut))
     return format_bdf(info.pci_domain, info.bus_dev_fn)
@@ -622,7 +585,6 @@ class Device:
     out_sz = ctypes.sizeof(TenstorrentMapping)
     buf = bytearray(in_sz + 6 * out_sz)
     QueryMappingsIn.from_buffer(buf).output_mapping_count = 6
-    trace_ioctl(IOCTL_QUERY_MAPPINGS)
     fcntl.ioctl(self.fd, _IO(IOCTL_QUERY_MAPPINGS), buf, True)
     bars = list((TenstorrentMapping * 6).from_buffer(buf, in_sz))
 
@@ -630,9 +592,6 @@ class Device:
     # we don't need to mmap global vram (4+5), that is done through the dram tiles and the NoC
     self.mm0 = mmap.mmap(self.fd, bars[0].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[0].mapping_base)
     self.mm1 = mmap.mmap(self.fd, bars[2].mapping_size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=bars[2].mapping_base)
-    dbg(3, "mmap",
-        f"bar0 base={bars[0].mapping_base:#x} size={bars[0].mapping_size:#x} "
-        f"bar2 base={bars[2].mapping_base:#x} size={bars[2].mapping_size:#x}")
 
   def bar0_read32(self, addr: int) -> int:
     return struct.unpack_from("<I", self.mm0, addr)[0]
@@ -670,50 +629,19 @@ class Device:
     if nextv != prev:
       win.writei32(off, nextv)
       win.readi32(off)  # flush posted write
-      dbg(3, "noc", f"tile {tile} noc{noc} NIU_CFG_0 0x{prev:08x} -> 0x{nextv:08x}")
-
-  def debug_tile_noc_translation_tables(self, tile: tuple[int, int]):
-    """Dump translation-related NOC_CFG regs for a tile (both NOCs)."""
-    base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
-    cfg = TLBConfig(addr=base, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
-    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
-
-    def rd(win: TLBWindow, abs_addr: int) -> int: return win.readi32(abs_addr - base)
-
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      for noc, noc_base in ((0, TensixMMIO.NOC0_NIU_START), (1, TensixMMIO.NOC1_NIU_START)):
-        cfg0 = rd(win, noc_base + 0x100)
-        x = [rd(win, noc_base + 0x100 + r * 4) for r in range(0x6, 0xC)]
-        y = [rd(win, noc_base + 0x100 + r * 4) for r in range(0xC, 0x12)]
-        logical = rd(win, noc_base + 0x100 + 0x12 * 4)
-        dbg(1, "noc", f"tile {tile} noc{noc} NIU_CFG_0=0x{cfg0:08x} TRANSLATE_EN={1 if (cfg0 & bit) else 0}")
-        dbg(1, "noc", f"tile {tile} noc{noc} NOC_ID_LOGICAL=0x{logical:08x}")
-        dbg(2, "noc", f"tile {tile} noc{noc} X_TABLE={','.join(f'{v:08x}' for v in x)}")
-        dbg(2, "noc", f"tile {tile} noc{noc} Y_TABLE={','.join(f'{v:08x}' for v in y)}")
-
-  def debug_arc_noc_niu(self):
-    """Dump NIU_CFG_0 via ARC BAR aliases (may not reflect Tensix tiles)."""
-    noc0_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC0_BAR)
-    noc1_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC1_BAR)
-    dbg(1, "noc", f"ARC BAR NIU_CFG_0: NOC0=0x{noc0_cfg:08x} NOC1=0x{noc1_cfg:08x}")
-    dbg(1, "noc", f"  NOC0: CG_EN={noc0_cfg & 1} TRANSLATE_EN={(noc0_cfg >> 14) & 1}")
-    dbg(1, "noc", f"  NOC1: CG_EN={noc1_cfg & 1} TRANSLATE_EN={(noc1_cfg >> 14) & 1}")
 
   def reset(self, dmc_reset: bool = False) -> int:
     bdf = self.get_bdf()
-    dbg(1, "dev", f"reset bdf={bdf} flags={'ASIC_DMC_RESET' if dmc_reset else 'ASIC_RESET'}")
     in_sz, out_sz = ctypes.sizeof(ResetDeviceIn), ctypes.sizeof(ResetDeviceOut)
 
     buf = bytearray(in_sz + out_sz)
     view = ResetDeviceIn.from_buffer(buf)
     view.output_size_bytes = out_sz
     view.flags = TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET if dmc_reset else TENSTORRENT_RESET_DEVICE_ASIC_RESET
-    trace_ioctl(IOCTL_RESET_DEVICE, f"flags={'ASIC_DMC_RESET' if dmc_reset else 'ASIC_RESET'}")
     fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
     self._close()
 
     # poll for device to come back (up to 10s)
-    dbg(2, "dev", "reset waiting for device...")
     for _ in range(50):
       time.sleep(0.2)
       if (path := find_dev_by_bdf(bdf)):
@@ -722,17 +650,14 @@ class Device:
     else:
       raise RuntimeError(f"device {bdf} didn't come back after reset")
 
-    dbg(2, "dev", f"reset device back path={self.path}")
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
 
     # POST_RESET reinits hardware
     buf = bytearray(in_sz + out_sz)
     view = ResetDeviceIn.from_buffer(buf)
     view.output_size_bytes, view.flags = out_sz, TENSTORRENT_RESET_DEVICE_POST_RESET
-    trace_ioctl(IOCTL_RESET_DEVICE, "flags=POST_RESET")
     fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
     result = ResetDeviceOut.from_buffer(buf, in_sz).result
-    dbg(1, "dev", f"reset complete result={result}")
 
     self._setup(retried=True)
     return result

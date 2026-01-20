@@ -1,9 +1,7 @@
 from dataclasses import dataclass
 from typing import Callable
-import time
 from configs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram
 from tlb import TLBConfig, TLBWindow, TLBMode, TLBSize
-from helpers import dbg, DEBUG
 
 def _align(x: int, a: int = DRAM_ALIGNMENT) -> int:
   return (x + a - 1) & ~(a - 1)
@@ -31,7 +29,6 @@ class DramAllocator:
     pages = (size + page_size - 1) // page_size
     pages_per_bank = (pages + num_banks - 1) // num_banks
     self.next = _align(self.next + pages_per_bank * page_size)
-    dbg(2, "dram", f"alloc name={name!r} addr={addr:#x} size={size} pages={pages} page_size={page_size}")
     return DramBuffer(name=name, addr=addr, size=size, page_size=page_size)
 
   def alloc_write(self, data: bytes, name: str | None = None, *, page_size: int | None = None) -> DramBuffer:
@@ -71,7 +68,6 @@ class DramAllocator:
     assert len(data) <= buf.size
     assert buf.page_size >= DRAM_ALIGNMENT and (buf.page_size & (DRAM_ALIGNMENT - 1)) == 0
     view = memoryview(data)
-    t0 = time.perf_counter() if DEBUG >= 2 else 0
 
     def do_write(addr: int, off: int):
       page = view[off:off + buf.page_size]
@@ -79,10 +75,6 @@ class DramAllocator:
 
     touched = self._for_each_page(buf, len(data), TLBMode.POSTED, do_write)
     self.barrier(touched)
-
-    if DEBUG >= 2:
-      elapsed_ms = (time.perf_counter() - t0) * 1000
-      dbg(2, "dram", f"write {len(data)} bytes in {elapsed_ms:.1f}ms ({len(data) / elapsed_ms / 1e6:.2f} GB/s)")
 
   def read(self, buf: DramBuffer) -> bytes:
     result = bytearray(buf.size)

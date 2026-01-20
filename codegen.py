@@ -1,5 +1,5 @@
 from __future__ import annotations
-from helpers import TT_HOME, DEBUG, pack_xip_elf
+from helpers import TT_HOME, pack_xip_elf
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -176,7 +176,7 @@ class Compiler:
     link_objs = [TT_HOME/"runtime"/"hw"/"lib"/"blackhole"/"noc.o"] if is_brisc else []
 
     build_dir = Path(tempfile.mkdtemp(prefix=f"tt-kern-{target}-", dir="/tmp"))
-    keep = DEBUG >= 3 if keep is None else keep
+    keep = keep or False
     try:
       fw = self._make_fw_symbols_elf(build_dir, self.firmware_dir/f"{target}.elf")
       (build_dir/"kernel_includes.hpp").write_text(kern)
@@ -242,7 +242,7 @@ class Compiler:
     mcpu = ("-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay")
 
     build_dir = Path(tempfile.mkdtemp(prefix=f"tt-kern-trisc{trisc_id}-", dir="/tmp"))
-    keep = DEBUG >= 3 if keep is None else keep
+    keep = keep or False
     try:
       fw = self._make_fw_symbols_elf(build_dir, self.firmware_dir/f"trisc{trisc_id}.elf")
       (build_dir/"kernel_includes.hpp").write_text(kern)
@@ -301,13 +301,11 @@ class Compiler:
 
   def _run_compile(self, cwd: Path, src: Path, obj: str, *, opt: str, cflags: list[str], defines: list[str], includes: list[str]):
     cmd = [str(self.compiler), opt, *cflags, *includes, "-c", "-o", obj, str(src), *defines]
-    if DEBUG >= 2: print(" ".join(cmd))
-    subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=DEBUG < 2)
+    subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True)
 
   def _run_link(self, cwd: Path, out: Path, *, opt: str, lflags: list[str], objs: list[str]):
     cmd = [str(self.compiler), opt, *lflags, *objs, "-o", str(out)]
-    if DEBUG >= 2: print(" ".join(cmd))
-    subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=DEBUG < 2)
+    subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True)
 
   def _make_fw_symbols_elf(self, build_dir: Path, fw: Path) -> Path:
     # Match TT-metal: link kernels against a "weakened" firmware ELF.
@@ -341,7 +339,7 @@ class Compiler:
 
     subprocess.run(
       [str(self.objcopy), f"--localize-symbols={localize_path}", f"--weaken-symbols={weaken_path}", str(out)],
-      cwd=build_dir, check=True, text=True, capture_output=DEBUG < 2,
+      cwd=build_dir, check=True, text=True, capture_output=True,
     )
     return out
 

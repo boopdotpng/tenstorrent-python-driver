@@ -1,56 +1,16 @@
-import os, sys,  fcntl, struct
+import os, fcntl, struct
 from ctypes import sizeof
 from abi import TENSTORRENT_IOCTL_MAGIC, TenstorrentGetDeviceInfoIn
 from abi import TenstorrentGetDeviceInfoOut, IOCTL_GET_DEVICE_INFO
-from abi import IOCTL_ALLOCATE_TLB, IOCTL_FREE_TLB, IOCTL_CONFIGURE_TLB
 from dataclasses import dataclass
 from pathlib import Path
 from configs import TLBSize, TensixL1
 
-DEBUG = int(os.environ.get("DEBUG", 0))
 _tt_home_env = os.environ.get("TT_HOME")
 if _tt_home_env:
   TT_HOME = Path(_tt_home_env)
 else:
   TT_HOME = Path(__file__).resolve().parents[1]/"tt-metal"
-
-# ANSI colors
-class C:
-  RESET = "\033[0m"
-  BOLD = "\033[1m"
-  DIM = "\033[2m"
-  RED = "\033[31m"
-  GREEN = "\033[32m"
-  YELLOW = "\033[33m"
-  BLUE = "\033[34m"
-  MAGENTA = "\033[35m"
-  CYAN = "\033[36m"
-
-TAG_COLORS = {
-  "dev": C.GREEN, "fw": C.CYAN, "tlb": C.BLUE,
-  "dram": C.MAGENTA, "mmap": C.YELLOW, "ioctl": C.DIM,
-}
-
-def dbg(level: int, tag: str, msg: str):
-  if DEBUG < level: return
-  color = TAG_COLORS.get(tag, C.RESET)
-  print(f"{color}{C.BOLD}{tag}{C.RESET}{color}:{C.RESET} {msg}")
-
-def warn(tag: str, msg: str):
-  print(f"{C.YELLOW}{C.BOLD}{tag}{C.RESET}{C.YELLOW}:{C.RESET} {msg}", file=sys.stderr)
-
-IOCTL_NAMES = {
-  0: "GET_DEVICE_INFO", 2: "QUERY_MAPPINGS", 6: "RESET_DEVICE",
-  7: "PIN_PAGES", 10: "UNPIN_PAGES", 11: "ALLOCATE_TLB",
-  12: "FREE_TLB", 13: "CONFIGURE_TLB",
-}
-
-_TLB_IOCTLS = {IOCTL_ALLOCATE_TLB, IOCTL_FREE_TLB, IOCTL_CONFIGURE_TLB}
-
-def trace_ioctl(nr: int, extra: str = ""):
-  if DEBUG < 4 or nr in _TLB_IOCTLS: return
-  name = IOCTL_NAMES.get(nr, str(nr))
-  dbg(4, "ioctl", f"{name}{' ' + extra if extra else ''}")
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
