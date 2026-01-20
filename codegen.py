@@ -133,7 +133,15 @@ class Compiler:
       defs.setdefault("IS_NOT_POW2_NUM_L1_BANKS", 1)
     return defs
 
-  def compile_kernel(self, kern: str, processor: Processor, *, dispatch_message_addr: int = 0, keep: bool | None = None) -> CompiledKernel:
+  def compile_kernel(
+    self,
+    kern: str,
+    processor: Processor,
+    *,
+    dispatch_message_addr: int = 0,
+    keep: bool | None = None,
+    noc_index: int | None = None,
+  ) -> CompiledKernel:
     # Each processor is compiled separately into its own ELF:
     # - BRISC: typically writer-side dataflow
     # - NCRISC: typically reader-side dataflow
@@ -142,12 +150,20 @@ class Compiler:
     # "dispatch_message_addr" is part of the mailbox protocol; pure-py uses slow-dispatch and currently
     # doesn't rely on device-side dispatch notifications, but the define still exists in TT-metal builds.
     if processor in (Processor.BRISC, Processor.NCRISC):
-      return self._compile_dm(kern, processor, dispatch_message_addr=dispatch_message_addr, keep=keep)
+      return self._compile_dm(kern, processor, dispatch_message_addr=dispatch_message_addr, keep=keep, noc_index=noc_index)
     elif processor in (Processor.TRISC0, Processor.TRISC1, Processor.TRISC2):
       return self._compile_trisc(kern, processor, dispatch_message_addr=dispatch_message_addr, keep=keep)
     raise ValueError(f"unsupported processor: {processor}")
 
-  def _compile_dm(self, kern: str, processor: Processor, *, dispatch_message_addr: int, keep: bool | None) -> CompiledKernel:
+  def _compile_dm(
+    self,
+    kern: str,
+    processor: Processor,
+    *,
+    dispatch_message_addr: int,
+    keep: bool | None,
+    noc_index: int | None,
+  ) -> CompiledKernel:
     # Data-movement RISCs (BRISC/NCRISC) run C++ kernels that call into `dataflow_api.h` (CB ops, noc ops, etc).
     # We compile a tiny entry translation unit that:
     # - waits for RUN_MSG_GO via the mailbox
@@ -193,10 +209,7 @@ class Compiler:
       debug = ["-g"] if self.debug_info else []
       src = build_dir/"dm_entry.cc" if self.dm_wrapper == "minimal" else TT_HOME/"tt_metal"/"hw"/"firmware"/"src"/"tt-1xx"/f"{target}k.cc"
       opt = "-O2" if self.dm_wrapper == "tt-metal" else "-Os"
-      # Use NOC0 for both BRISC and NCRISC.
-      # NOC1 requires translation tables to be programmed correctly, which pure-py doesn't control.
-      # See boop-docs/tt-metal/noc1-translation.md for details.
-      noc_index = 0
+      if noc_index is None: noc_index = 0
       self._run_compile(
         build_dir, src, obj, opt=opt,
         cflags=[*self.COMMON_CFLAGS, *debug, *mcpu],

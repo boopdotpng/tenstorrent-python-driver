@@ -37,7 +37,13 @@ class TileGrid:
     return cls(tensix=tensix, tensix_mcast=tensix_mcast, dram=dram)
 
 class Device:
-  def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
+  def __init__(
+    self,
+    path: str = "/dev/tenstorrent/0",
+    *,
+    upload_firmware: bool = True,
+    noc_translation_enabled: bool | dict[int, bool] | None = None,
+  ):
     self.path = path
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
     self._setup()
@@ -46,6 +52,17 @@ class Device:
     dbg(2, "dev", f"harvested_dram={self.harvested_dram}")
     self.tiles = TileGrid.p100a(self.harvested_dram)
     dbg(2, "tiles", f"tensix={len(self.tiles.tensix)} dram={len(self.tiles.dram)} mcast={self.tiles.tensix_mcast}")
+    ref_tile = (1, 2) if (1, 2) in self.tiles.tensix else self.tiles.tensix[0]
+    detected = self.get_tile_noc_translation_enabled(ref_tile)
+    desired = detected.copy()
+    if isinstance(noc_translation_enabled, bool):
+      desired = {0: noc_translation_enabled, 1: noc_translation_enabled}
+    elif isinstance(noc_translation_enabled, dict):
+      for noc in (0, 1):
+        if noc in noc_translation_enabled:
+          desired[noc] = bool(noc_translation_enabled[noc])
+    self.noc_translation_enabled = desired
+    dbg(2, "noc", f"noc_translation_enabled(tile={ref_tile}) detected={detected} desired={self.noc_translation_enabled}")
 
     if upload_firmware: self.upload_firmware()
 
@@ -80,7 +97,13 @@ class Device:
     remote_blob = self._build_remote_cb_blob({}, min_remote_start)
     return local_mask, local_blob, min_remote_start, remote_blob
 
-  def _pack_kernel_config(self, kernels: dict[str, CompiledKernel], rt_args: dict[str, list[int]]):
+  def _pack_kernel_config(
+    self,
+    kernels: dict[str, CompiledKernel],
+    rt_args: dict[str, list[int]],
+    *,
+    brisc_noc_id: int,
+  ):
     pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
     align16 = lambda n: (n + 15) & ~15
 
@@ -124,7 +147,7 @@ class Device:
     cfg.local_cb_mask = local_cb_mask
     cfg.min_remote_cb_start_index = min_remote_start
     cfg.enables = enables
-    cfg.brisc_noc_id = 0
+    cfg.brisc_noc_id = brisc_noc_id
     cfg.brisc_noc_mode = 0
     cfg.mode = DevMsgs.DISPATCH_MODE_HOST
 
@@ -136,8 +159,16 @@ class Device:
 
     return bytes(img), cfg
 
-  def run(self, *, cores: list[tuple[int, int]], kernels: dict[str, CompiledKernel], rt_args: dict[str, list[int]]):
-    img, kc = self._pack_kernel_config(kernels, rt_args)
+  def run(
+    self,
+    *,
+    cores: list[tuple[int, int]],
+    kernels: dict[str, CompiledKernel],
+    rt_args: dict[str, list[int]],
+    brisc_noc_id: int = 0,
+  ):
+    if brisc_noc_id not in (0, 1): raise ValueError("brisc_noc_id must be 0 or 1")
+    img, kc = self._pack_kernel_config(kernels, rt_args, brisc_noc_id=brisc_noc_id)
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -149,11 +180,14 @@ class Device:
     go.bits.signal = DevMsgs.RUN_MSG_GO
     go_blob = as_bytes(go)
 
-    cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+    mmio_base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
+    mmio_cfg = TLBConfig(addr=mmio_base, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
       for x, y in cores:
-        cfg.start = cfg.end = (x, y)
-        win.configure(cfg)
+        self._set_tile_noc_translation_enabled(win, mmio_cfg, (x, y), 1, self.noc_translation_enabled[1])
+        l1_cfg.start = l1_cfg.end = (x, y)
+        win.configure(l1_cfg)
         win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
@@ -161,11 +195,55 @@ class Device:
         win.write(TensixL1.GO_MSG, go_blob, use_uc=True, restore=False)
 
       for x, y in cores:
-        cfg.start = cfg.end = (x, y)
-        win.configure(cfg)
+        l1_cfg.start = l1_cfg.end = (x, y)
+        win.configure(l1_cfg)
         deadline = time.perf_counter() + 10.0
         while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
-          if time.perf_counter() > deadline: raise TimeoutError(f"timeout waiting for core {(x, y)}")
+          if time.perf_counter() > deadline:
+            tile = (x, y)
+            go_u32 = win.readi32(TensixL1.GO_MSG)
+            sync = win.readi32(TensixL1.MAILBOX_BASE + 8)
+            dbg_words = [win.readi32(TensixL1.LLK_DEBUG_BASE + i * 4) for i in range(8)]
+            self._set_tile_noc_translation_enabled(win, mmio_cfg, tile, 1, self.noc_translation_enabled[1])
+            base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
+            mmio_cfg.start = mmio_cfg.end = tile
+            win.configure(mmio_cfg)
+            noc0_cfg0 = win.readi32((TensixMMIO.NOC0_NIU_START + 0x100) - base)
+            noc1_cfg0 = win.readi32((TensixMMIO.NOC1_NIU_START + 0x100) - base)
+            dm1, tr0, tr1, tr2 = sync & 0xFF, (sync >> 8) & 0xFF, (sync >> 16) & 0xFF, (sync >> 24) & 0xFF
+            def status(noc_base: int, reg: int) -> int: return win.readi32((noc_base + 0x200 + reg * 4) - base)
+            n0 = {
+              "rd_sent": status(TensixMMIO.NOC0_NIU_START, 0x5),
+              "rd_resp": status(TensixMMIO.NOC0_NIU_START, 0x2),
+              "np_wr_sent": status(TensixMMIO.NOC0_NIU_START, 0xA),
+              "wr_ack": status(TensixMMIO.NOC0_NIU_START, 0x1),
+              "p_wr_sent": status(TensixMMIO.NOC0_NIU_START, 0xB),
+            }
+            n1 = {
+              "rd_sent": status(TensixMMIO.NOC1_NIU_START, 0x5),
+              "rd_resp": status(TensixMMIO.NOC1_NIU_START, 0x2),
+              "np_wr_sent": status(TensixMMIO.NOC1_NIU_START, 0xA),
+              "wr_ack": status(TensixMMIO.NOC1_NIU_START, 0x1),
+              "p_wr_sent": status(TensixMMIO.NOC1_NIU_START, 0xB),
+            }
+            def stream_reg(stream_id: int, reg_id: int) -> int:
+              return win.readi32((0xFFB40000 + stream_id * 0x1000 + reg_id * 4) - base)
+            # CB sync uses stream scratch regs:
+            # - tiles_received: STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX (10)
+            # - tiles_acked: STREAM_REMOTE_DEST_BUF_START_REG_INDEX (8)
+            # Operand->stream_id: 8 + operand. So operand0->8, operand16->24.
+            cb_regs = {
+              "cb0": {"received": stream_reg(8, 10), "acked": stream_reg(8, 8)},
+              "cb16": {"received": stream_reg(24, 10), "acked": stream_reg(24, 8)},
+            }
+            raise TimeoutError(
+              f"timeout waiting for core {tile}: "
+              f"go=0x{go_u32:08x} sync=0x{sync:08x} "
+              f"sync_bytes=[dm1=0x{dm1:02x},tr0=0x{tr0:02x},tr1=0x{tr1:02x},tr2=0x{tr2:02x}] "
+              f"dbg={[f'0x{v:08x}' for v in dbg_words]} "
+              f"NIU_CFG_0[noc0]=0x{noc0_cfg0:08x} NIU_CFG_0[noc1]=0x{noc1_cfg0:08x} "
+              f"status0={n0} status1={n1} cb={cb_regs}"
+            )
           time.sleep(0.001)
 
   # upload firmware to risc-v cores inside tensix tiles (required every fresh boot)
@@ -323,9 +401,9 @@ class Device:
     NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
     GRID_X, GRID_Y = 17, 12
 
-    # DRAM coordinates from blackhole_140_arch.yaml
-    # Format: DRAM_COORDS[channel] = [(x,y) for subchannel 0, 1, 2]
-    DRAM_COORDS = {
+    # DRAM core locations in physical NOC0 coordinates.
+    # This matches tt-umd `blackhole::DRAM_CORES_NOC0` and `blackhole_140_arch.yaml`.
+    DRAM_PHYS_NOC0 = {
       0: [(0, 0), (0, 1), (0, 11)],
       1: [(0, 2), (0, 10), (0, 3)],
       2: [(0, 9), (0, 4), (0, 8)],
@@ -335,40 +413,91 @@ class Device:
       6: [(9, 9), (9, 4), (9, 8)],
       7: [(9, 5), (9, 7), (9, 6)],
     }
-    # worker_endpoint[channel] = [noc0_subchannel, noc1_subchannel]
-    WORKER_EP = {
+    # DRAM view routing endpoints from `blackhole_140_arch.yaml` (dram_views[].worker_endpoint).
+    #
+    # Important: this table is indexed by the *logical* DRAM bank id (0..7), not the physical
+    # DRAM channel id. With one harvested bank, logical bank ids are compacted and map onto the
+    # remaining physical channels in order.
+    WORKER_EP_LOGICAL = {
       0: [2, 1], 1: [0, 1], 2: [0, 1], 3: [0, 1],
       4: [2, 1], 5: [2, 1], 6: [2, 1], 7: [2, 1],
     }
 
-    def noc_coord(noc: int, grid_size: int, coord: int) -> int:
-      """Apply NOC coordinate transformation. NOC1 mirrors coordinates."""
-      return coord if noc == 0 else (grid_size - 1 - coord)
+    def dram_translated_map_for_harvested_bank(harvested_bank: int | None) -> dict[tuple[int, int], tuple[int, int]]:
+      """Return (logical_bank, port) -> translated (x, y) for DRAM cores.
 
-    def get_dram_coord(ch: int, noc: int) -> tuple[int, int]:
-      """Get DRAM coordinate for channel and NOC.
-
-      Use subchannel 0 for both NOCs (same physical endpoint as host TLB writes).
-      Apply NOC1 mirroring for physical coordinates.
+      This matches tt-umd's `BlackholeCoordinateManager::fill_dram_noc0_translated_mapping` using:
+      - blackhole::dram_translated_coordinate_start_x = 17
+      - blackhole::dram_translated_coordinate_start_y = 12
+      - blackhole::NUM_NOC_PORTS_PER_DRAM_BANK = 3
+      - blackhole::NUM_DRAM_BANKS = 8
       """
-      raw_x, raw_y = DRAM_COORDS[ch][0]  # Always subchannel 0
-      x = noc_coord(noc, GRID_X, raw_x)
-      y = noc_coord(noc, GRID_Y, raw_y)
-      return (x, y)
+      START_X, START_Y, PORTS, TOTAL_BANKS = 17, 12, 3, 8
+      m: dict[tuple[int, int], tuple[int, int]] = {}
+      def map_banks(start: int, end: int, x: int, y0: int = START_Y):
+        y = y0
+        for bank in range(start, end):
+          for port in range(PORTS):
+            m[(bank, port)] = (x, y)
+            y += 1
+
+      if harvested_bank is None:
+        map_banks(0, TOTAL_BANKS // 2, START_X)
+        map_banks(TOTAL_BANKS // 2, TOTAL_BANKS, START_X + 1)
+        return m
+
+      if not (0 <= harvested_bank < TOTAL_BANKS): raise ValueError("harvested_dram_bank out of range")
+      half = TOTAL_BANKS // 2
+      # When a bank is harvested, tt-umd exposes 7 logical banks (0..6) and reserves the last virtual slot.
+      # The mapping below lays out those 7 banks into translated DRAM space.
+      if harvested_bank < half:
+        mirror_east_bank = harvested_bank + half - 1
+        map_banks(0, half - 1, START_X + 1)
+        map_banks(half - 1, mirror_east_bank, START_X)
+        map_banks(
+          mirror_east_bank + 1,
+          TOTAL_BANKS - 1,
+          START_X,
+          START_Y + (mirror_east_bank - (half - 1)) * PORTS,
+        )
+        map_banks(mirror_east_bank, mirror_east_bank + 1, START_X, START_Y + (half - 1) * PORTS)
+      else:
+        mirror_west_bank = harvested_bank - half
+        map_banks(0, mirror_west_bank, START_X)
+        map_banks(
+          mirror_west_bank + 1,
+          half,
+          START_X,
+          START_Y + mirror_west_bank * PORTS,
+        )
+        map_banks(mirror_west_bank, mirror_west_bank + 1, START_X, START_Y + (half - 1) * PORTS)
+        map_banks(half, TOTAL_BANKS - 1, START_X + 1)
+      return m
+
+    def noc_coord(noc: int, grid_size: int, coord: int) -> int:
+      if noc == 0 or self.noc_translation_enabled.get(noc, True): return coord
+      return grid_size - 1 - coord
 
     def pack_xy(x: int, y: int) -> int:
       """Pack (x, y) into 16-bit NoC XY encoding: (y << 6) | x"""
       return ((y << 6) | x) & 0xFFFF
 
-    # Build list of unharvested channels (bank_id -> channel mapping)
-    channels = [c for c in range(8) if c != self.harvested_dram]
-    assert len(channels) == NUM_DRAM_BANKS, f"expected {NUM_DRAM_BANKS} banks, got {len(channels)}"
+    # Map logical DRAM bank ids (0..6) onto physical channels (0..7, skipping the harvested one).
+    physical_channels = [c for c in range(8) if c != self.harvested_dram]
+    assert len(physical_channels) == NUM_DRAM_BANKS, f"expected {NUM_DRAM_BANKS} banks, got {len(physical_channels)}"
+    dram_translated = dram_translated_map_for_harvested_bank(self.harvested_dram)
 
     # dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] - stored as [noc0_banks..., noc1_banks...]
     dram_xy = []
     for noc in range(NUM_NOCS):
-      for ch in channels:
-        x, y = get_dram_coord(ch, noc)
+      for logical_bank, phys_ch in enumerate(physical_channels):
+        port = WORKER_EP_LOGICAL[logical_bank][noc]
+        if self.noc_translation_enabled.get(noc, True):
+          x, y = dram_translated[(logical_bank, port)]
+        else:
+          raw_x, raw_y = DRAM_PHYS_NOC0[phys_ch][port]
+          x = noc_coord(noc, GRID_X, raw_x)
+          y = noc_coord(noc, GRID_Y, raw_y)
         dram_xy.append(pack_xy(x, y))
 
     # l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS]
@@ -511,34 +640,64 @@ class Device:
   def bar0_write32(self, addr: int, val: int):
     struct.pack_into("<I", self.mm0, addr, val)
 
-  def get_noc_translation_enabled(self) -> bool:
-    """Read NIU_CFG_0 and check if NOC translation is enabled (bit 14)."""
-    niu_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC0_BAR)
-    return ((niu_cfg >> NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN) & 1) != 0
+  def get_tile_noc_translation_enabled(self, tile: tuple[int, int]) -> dict[int, bool]:
+    """Read NIU_CFG_0 on a Tensix tile for both NOCs."""
+    base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
+    cfg = TLBConfig(addr=base, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
+    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+      v0 = win.readi32((TensixMMIO.NOC0_NIU_START + 0x100) - base)
+      v1 = win.readi32((TensixMMIO.NOC1_NIU_START + 0x100) - base)
+    return {0: (v0 & bit) != 0, 1: (v1 & bit) != 0}
 
-  def debug_noc_niu(self):
-    """Print NOC0 and NOC1 NIU configuration for debugging."""
+  def _set_tile_noc_translation_enabled(
+    self,
+    win: TLBWindow,
+    cfg: TLBConfig,
+    tile: tuple[int, int],
+    noc: int,
+    enable: bool,
+  ):
+    if noc not in (0, 1): raise ValueError("noc must be 0 or 1")
+    base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
+    cfg.addr, cfg.start, cfg.end, cfg.mcast, cfg.mode = base, tile, tile, False, TLBMode.STRICT
+    win.configure(cfg)
+    reg = (TensixMMIO.NOC0_NIU_START if noc == 0 else TensixMMIO.NOC1_NIU_START) + 0x100
+    off = reg - base
+    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
+    prev = win.readi32(off)
+    nextv = (prev | bit) if enable else (prev & ~bit)
+    if nextv != prev:
+      win.writei32(off, nextv)
+      win.readi32(off)  # flush posted write
+      dbg(3, "noc", f"tile {tile} noc{noc} NIU_CFG_0 0x{prev:08x} -> 0x{nextv:08x}")
+
+  def debug_tile_noc_translation_tables(self, tile: tuple[int, int]):
+    """Dump translation-related NOC_CFG regs for a tile (both NOCs)."""
+    base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
+    cfg = TLBConfig(addr=base, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
+    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
+
+    def rd(win: TLBWindow, abs_addr: int) -> int: return win.readi32(abs_addr - base)
+
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+      for noc, noc_base in ((0, TensixMMIO.NOC0_NIU_START), (1, TensixMMIO.NOC1_NIU_START)):
+        cfg0 = rd(win, noc_base + 0x100)
+        x = [rd(win, noc_base + 0x100 + r * 4) for r in range(0x6, 0xC)]
+        y = [rd(win, noc_base + 0x100 + r * 4) for r in range(0xC, 0x12)]
+        logical = rd(win, noc_base + 0x100 + 0x12 * 4)
+        dbg(1, "noc", f"tile {tile} noc{noc} NIU_CFG_0=0x{cfg0:08x} TRANSLATE_EN={1 if (cfg0 & bit) else 0}")
+        dbg(1, "noc", f"tile {tile} noc{noc} NOC_ID_LOGICAL=0x{logical:08x}")
+        dbg(2, "noc", f"tile {tile} noc{noc} X_TABLE={','.join(f'{v:08x}' for v in x)}")
+        dbg(2, "noc", f"tile {tile} noc{noc} Y_TABLE={','.join(f'{v:08x}' for v in y)}")
+
+  def debug_arc_noc_niu(self):
+    """Dump NIU_CFG_0 via ARC BAR aliases (may not reflect Tensix tiles)."""
     noc0_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC0_BAR)
     noc1_cfg = self.bar0_read32(NocNIU.NIU_CFG_NOC1_BAR)
-    dbg(1, "noc", f"NIU_CFG_0: NOC0=0x{noc0_cfg:08x} NOC1=0x{noc1_cfg:08x}")
+    dbg(1, "noc", f"ARC BAR NIU_CFG_0: NOC0=0x{noc0_cfg:08x} NOC1=0x{noc1_cfg:08x}")
     dbg(1, "noc", f"  NOC0: CG_EN={noc0_cfg & 1} TRANSLATE_EN={(noc0_cfg >> 14) & 1}")
     dbg(1, "noc", f"  NOC1: CG_EN={noc1_cfg & 1} TRANSLATE_EN={(noc1_cfg >> 14) & 1}")
-
-  def set_noc_translation_enabled(self, enable: bool):
-    """Enable or disable NOC coordinate translation on both NOC0 and NOC1.
-
-    When enabled, NOC1 coordinates are automatically translated so firmware
-    can use the same logical coordinates for both NOCs.
-    """
-    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
-    for bar_addr in (NocNIU.NIU_CFG_NOC0_BAR, NocNIU.NIU_CFG_NOC1_BAR):
-      niu_cfg = self.bar0_read32(bar_addr)
-      if enable:
-        niu_cfg |= bit
-      else:
-        niu_cfg &= ~bit
-      self.bar0_write32(bar_addr, niu_cfg)
-    dbg(2, "noc", f"noc_translation_enabled={enable}")
 
   def reset(self, dmc_reset: bool = False) -> int:
     bdf = self.get_bdf()
