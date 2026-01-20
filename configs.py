@@ -64,6 +64,11 @@ class TensixL1:
   TRISC0_INIT_LOCAL_L1_BASE_SCRATCH = 0x00c2b0
   TRISC1_INIT_LOCAL_L1_BASE_SCRATCH = 0x00d2b0
   TRISC2_INIT_LOCAL_L1_BASE_SCRATCH = 0x00e2b0
+  NCRISC_INIT_IRAM_L1_BASE_SCRATCH = 0x00f2b0
+
+  # Bank-to-NoC mapping tables (written by host, read by firmware during init)
+  # Layout: dram_bank_to_noc_xy + l1_bank_to_noc_xy + bank_to_dram_offset + bank_to_l1_offset
+  MEM_BANK_TO_NOC_SCRATCH = 0x0112b0  # NCRISC_INIT_IRAM + 0x2000
 
 class TensixMMIO:
   LOCAL_RAM_START = 0xFFB00000

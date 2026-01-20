@@ -266,6 +266,15 @@ class Device:
       dbg(2, "fw", f"verify tile {test_tile}: JAL=0x{v_jal:08x} GO=0x{v_go:08x} FW=0x{v_fw:08x}")
       cfg.mcast = True
 
+      # Write bank-to-NoC tables to scratch area (firmware reads these during init)
+      bank_tables = self._build_bank_noc_tables()
+      for x0, x1 in self.tiles.tensix_mcast:
+        cfg.start, cfg.end = (x0, y0), (x1, y1)
+        cfg.addr, cfg.mode = 0, TLBMode.ORDERED_BULK
+        win.configure(cfg)
+        win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
+      dbg(2, "fw", f"bank tables written to 0x{TensixL1.MEM_BANK_TO_NOC_SCRATCH:x}")
+
       # Phase 2: Release BRISC on ALL tiles (after all firmware is written)
       for x0, x1 in self.tiles.tensix_mcast:
         cfg.start, cfg.end = (x0, y0), (x1, y1)
@@ -289,6 +298,85 @@ class Device:
         if go == DevMsgs.RUN_MSG_DONE and dm1 == 0 and tr1 == 0 and tr2 == 0 and tr0 in (0, 3): return
         if time.perf_counter() > deadline: raise TimeoutError(f"firmware not ready on tile {tile}: go={go:#x} sync={sync:#x}")
         time.sleep(0.001)
+
+  def _build_bank_noc_tables(self) -> bytes:
+    """Build the bank-to-NoC mapping tables that firmware copies to local memory.
+
+    Layout in MEM_BANK_TO_NOC_SCRATCH:
+      dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS]  (uint16_t)
+      l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS]      (uint16_t)
+      bank_to_dram_offset[NUM_DRAM_BANKS]            (int32_t)
+      bank_to_l1_offset[NUM_L1_BANKS]                (int32_t)
+    """
+    NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
+    GRID_X, GRID_Y = 17, 12
+
+    # DRAM coordinates: use subchannel 0 for all banks (matches DramAllocator)
+    # All subchannels access the same 4GB DRAM, subchannel 0 is first in BANK_TILE_YS
+    # Bank 0-3 at x=0, Bank 4-7 at x=9
+    DRAM_COORDS = {
+      0: (0, 0), 1: (0, 2), 2: (0, 4), 3: (0, 5),
+      4: (9, 0), 5: (9, 2), 6: (9, 4), 7: (9, 5),
+    }  # Matches Dram.BANK_TILE_YS[bank][0] and Dram.BANK_X[bank]
+
+    def noc_coord(noc: int, grid_size: int, coord: int) -> int:
+      """NoC coordinate transformation.
+
+      On Blackhole with COORDINATE_VIRTUALIZATION_ENABLED, the NOC hardware
+      handles coordinate translation. Since pure-py doesn't set up the full
+      translation tables like tt-metal does, use raw physical coordinates
+      for both NoCs.
+      """
+      # TODO: If this doesn't work, may need to set up NOC translation tables
+      # or match tt-metal's virtualization logic more closely
+      return coord  # Use raw coordinates for both NoCs
+
+    def pack_xy(x: int, y: int) -> int:
+      """Pack (x, y) into 16-bit NoC XY encoding: (y << 6) | x"""
+      return ((y << 6) | x) & 0xFFFF
+
+    # Build list of unharvested channels (bank_id -> channel mapping)
+    channels = [c for c in range(8) if c != self.harvested_dram]
+    assert len(channels) == NUM_DRAM_BANKS, f"expected {NUM_DRAM_BANKS} banks, got {len(channels)}"
+
+    # dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] - stored as [noc0_banks..., noc1_banks...]
+    dram_xy = []
+    for noc in range(NUM_NOCS):
+      for ch in channels:
+        raw_x, raw_y = DRAM_COORDS[ch]
+        x = noc_coord(noc, GRID_X, raw_x)
+        y = noc_coord(noc, GRID_Y, raw_y)
+        dram_xy.append(pack_xy(x, y))
+
+    # l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS]
+    # Simplified mapping: distribute banks across tensix cores in row-major order
+    tensix_cols = list(TileGrid.TENSIX_X_P100A)
+    l1_xy = []
+    for noc in range(NUM_NOCS):
+      for bank_id in range(NUM_L1_BANKS):
+        col_idx = bank_id % len(tensix_cols)
+        row_idx = bank_id // len(tensix_cols)
+        raw_x = tensix_cols[col_idx]
+        raw_y = 2 + (row_idx % 10)  # tensix rows 2-11
+        x = noc_coord(noc, GRID_X, raw_x)
+        y = noc_coord(noc, GRID_Y, raw_y)
+        l1_xy.append(pack_xy(x, y))
+
+    # bank_to_dram_offset[NUM_DRAM_BANKS] - all zeros for simple interleaving
+    dram_offsets = [0] * NUM_DRAM_BANKS
+
+    # bank_to_l1_offset[NUM_L1_BANKS] - all zeros (no per-bank offset needed)
+    l1_offsets = [0] * NUM_L1_BANKS
+
+    # Pack into bytes (little-endian)
+    blob = struct.pack(f"<{len(dram_xy)}H", *dram_xy)
+    blob += struct.pack(f"<{len(l1_xy)}H", *l1_xy)
+    blob += struct.pack(f"<{len(dram_offsets)}i", *dram_offsets)
+    blob += struct.pack(f"<{len(l1_offsets)}i", *l1_offsets)
+
+    dbg(2, "noc", f"bank tables: dram_xy={len(dram_xy)*2}B l1_xy={len(l1_xy)*2}B "
+                  f"dram_off={len(dram_offsets)*4}B l1_off={len(l1_offsets)*4}B total={len(blob)}B")
+    return blob
 
   def _read_arc_boot_status(self) -> int:
     cfg = TLBConfig(addr=Arc.NOC_BASE, start=TileGrid.ARC, end=TileGrid.ARC, noc=0, mcast=False, mode=TLBMode.STRICT)
