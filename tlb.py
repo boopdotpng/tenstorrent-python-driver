@@ -7,10 +7,11 @@ import fcntl, mmap
 
 class TLBMode(Enum):
   # Values are (ordering, static_vc): ordering 0=relaxed, 1=ordered, 2=posted
-  STRICT = (1, 1)        # register access: full ordering, writes land in order
+  # NOTE: On Blackhole, UMD programs `static_vc = 0` (disabled). Setting it on BH can wedge the chip (ARC hangs).
+  STRICT = (1, 0)        # register access: full ordering, writes land in order
   BULK = (0, 0)          # L1/DRAM data: max parallelism, no ordering guarantees
   POSTED = (2, 0)        # fire-and-forget writes: fastest, weakest ordering
-  ORDERED_BULK = (0, 1)  # high throughput but packets stay in order through NoC
+  ORDERED_BULK = (1, 0)  # high throughput but packets stay in order through NoC
 
 Coord = tuple[int, int]
 

@@ -23,9 +23,10 @@ class DramAllocator:
     self.max_page_size = 2 * 1024 * 1024
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
 
-  def alloc(self, size: int, name: str | None = None) -> DramBuffer:
+  def alloc(self, size: int, name: str | None = None, *, page_size: int | None = None) -> DramBuffer:
     num_banks = len(self.bank_tiles)
-    page_size = min(self.max_page_size, _align((size + num_banks - 1) // num_banks))
+    page_size = min(self.max_page_size, page_size or _align((size + num_banks - 1) // num_banks))
+    page_size = _align(page_size)
     addr = self.next
     pages = (size + page_size - 1) // page_size
     pages_per_bank = (pages + num_banks - 1) // num_banks
@@ -33,8 +34,8 @@ class DramAllocator:
     dbg(2, "dram", f"alloc name={name!r} addr={addr:#x} size={size} pages={pages} page_size={page_size}")
     return DramBuffer(name=name, addr=addr, size=size, page_size=page_size)
 
-  def alloc_write(self, data: bytes, name: str | None = None) -> DramBuffer:
-    buf = self.alloc(len(data), name=name)
+  def alloc_write(self, data: bytes, name: str | None = None, *, page_size: int | None = None) -> DramBuffer:
+    buf = self.alloc(len(data), name=name, page_size=page_size)
     self.write(buf, data)
     return buf
 

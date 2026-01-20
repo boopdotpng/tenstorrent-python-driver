@@ -76,7 +76,14 @@ class TensixMMIO:
   RISCV_DEBUG_REG_TRISC1_RESET_PC = 0xFFB1222C
   RISCV_DEBUG_REG_TRISC2_RESET_PC = 0xFFB12230
   RISCV_DEBUG_REG_NCRISC_RESET_PC = 0xFFB12238
-  SOFT_RESET_ALL = 0x47800  # reset all 5 RISC-V cores (brisc, ncrisc, trisc0-2)
+
+  # Soft reset bit definitions (from tensix.h)
+  SOFT_RESET_BRISC = 0x00800   # bit 11
+  SOFT_RESET_TRISCS = 0x07000  # bits 12-14 (trisc0, trisc1, trisc2)
+  SOFT_RESET_NCRISC = 0x40000  # bit 18
+  SOFT_RESET_ALL = 0x47800     # all 5 RISC-V cores
+  # Keep TRISC/NCRISC in reset, release only BRISC (BRISC brings up others)
+  SOFT_RESET_BRISC_ONLY_RUN = SOFT_RESET_TRISCS | SOFT_RESET_NCRISC  # 0x47000
 
 class Arc:
   NOC_BASE = 0x80000000  # ARC NoC xbar base
