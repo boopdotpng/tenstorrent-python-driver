@@ -664,10 +664,6 @@ class Device:
 
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
 
-  def force_fan_speed(self, pct: int | None, *, timeout_ms: int = 1000) -> list[int]:
-    raw = 0xFFFFFFFF if pct is None else int(pct)
-    return self.arc_msg(0xAC, raw, 0, timeout_ms=timeout_ms)
-
   def get_tile_noc_translation_enabled(self, tile: tuple[int, int]) -> dict[int, bool]:
     """Read NIU_CFG_0 on a Tensix tile for both NOCs."""
     base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
