@@ -67,9 +67,7 @@ class TileGrid:
     return cls(tensix=tensix, tensix_mcast=tensix_mcast, dram=dram)
 
 class Device:
-  def __init__(
-    self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True
-  ):
+  def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
     self.path = path
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
     self._setup()
@@ -101,9 +99,7 @@ class Device:
     return mask, as_bytes(arr)
 
   def _pack_kernel_config(self, program: Program):
-    pack = lambda xs: b"".join(
-      int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs
-    )
+    pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
     align16 = lambda n: (n + 15) & ~15
 
     brisc_rta = pack(program.writer_rt_args)
@@ -258,26 +254,20 @@ class Device:
 
     def stage_spans(name: str, segs) -> list[tuple[int, bytes]]:
       base, init = fw_map[name]
-      assert any(s.paddr == base for s in segs), (
-        f"{name}: missing text base 0x{base:x}"
-      )
+      assert any(s.paddr == base for s in segs), f"{name}: missing text base 0x{base:x}"
       spans = []
       for s in segs:
         if not s.data and s.memsz == 0:
           continue
         data = (
-          s.data
-          if s.memsz <= len(s.data)
-          else s.data + b"\0" * (s.memsz - len(s.data))
+          s.data if s.memsz <= len(s.data) else s.data + b"\0" * (s.memsz - len(s.data))
         )
         addr = s.paddr
         if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
           addr = init + (addr - TensixMMIO.LOCAL_RAM_START)
           assert 0 <= addr < TensixL1.SIZE
         else:
-          assert 0 <= addr < TensixL1.SIZE, (
-            f"{name}: unexpected paddr 0x{addr:x}"
-          )
+          assert 0 <= addr < TensixL1.SIZE, f"{name}: unexpected paddr 0x{addr:x}"
         spans.append((addr, data))
       return spans
 
@@ -300,9 +290,7 @@ class Device:
           for addr, data in spans:
             win.write(addr, data, use_uc=True, restore=False)
 
-        win.write(
-          0x0, jal_insn.to_bytes(4, "little"), use_uc=True, restore=False
-        )
+        win.write(0x0, jal_insn.to_bytes(4, "little"), use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, go_msg, use_uc=True, restore=False)
 
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
@@ -564,9 +552,7 @@ class Device:
     self.arch = self._get_arch()
     if self.arch != "p100a":
       os.close(self.fd)
-      raise SystemExit(
-        f"unsupported blackhole device {self.arch}; p100a only for now"
-      )
+      raise SystemExit(f"unsupported blackhole device {self.arch}; p100a only for now")
     self._map_bars()
 
   def _close(self):
@@ -694,9 +680,7 @@ class Device:
         time.sleep(0.001)
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
 
-  def get_tile_noc_translation_enabled(
-    self, tile: tuple[int, int]
-  ) -> dict[int, bool]:
+  def get_tile_noc_translation_enabled(self, tile: tuple[int, int]) -> dict[int, bool]:
     base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
     cfg = TLBConfig(
       addr=base, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT
@@ -726,9 +710,7 @@ class Device:
       TLBMode.STRICT,
     )
     win.configure(cfg)
-    reg = (
-      TensixMMIO.NOC0_NIU_START if noc == 0 else TensixMMIO.NOC1_NIU_START
-    ) + 0x100
+    reg = (TensixMMIO.NOC0_NIU_START if noc == 0 else TensixMMIO.NOC1_NIU_START) + 0x100
     off = reg - base
     bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
     prev = win.readi32(off)
