@@ -6,7 +6,6 @@ import os
 
 from codegen import Compiler, Processor
 from device import Device
-from fast_device import FastDevice
 
 N_TILES = 64
 
@@ -181,8 +180,7 @@ def main():
   dev_cfg = {}
   if noc1_translate is not None:
     dev_cfg["noc_translation_enabled"] = {1: bool(int(noc1_translate))}
-  DeviceClass = FastDevice if os.environ.get("TT_FAST_DISPATCH") else Device
-  device = DeviceClass(**dev_cfg)
+  device = Device(**dev_cfg)
   try:
     core = (1, 2) if (1, 2) in device.tiles.tensix else device.tiles.tensix[0]
     if os.environ.get("DUMP_NOC_TABLES") == "1":
