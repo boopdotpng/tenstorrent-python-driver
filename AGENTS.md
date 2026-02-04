@@ -6,4 +6,5 @@ Write excellent, concise code that solves problems elegantly.
 
 ## style
 - use 2 space indents everywhere 
+- max 150 characters per line
 - do not run a formatter after you write code 

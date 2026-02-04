@@ -5,26 +5,23 @@ from helpers import _IO, noc1
 import fcntl, mmap
 
 class TLBMode(Enum):
-  STRICT = (1, 0)  # register access: full ordering
-  BULK = (0, 0)  # L1/DRAM data: max parallelism
-  POSTED = (2, 0)  # fire-and-forget writes
-  ORDERED_BULK = (1, 0)  # high throughput, packets in order
-
-Coord = tuple[int, int]
+  RELAXED = 0  # bulk transfers, may reorder
+  STRICT = 1   # full ordering, slow dispatch
+  POSTED = 2   # fire-and-forget, RAW hazard possible
 
 @dataclass
 class TLBConfig:
   addr: int
-  start: Coord | None = None
-  end: Coord | None = None
+  start: tuple[int, int] | None = None
+  end: tuple[int, int] | None = None
   noc: int = 0
   mcast: bool = False
-  mode: TLBMode = TLBMode.BULK
+  mode: TLBMode = TLBMode.RELAXED
 
   def to_struct(self) -> NocTlbConfig:
     if self.start is None or self.end is None:
       raise ValueError("tlb start/end must be set before configure")
-    ordering, static_vc = self.mode.value
+    ordering = self.mode.value
     start = noc1(*self.start) if self.noc == 1 else self.start
     end = noc1(*self.end) if self.noc == 1 else self.end
     cfg = NocTlbConfig()
@@ -34,7 +31,7 @@ class TLBConfig:
     cfg.noc = self.noc
     cfg.mcast = int(self.mcast)
     cfg.ordering = ordering
-    cfg.static_vc = static_vc
+    cfg.static_vc = 0
     cfg.linked = 0
     return cfg
 
@@ -84,8 +81,6 @@ class TLBWindow:
     self.config = config
 
   def write(self, addr: int, data: bytes, use_uc: bool = False, restore: bool = True):
-    if not data:
-      return
     if self.config is None:
       raise RuntimeError("tlb window has no active config")
     config = self.config
@@ -105,10 +100,10 @@ class TLBWindow:
         config.addr = prev
         self.configure(config)
 
-  def readi32(self, offset: int) -> int:
+  def read32(self, offset: int) -> int:
     return int.from_bytes(self.uc[offset : offset + 4], "little")
 
-  def writei32(self, offset: int, value: int):
+  def write32(self, offset: int, value: int):
     self.uc[offset : offset + 4] = value.to_bytes(4, "little")
 
   def free(self):

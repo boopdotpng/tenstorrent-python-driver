@@ -1,20 +1,32 @@
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable
 from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize
 from tlb import TLBConfig, TLBWindow, TLBMode
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
+TILE_ELEMS = TILE_R * TILE_C
+
+class DType(Enum):
+  float32 = 4
+  int32 = 4
+  uint32 = 4
+  float16 = 2
+  bfloat16 = 2
+  uint16 = 2
+  int8 = 1
+  uint8 = 1
 
 def _align(x: int, a: int = DRAM_ALIGNMENT) -> int:
   return (x + a - 1) & ~(a - 1)
 
-def _tile_transform(data: bytes, n_tiles: int, forward: bool) -> bytes:
+def _tile_transform(data: bytes, bpe: int, forward: bool) -> bytes:
   """Convert between row-major and TILED_NFACES (4 faces per 32x32 tile)."""
-  bpe = len(data) // (n_tiles * TILE_R * TILE_C)
+  n_tiles = len(data) // (TILE_ELEMS * bpe)
   out = bytearray(len(data))
   for t in range(n_tiles):
-    toff = t * TILE_R * TILE_C * bpe
+    toff = t * TILE_ELEMS * bpe
     for face_r in range(2):
       for face_c in range(2):
         face_idx = face_r * 2 + face_c
@@ -27,11 +39,11 @@ def _tile_transform(data: bytes, n_tiles: int, forward: bool) -> bytes:
           out[dst_off : dst_off + FACE_C * bpe] = data[src_off : src_off + FACE_C * bpe]
   return bytes(out)
 
-def tilize(data: bytes, n_tiles: int) -> bytes:
-  return _tile_transform(data, n_tiles, forward=True)
+def tilize(data: bytes, bpe: int) -> bytes:
+  return _tile_transform(data, bpe, forward=True)
 
-def untilize(data: bytes, n_tiles: int) -> bytes:
-  return _tile_transform(data, n_tiles, forward=False)
+def untilize(data: bytes, bpe: int) -> bytes:
+  return _tile_transform(data, bpe, forward=False)
 
 @dataclass(frozen=True)
 class DramBuffer:
@@ -39,6 +51,7 @@ class DramBuffer:
   addr: int
   size: int
   page_size: int
+  dtype: DType | None = None
 
 class DramAllocator:
   def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]]):
@@ -49,7 +62,7 @@ class DramAllocator:
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
 
   def alloc(
-    self, size: int, name: str | None = None, *, page_size: int | None = None
+    self, size: int, name: str | None = None, *, page_size: int | None = None, dtype: DType | None = None
   ) -> DramBuffer:
     num_banks = len(self.bank_tiles)
     page_size = min(
@@ -60,12 +73,12 @@ class DramAllocator:
     pages = (size + page_size - 1) // page_size
     pages_per_bank = (pages + num_banks - 1) // num_banks
     self.next = _align(self.next + pages_per_bank * page_size)
-    return DramBuffer(name=name, addr=addr, size=size, page_size=page_size)
+    return DramBuffer(name=name, addr=addr, size=size, page_size=page_size, dtype=dtype)
 
   def alloc_write(
-    self, data: bytes, name: str | None = None, *, page_size: int | None = None
+    self, data: bytes, name: str | None = None, *, page_size: int | None = None, dtype: DType | None = None
   ) -> DramBuffer:
-    buf = self.alloc(len(data), name=name, page_size=page_size)
+    buf = self.alloc(len(data), name=name, page_size=page_size, dtype=dtype)
     self.write(buf, data)
     return buf
 
@@ -103,15 +116,15 @@ class DramAllocator:
             mode=TLBMode.STRICT,
           )
         )
-        self.win.writei32(DRAM_BARRIER_BASE, flag)
-        while self.win.readi32(DRAM_BARRIER_BASE) != flag:
+        self.win.write32(DRAM_BARRIER_BASE, flag)
+        while self.win.read32(DRAM_BARRIER_BASE) != flag:
           pass
 
   def write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
-    assert (
-      buf.page_size >= DRAM_ALIGNMENT and (buf.page_size & (DRAM_ALIGNMENT - 1)) == 0
-    )
+    assert buf.page_size >= DRAM_ALIGNMENT and (buf.page_size & (DRAM_ALIGNMENT - 1)) == 0
+    if buf.dtype is not None:
+      data = tilize(data, buf.dtype.value)
     view = memoryview(data)
 
     def do_write(addr: int, off: int):
@@ -129,7 +142,9 @@ class DramAllocator:
       n = min(buf.page_size, remaining)
       result[off : off + n] = self.win.wc[addr : addr + n]
 
-    self._for_each_page(buf, buf.size, TLBMode.BULK, do_read)
+    self._for_each_page(buf, buf.size, TLBMode.RELAXED, do_read)
+    if buf.dtype is not None:
+      return untilize(bytes(result), buf.dtype.value)
     return bytes(result)
 
   def close(self):

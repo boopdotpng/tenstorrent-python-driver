@@ -1,80 +1,53 @@
-from __future__ import annotations
 import ctypes, fcntl, mmap, os, struct, time
 from dataclasses import dataclass, field
 from typing import ClassVar
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import (
-  _IO,
-  align_down,
-  find_dev_by_bdf,
-  format_bdf,
-  generate_jal_instruction,
-  ioctl,
-  load_pt_load,
-)
+from helpers import _IO, align_down, generate_jal_instruction, load_pt_load
 from pathlib import Path
 from dram import DramAllocator
 from codegen import CompiledKernel
 
 @dataclass
 class Program:
-  reader: CompiledKernel | None = None
-  writer: CompiledKernel | None = None
-  compute: list[CompiledKernel] = field(
-    default_factory=list
-  )  # [trisc0, trisc1, trisc2]
-  reader_rt_args: list[int] = field(default_factory=list)
-  writer_rt_args: list[int] = field(default_factory=list)
-  compute_rt_args: list[int] = field(default_factory=list)
-  cbs: list[int] = field(default_factory=lambda: [0, 16])
-  tile_size: int = 2048
-  num_pages: int = 2
+  reader: CompiledKernel | None
+  writer: CompiledKernel | None
+  compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel] | None
+  reader_rt_args: list[int]
+  writer_rt_args: list[int]
+  compute_rt_args: list[int]
+  cbs: list[int]
+  tile_size: int
+  num_pages: int
 
 @dataclass
 class TileGrid:
   ARC: ClassVar[tuple[int, int]] = (8, 0)
+  TENSIX_X: ClassVar[tuple[int, ...]] = (*range(1, 8), *range(10, 15))  # 1-7, 10-14 (skip DRAM cols 8,9)
   TENSIX_Y: ClassVar[tuple[int, int]] = (2, 11)
-  TENSIX_X_P100A: ClassVar[tuple[int, ...]] = (
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    10,
-    11,
-    12,
-    13,
-    14,
-  )
-  tensix: list[tuple[int, int]]
-  tensix_mcast: list[tuple[int, int]]
-  dram: list[tuple[int, int, int]]
+  TENSIX: ClassVar[list[tuple[int, int]]] = [(x, y) for x in TENSIX_X for y in range(2, 12)]
+  TENSIX_MCAST: ClassVar[list[tuple[int, int]]] = [(1, 7), (10, 14)]
 
-  @classmethod
-  def p100a(cls, harvested_dram_bank: int) -> TileGrid:
-    tensix_cols = list(cls.TENSIX_X_P100A)
-    y0, y1 = cls.TENSIX_Y
-    tensix = [(x, y) for x in tensix_cols for y in range(y0, y1 + 1)]
-    tensix_mcast = [(1, 7), (10, 14)]
-    dram = []
-    for bank in range(Dram.BANK_COUNT):
-      if bank == harvested_dram_bank:
-        continue
-      dram.extend((bank, Dram.BANK_X[bank], y) for y in Dram.BANK_TILE_YS[bank])
-    return cls(tensix=tensix, tensix_mcast=tensix_mcast, dram=dram)
+  harvested_dram_bank: int
+  dram: list[tuple[int, int, int]] = field(init=False)
+
+  def __post_init__(self):
+    self.dram = [(bank, Dram.BANK_X[bank], y) for bank in range(Dram.BANK_COUNT)
+                 if bank != self.harvested_dram_bank for y in Dram.BANK_TILE_YS[bank]]
 
 class Device:
   def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
     self.path = path
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
-    self._setup()
+    ordinal = path.split("/")[-1]
+    self.arch = Path(f"/sys/class/tenstorrent/tenstorrent!{ordinal}/tt_card_type").read_text().strip()
+    if self.arch != "p100a":
+      os.close(self.fd)
+      raise SystemExit(f"unsupported blackhole device {self.arch}; p100a only for now")
     self._assert_arc_booted()
     self.harvested_dram = self.get_harvested_dram_bank()
-    self.tiles = TileGrid.p100a(self.harvested_dram)
-    ref_tile = (1, 2) if (1, 2) in self.tiles.tensix else self.tiles.tensix[0]
+    self.tiles = TileGrid(self.harvested_dram)
+    ref_tile = (1, 2) if (1, 2) in TileGrid.TENSIX else TileGrid.TENSIX[0]
     self.noc_translation_enabled = self.get_tile_noc_translation_enabled(ref_tile)
     if upload_firmware:
       self.upload_firmware()
@@ -114,8 +87,9 @@ class Device:
     kernel_off = align16(local_cb_off + len(local_cb_blob))
 
     kernels = {"brisc": program.writer, "ncrisc": program.reader}
-    for i, k in enumerate(program.compute):
-      kernels[f"trisc{i}"] = k
+    if program.compute:
+      for i, k in enumerate(program.compute):
+        kernels[f"trisc{i}"] = k
     proc = [
       ("brisc", 0),
       ("ncrisc", 1),
@@ -177,7 +151,7 @@ class Device:
 
   def run(self, program: Program):
     img, kc = self._pack_kernel_config(program)
-    cores = self.tiles.tensix
+    cores = TileGrid.TENSIX
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -279,13 +253,13 @@ class Device:
     go_msg = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
 
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
-      for x0, x1 in self.tiles.tensix_mcast:
+      for x0, x1 in TileGrid.TENSIX_MCAST:
         cfg.start, cfg.end = (x0, y0), (x1, y1)
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
-        win.writei32(reg_off, TensixMMIO.SOFT_RESET_ALL)
+        win.write32(reg_off, TensixMMIO.SOFT_RESET_ALL)
 
-        cfg.mode = TLBMode.ORDERED_BULK
+        cfg.mode = TLBMode.RELAXED
         for name, spans in staged.items():
           for addr, data in spans:
             win.write(addr, data, use_uc=True, restore=False)
@@ -299,12 +273,12 @@ class Device:
         trisc1_pc_off = TensixMMIO.RISCV_DEBUG_REG_TRISC1_RESET_PC - reg_base
         trisc2_pc_off = TensixMMIO.RISCV_DEBUG_REG_TRISC2_RESET_PC - reg_base
         ncrisc_pc_off = TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC - reg_base
-        win.writei32(trisc0_pc_off, TensixL1.TRISC0_BASE)
-        win.writei32(trisc1_pc_off, TensixL1.TRISC1_BASE)
-        win.writei32(trisc2_pc_off, TensixL1.TRISC2_BASE)
-        win.writei32(ncrisc_pc_off, TensixL1.NCRISC_FIRMWARE_BASE)
+        win.write32(trisc0_pc_off, TensixL1.TRISC0_BASE)
+        win.write32(trisc1_pc_off, TensixL1.TRISC1_BASE)
+        win.write32(trisc2_pc_off, TensixL1.TRISC2_BASE)
+        win.write32(ncrisc_pc_off, TensixL1.NCRISC_FIRMWARE_BASE)
 
-      test_tile = self.tiles.tensix[0]
+      test_tile = TileGrid.TENSIX[0]
       cfg.start, cfg.end = test_tile, test_tile
       cfg.addr, cfg.mode = 0, TLBMode.STRICT
       cfg.mcast = False
@@ -312,9 +286,9 @@ class Device:
       cfg.mcast = True
 
       bank_tables = self._build_bank_noc_tables()
-      for x0, x1 in self.tiles.tensix_mcast:
+      for x0, x1 in TileGrid.TENSIX_MCAST:
         cfg.start, cfg.end = (x0, y0), (x1, y1)
-        cfg.addr, cfg.mode = 0, TLBMode.ORDERED_BULK
+        cfg.addr, cfg.mode = 0, TLBMode.RELAXED
         win.configure(cfg)
         win.write(
           TensixL1.MEM_BANK_TO_NOC_SCRATCH,
@@ -324,17 +298,17 @@ class Device:
         )
 
       cfg.mcast = True
-      for x0, x1 in self.tiles.tensix_mcast:
+      for x0, x1 in TileGrid.TENSIX_MCAST:
         cfg.start, cfg.end = (x0, y0), (x1, y1)
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
-        win.readi32(reg_off)
-        win.writei32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
+        win.read32(reg_off)
+        win.write32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
 
     self._wait_firmware_ready()
 
   def _wait_firmware_ready(self):
-    tile = (1, 2) if (1, 2) in self.tiles.tensix else self.tiles.tensix[0]
+    tile = (1, 2) if (1, 2) in TileGrid.TENSIX else TileGrid.TENSIX[0]
     cfg = TLBConfig(
       addr=0, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT
     )
@@ -342,7 +316,7 @@ class Device:
       deadline = time.perf_counter() + 2.0
       while True:
         go = win.uc[TensixL1.GO_MSG + 3]
-        sync = win.readi32(TensixL1.MAILBOX_BASE + 8)
+        sync = win.read32(TensixL1.MAILBOX_BASE + 8)
         dm1, tr0, tr1, tr2 = (
           sync & 0xFF,
           (sync >> 8) & 0xFF,
@@ -466,7 +440,7 @@ class Device:
           y = noc_coord(noc, GRID_Y, raw_y)
         dram_xy.append(pack_xy(x, y))
 
-    tensix_cols = list(TileGrid.TENSIX_X_P100A)
+    tensix_cols = TileGrid.TENSIX_X
     l1_xy = []
     for noc in range(NUM_NOCS):
       for bank_id in range(NUM_L1_BANKS):
@@ -497,7 +471,7 @@ class Device:
       mode=TLBMode.STRICT,
     )
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as arc:
-      return arc.readi32(Arc.SCRATCH_RAM_2)
+      return arc.read32(Arc.SCRATCH_RAM_2)
 
   def _assert_arc_booted(self, timeout_s: float = 5.0):
     deadline = time.perf_counter() + timeout_s
@@ -521,7 +495,7 @@ class Device:
       mode=TLBMode.STRICT,
     )
     with TLBWindow(self.fd, TLBSize.MiB_2, tlb_config) as arc:
-      telem_struct_addr = arc.readi32(Arc.SCRATCH_RAM_13)
+      telem_struct_addr = arc.read32(Arc.SCRATCH_RAM_13)
       if telem_struct_addr == 0 or not (
         Arc.CSM_START <= telem_struct_addr <= Arc.CSM_END
       ):
@@ -529,17 +503,17 @@ class Device:
       csm_base, csm_offset = align_down(telem_struct_addr, TLBSize.MiB_2)
       tlb_config.addr = csm_base
       arc.configure(tlb_config)
-      entry_count = arc.readi32(csm_offset + 4)
+      entry_count = arc.read32(csm_offset + 4)
       tags_base = csm_offset + 8
       data_base = tags_base + entry_count * 4
       tag_to_offset = {}
       for i in range(entry_count):
-        tag_offset = arc.readi32(tags_base + i * 4)
+        tag_offset = arc.read32(tags_base + i * 4)
         tag_to_offset[tag_offset & 0xFFFF] = (tag_offset >> 16) & 0xFFFF
 
       def read_tag(tag: int, default: int) -> int:
         off = tag_to_offset.get(tag)
-        return default if off is None else arc.readi32(data_base + off * 4)
+        return default if off is None else arc.read32(data_base + off * 4)
 
       gddr_enabled = read_tag(Arc.TAG_GDDR_ENABLED, Arc.DEFAULT_GDDR_ENABLED)
     dram_off = [
@@ -548,53 +522,10 @@ class Device:
     assert len(dram_off) == 1, f"expected 1 harvested dram bank, got {dram_off}"
     return dram_off[0]
 
-  def _setup(self, retried: bool = False):
-    self.arch = self._get_arch()
-    if self.arch != "p100a":
-      os.close(self.fd)
-      raise SystemExit(f"unsupported blackhole device {self.arch}; p100a only for now")
-    self._map_bars()
-
   def _close(self):
-    if hasattr(self, "mm0"):
-      self.mm0.close()
-    if hasattr(self, "mm1"):
-      self.mm1.close()
     if hasattr(self, "dram"):
       self.dram.close()
     os.close(self.fd)
-
-  def get_bdf(self) -> str:
-    info = ioctl(
-      self.fd,
-      IOCTL_GET_DEVICE_INFO,
-      TenstorrentGetDeviceInfoIn,
-      TenstorrentGetDeviceInfoOut,
-      output_size_bytes=ctypes.sizeof(TenstorrentGetDeviceInfoOut),
-    )
-    return format_bdf(info.pci_domain, info.bus_dev_fn)
-
-  def _map_bars(self):
-    in_sz = ctypes.sizeof(QueryMappingsIn)
-    out_sz = ctypes.sizeof(TenstorrentMapping)
-    buf = bytearray(in_sz + 6 * out_sz)
-    QueryMappingsIn.from_buffer(buf).output_mapping_count = 6
-    fcntl.ioctl(self.fd, _IO(IOCTL_QUERY_MAPPINGS), buf, True)
-    bars = list((TenstorrentMapping * 6).from_buffer(buf, in_sz))
-    self.mm0 = mmap.mmap(
-      self.fd,
-      bars[0].mapping_size,
-      flags=mmap.MAP_SHARED,
-      prot=mmap.PROT_READ | mmap.PROT_WRITE,
-      offset=bars[0].mapping_base,
-    )
-    self.mm1 = mmap.mmap(
-      self.fd,
-      bars[2].mapping_size,
-      flags=mmap.MAP_SHARED,
-      prot=mmap.PROT_READ | mmap.PROT_WRITE,
-      offset=bars[2].mapping_base,
-    )
 
   def arc_msg(
     self,
@@ -631,42 +562,42 @@ class Device:
       mode=TLBMode.STRICT,
     )
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as arc:
-      info_ptr = arc.readi32(Arc.SCRATCH_RAM_11)
+      info_ptr = arc.read32(Arc.SCRATCH_RAM_11)
       if info_ptr == 0:
         raise RuntimeError("msgqueue not initialized (SCRATCH_RAM_11 == 0)")
 
       info_base, info_off = align_down(info_ptr, TLBSize.MiB_2)
       cfg.addr = info_base
       arc.configure(cfg)
-      queues_ptr = arc.readi32(info_off)
+      queues_ptr = arc.read32(info_off)
 
       q_base, q_off = align_down(queues_ptr, TLBSize.MiB_2)
       cfg.addr = q_base
       arc.configure(cfg)
       q = q_off + queue * QUEUE_STRIDE
 
-      wptr = arc.readi32(q + 0)
+      wptr = arc.read32(q + 0)
       req = q + HEADER_BYTES + (wptr % MSG_QUEUE_SIZE) * REQUEST_BYTES
       words = [msg & 0xFF, arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF] + [0] * (
         REQUEST_MSG_LEN - 3
       )
       for i, word in enumerate(words):
-        arc.writei32(req + i * 4, word)
-      arc.writei32(q + 0, (wptr + 1) % MSG_QUEUE_POINTER_WRAP)
+        arc.write32(req + i * 4, word)
+      arc.write32(q + 0, (wptr + 1) % MSG_QUEUE_POINTER_WRAP)
 
       cfg.addr = Arc.NOC_BASE
       arc.configure(cfg)
-      arc.writei32(
+      arc.write32(
         RESET_UNIT_ARC_MISC_CNTL,
-        arc.readi32(RESET_UNIT_ARC_MISC_CNTL) | IRQ0_TRIG_BIT,
+        arc.read32(RESET_UNIT_ARC_MISC_CNTL) | IRQ0_TRIG_BIT,
       )
 
       cfg.addr = q_base
       arc.configure(cfg)
-      rptr = arc.readi32(q + 4)
+      rptr = arc.read32(q + 4)
       deadline = time.monotonic() + (timeout_ms / 1000.0)
       while time.monotonic() < deadline:
-        resp_wptr = arc.readi32(q + 20)
+        resp_wptr = arc.read32(q + 20)
         if resp_wptr != rptr:
           resp = (
             q
@@ -674,8 +605,8 @@ class Device:
             + (MSG_QUEUE_SIZE * REQUEST_BYTES)
             + (rptr % MSG_QUEUE_SIZE) * RESPONSE_BYTES
           )
-          out = [arc.readi32(resp + i * 4) for i in range(RESPONSE_MSG_LEN)]
-          arc.writei32(q + 4, (rptr + 1) % MSG_QUEUE_POINTER_WRAP)
+          out = [arc.read32(resp + i * 4) for i in range(RESPONSE_MSG_LEN)]
+          arc.write32(q + 4, (rptr + 1) % MSG_QUEUE_POINTER_WRAP)
           return out
         time.sleep(0.001)
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
@@ -687,8 +618,8 @@ class Device:
     )
     bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      v0 = win.readi32((TensixMMIO.NOC0_NIU_START + 0x100) - base)
-      v1 = win.readi32((TensixMMIO.NOC1_NIU_START + 0x100) - base)
+      v0 = win.read32((TensixMMIO.NOC0_NIU_START + 0x100) - base)
+      v1 = win.read32((TensixMMIO.NOC1_NIU_START + 0x100) - base)
     return {0: (v0 & bit) != 0, 1: (v1 & bit) != 0}
 
   def _set_tile_noc_translation_enabled(
@@ -713,48 +644,13 @@ class Device:
     reg = (TensixMMIO.NOC0_NIU_START if noc == 0 else TensixMMIO.NOC1_NIU_START) + 0x100
     off = reg - base
     bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
-    prev = win.readi32(off)
+    prev = win.read32(off)
     nextv = (prev | bit) if enable else (prev & ~bit)
     if nextv != prev:
-      win.writei32(off, nextv)
-      win.readi32(off)
+      win.write32(off, nextv)
+      win.read32(off)
 
-  def reset(self, dmc_reset: bool = False) -> int:
-    bdf = self.get_bdf()
-    in_sz, out_sz = ctypes.sizeof(ResetDeviceIn), ctypes.sizeof(ResetDeviceOut)
-    buf = bytearray(in_sz + out_sz)
-    view = ResetDeviceIn.from_buffer(buf)
-    view.output_size_bytes = out_sz
-    view.flags = (
-      TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET
-      if dmc_reset
-      else TENSTORRENT_RESET_DEVICE_ASIC_RESET
-    )
-    fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
-    self._close()
-    for _ in range(50):
-      time.sleep(0.2)
-      if path := find_dev_by_bdf(bdf):
-        self.path = path
-        break
-    else:
-      raise RuntimeError(f"device {bdf} didn't come back after reset")
-    self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
-    buf = bytearray(in_sz + out_sz)
-    view = ResetDeviceIn.from_buffer(buf)
-    view.output_size_bytes, view.flags = out_sz, TENSTORRENT_RESET_DEVICE_POST_RESET
-    fcntl.ioctl(self.fd, _IO(IOCTL_RESET_DEVICE), buf, True)
-    result = ResetDeviceOut.from_buffer(buf, in_sz).result
-    self._setup(retried=True)
-    return result
 
-  def _get_arch(self):
-    ordinal = self.path.split("/")[-1]
-    return (
-      Path(f"/sys/class/tenstorrent/tenstorrent!{ordinal}/tt_card_type")
-      .read_text()
-      .strip()
-    )
 
   def close(self):
     self._close()

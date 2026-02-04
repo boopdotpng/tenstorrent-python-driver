@@ -1,6 +1,6 @@
 from __future__ import annotations
 import random, struct
-from codegen import Compiler, Processor
+from codegen import Compiler
 from device import Device, Program
 from dram import tilize, untilize
 
@@ -99,24 +99,8 @@ def _make_bf16_buffer(n_tiles: int, *, seed: int = 0) -> bytes:
     out[i * 2 : (i + 1) * 2] = _bf16_from_f32(r.random()).to_bytes(2, "little")
   return bytes(out)
 
-def _compile_add1_sfpu():
-  cc = Compiler()
-  return {
-    "reader": cc.compile_kernel(
-      K_READER, Processor.NCRISC, dispatch_message_addr=0, noc_index=0
-    ),
-    "writer": cc.compile_kernel(
-      K_WRITER, Processor.BRISC, dispatch_message_addr=0, noc_index=1
-    ),
-    "compute": [
-      cc.compile_kernel(K_COMPUTE, Processor.TRISC0, dispatch_message_addr=0),
-      cc.compile_kernel(K_COMPUTE, Processor.TRISC1, dispatch_message_addr=0),
-      cc.compile_kernel(K_COMPUTE, Processor.TRISC2, dispatch_message_addr=0),
-    ],
-  }
-
 def main():
-  kernels = _compile_add1_sfpu()
+  kernels = Compiler().compile(K_READER, K_WRITER, K_COMPUTE)
   device = Device()
   try:
     tile_size_bytes = 32 * 32 * 2
@@ -128,12 +112,15 @@ def main():
     )
 
     program = Program(
-      reader=kernels["reader"],
-      writer=kernels["writer"],
-      compute=kernels["compute"],
+      reader=kernels.reader,
+      writer=kernels.writer,
+      compute=kernels.compute,
       reader_rt_args=[src_buf.addr],
       writer_rt_args=[dst_buf.addr],
+      compute_rt_args=[],
       cbs=[0, 16],
+      tile_size=tile_size_bytes,
+      num_pages=2,
     )
     device.run(program)
 

@@ -102,35 +102,11 @@ class Dram:
 # -- Kernel driver ioctls ------------------------------------------------------
 
 TENSTORRENT_IOCTL_MAGIC = 0xFA
-IOCTL_GET_DEVICE_INFO = 0
-IOCTL_QUERY_MAPPINGS = 2
-IOCTL_RESET_DEVICE = 6
 IOCTL_ALLOCATE_TLB = 11
 IOCTL_FREE_TLB = 12
 IOCTL_CONFIGURE_TLB = 13
 
-TENSTORRENT_RESET_DEVICE_ASIC_RESET = 4
-TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET = 5
-TENSTORRENT_RESET_DEVICE_POST_RESET = 6
-
 # -- Ioctl structs -------------------------------------------------------------
-
-class QueryMappingsIn(S):
-  _fields_ = [("output_mapping_count", u32), ("reserved", u32)]
-
-class TenstorrentMapping(S):
-  _fields_ = [
-    ("mapping_id", u32),
-    ("reserved", u32),
-    ("mapping_base", u64),
-    ("mapping_size", u64),
-  ]
-
-class ResetDeviceIn(S):
-  _fields_ = [("output_size_bytes", u32), ("flags", u32)]
-
-class ResetDeviceOut(S):
-  _fields_ = [("output_size_bytes", u32), ("result", u32)]
 
 class AllocateTlbIn(S):
   _fields_ = [("size", u64), ("reserved", u64)]
@@ -168,22 +144,6 @@ class NocTlbConfig(S):
 
 class ConfigureTlbIn(S):
   _fields_ = [("tlb_id", u32), ("reserved", u32), ("config", NocTlbConfig)]
-
-class TenstorrentGetDeviceInfoIn(S):
-  _fields_ = [("output_size_bytes", u32)]
-
-class TenstorrentGetDeviceInfoOut(S):
-  _fields_ = [
-    ("output_size_bytes", u32),
-    ("vendor_id", u16),
-    ("device_id", u16),
-    ("subsystem_vendor_id", u16),
-    ("subsystem_id", u16),
-    ("bus_dev_fn", u16),
-    ("max_dma_buf_size_log2", u16),
-    ("pci_domain", u16),
-    ("reserved", u16),
-  ]
 
 # -- Firmware dispatch structs -------------------------------------------------
 
