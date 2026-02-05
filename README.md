@@ -2,7 +2,10 @@
 A full replacement of **tt-metal** and **tt-umd**, written in Python. 
 
 ## requirements 
-- A build of tt-metal. You need the compiler and some of the header files, notably `sfpi.h` and some `ckernel` headers (low level control of the tensix coprocessor). At some point I'll extract the headers I need into this project and bundle the compiler so that it works without installing anything, but for now set `TT_HOME` to wherever you have `tt-metal` installed. This is only required for kernel compilation. 
-- **tt-kmd**, their kernel driver. 
-- Firmware for each baby risc-v core (this is already in the repo)
+- **tt-kmd**
 
+## instructions 
+Run `setup-deps.sh` to install the tarball containing the risc-v compiler, include headers, and libraries. Previously, you had to build a whole copy of `tt-metal` to get these headers, but the tarball contains the minimal set of files required to run all tt-metal kernels. 
+
+
+Currently, I have add1 and a very naive, slow matmul working. 
