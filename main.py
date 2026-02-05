@@ -1,9 +1,6 @@
-#!/usr/bin/env python3
-"""Simple eltwise add +1.0 example with explicit dataflow kernels."""
 from __future__ import annotations
-import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
-from codegen import Compiler, DataFormat
+from codegen import Compiler, Processor
 from device import Device, Program
 from dram import tilize, untilize
 
@@ -24,7 +21,8 @@ void kernel_main() {
   constexpr uint32_t n_tiles = 64;
   for (uint32_t i = 0; i < n_tiles; ++i) {
     cb_reserve_back(cb_in0, 1);
-    noc_async_read_tile(i, in0, get_write_ptr(cb_in0));
+    uint32_t cb_in0_addr = get_write_ptr(cb_in0);
+    noc_async_read_tile(i, in0, cb_in0_addr);
     noc_async_read_barrier();
     cb_push_back(cb_in0, 1);
   }
@@ -46,7 +44,8 @@ void kernel_main() {
   constexpr uint32_t n_tiles = 64;
   for (uint32_t i = 0; i < n_tiles; ++i) {
     cb_wait_front(cb_out0, 1);
-    noc_async_write_tile(i, out0, get_read_ptr(cb_out0));
+    uint32_t cb_out0_addr = get_read_ptr(cb_out0);
+    noc_async_write_tile(i, out0, cb_out0_addr);
     noc_async_write_barrier();
     cb_pop_front(cb_out0, 1);
   }
@@ -100,31 +99,46 @@ def _make_bf16_buffer(n_tiles: int, *, seed: int = 0) -> bytes:
     out[i * 2 : (i + 1) * 2] = _bf16_from_f32(r.random()).to_bytes(2, "little")
   return bytes(out)
 
+def _compile_add1_sfpu():
+  cc = Compiler()
+  return {
+    "reader": cc.compile_kernel(
+      K_READER, Processor.NCRISC, dispatch_message_addr=0, noc_index=0
+    ),
+    "writer": cc.compile_kernel(
+      K_WRITER, Processor.BRISC, dispatch_message_addr=0, noc_index=1
+    ),
+    "compute": [
+      cc.compile_kernel(K_COMPUTE, Processor.TRISC0, dispatch_message_addr=0),
+      cc.compile_kernel(K_COMPUTE, Processor.TRISC1, dispatch_message_addr=0),
+      cc.compile_kernel(K_COMPUTE, Processor.TRISC2, dispatch_message_addr=0),
+    ],
+  }
+
 def main():
-  kernels = Compiler().compile(K_READER, K_WRITER, K_COMPUTE)
+  kernels = _compile_add1_sfpu()
   device = Device()
   try:
     tile_size_bytes = 32 * 32 * 2
     src_rm = _make_bf16_buffer(N_TILES)
-    src = tilize(src_rm, 2)  # 2 bytes per bf16 element
+    src = tilize(src_rm, N_TILES)
     src_buf = device.dram.alloc_write(src, name="src", page_size=tile_size_bytes)
-    dst_buf = device.dram.alloc(tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes)
+    dst_buf = device.dram.alloc(
+      tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes
+    )
 
     program = Program(
-      reader=kernels.reader,
-      writer=kernels.writer,
-      compute=kernels.compute,
+      reader=kernels["reader"],
+      writer=kernels["writer"],
+      compute=kernels["compute"],
       reader_rt_args=[src_buf.addr],
       writer_rt_args=[dst_buf.addr],
-      compute_rt_args=[],
       cbs=[0, 16],
-      tile_size=tile_size_bytes,
-      num_pages=2,
     )
     device.run(program)
 
     out_tiled = device.dram.read(dst_buf)
-    out = untilize(out_tiled, 2)  # 2 bytes per bf16 element
+    out = untilize(out_tiled, N_TILES)
 
     for i in range(0, len(out), 2):
       src_bf16 = int.from_bytes(src_rm[i : i + 2], "little")
