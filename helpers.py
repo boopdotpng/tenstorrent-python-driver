@@ -29,20 +29,11 @@ def iter_pt_load(elf: bytes):
     raise ValueError("ELF truncated")
   for i in range(e_phnum):
     off = e_phoff + i * e_phentsize
-    p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, _ = (
-      struct.unpack_from("<IIIIIIII", elf, off)
-    )
-    if p_type != 1:
-      continue  # PT_LOAD
-    if p_offset + p_filesz > len(elf):
-      raise ValueError("ELF truncated")
+    p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, _ = struct.unpack_from("<IIIIIIII", elf, off)
+    if p_type != 1: continue  # PT_LOAD
+    if p_offset + p_filesz > len(elf): raise ValueError("ELF truncated")
     paddr = p_paddr or p_vaddr
-    yield PTLoad(
-      paddr=paddr,
-      data=elf[p_offset : p_offset + p_filesz],
-      memsz=p_memsz,
-      flags=p_flags,
-    )
+    yield PTLoad(paddr=paddr, data=elf[p_offset : p_offset + p_filesz], memsz=p_memsz, flags=p_flags)
 
 def load_pt_load(path: str | os.PathLike[str]) -> list[PTLoad]:
   with open(os.fspath(path), "rb") as f:
@@ -70,8 +61,7 @@ def pack_xip_elf(path: str | os.PathLike[str]) -> tuple[bytes, int]:
     start = s.paddr - base
     size = max(s.memsz, len(s.data))
     end = start + size
-    if len(out) < end:
-      out.extend(b"\0" * (end - len(out)))
+    if len(out) < end: out.extend(b"\0" * (end - len(out)))
     out[start : start + len(s.data)] = s.data
   text = next((s for s in l1 if (s.flags & 1) and s.data), l1[0])
   return bytes(out), len(text.data)

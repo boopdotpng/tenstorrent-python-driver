@@ -89,12 +89,9 @@ class DramAllocator:
     pages = (size + buf.page_size - 1) // buf.page_size
     touched = []
     for bank_idx, (bank_id, x, y) in enumerate(self.bank_tiles):
-      if bank_idx >= pages:
-        break
+      if bank_idx >= pages: break
       touched.append((bank_id, x, y))
-      self.win.configure(
-        TLBConfig(addr=0, start=(x, y), end=(x, y), noc=0, mcast=False, mode=mode)
-      )
+      self.win.configure(TLBConfig(addr=0, start=(x, y), end=(x, y), noc=0, mcast=False, mode=mode))
       local_page = 0
       for page_idx in range(bank_idx, pages, num_banks):
         addr = buf.addr + local_page * buf.page_size
@@ -106,16 +103,7 @@ class DramAllocator:
   def barrier(self, tiles: list[tuple[int, int, int]]):
     for flag in Dram.BARRIER_FLAGS:
       for _, x, y in tiles:
-        self.win.configure(
-          TLBConfig(
-            addr=0,
-            start=(x, y),
-            end=(x, y),
-            noc=0,
-            mcast=False,
-            mode=TLBMode.STRICT,
-          )
-        )
+        self.win.configure(TLBConfig(addr=0, start=(x, y), end=(x, y), noc=0, mcast=False, mode=TLBMode.STRICT))
         self.win.write32(DRAM_BARRIER_BASE, flag)
         while self.win.read32(DRAM_BARRIER_BASE) != flag:
           pass
@@ -123,8 +111,7 @@ class DramAllocator:
   def write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
     assert buf.page_size >= DRAM_ALIGNMENT and (buf.page_size & (DRAM_ALIGNMENT - 1)) == 0
-    if buf.dtype is not None:
-      data = tilize(data, buf.dtype.value)
+    if buf.dtype is not None: data = tilize(data, buf.dtype.value)
     view = memoryview(data)
 
     def do_write(addr: int, off: int):
@@ -143,8 +130,7 @@ class DramAllocator:
       result[off : off + n] = self.win.wc[addr : addr + n]
 
     self._for_each_page(buf, buf.size, TLBMode.RELAXED, do_read)
-    if buf.dtype is not None:
-      return untilize(bytes(result), buf.dtype.value)
+    if buf.dtype is not None: return untilize(bytes(result), buf.dtype.value)
     return bytes(result)
 
   def close(self):

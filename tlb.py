@@ -20,8 +20,7 @@ class TLBConfig:
   mode: TLBMode = TLBMode.RELAXED
 
   def to_struct(self) -> NocTlbConfig:
-    if self.start is None or self.end is None:
-      raise ValueError("tlb start/end must be set before configure")
+    if self.start is None or self.end is None: raise ValueError("tlb start/end must be set before configure")
     ordering = self.mode.value
     start = noc1(*self.start) if self.noc == 1 else self.start
     end = noc1(*self.end) if self.noc == 1 else self.end
@@ -43,8 +42,7 @@ class TLBWindow:
     self.config: TLBConfig | None = None
     self._allocate(size)
     self._mmap()
-    if config is not None:
-      self.configure(config)
+    if config is not None: self.configure(config)
 
   def _allocate(self, size: TLBSize):
     buf = bytearray(sizeof(AllocateTlbIn) + sizeof(AllocateTlbOut))
@@ -57,20 +55,8 @@ class TLBWindow:
     self._mmap_offset_wc = out.mmap_offset_wc
 
   def _mmap(self):
-    self.uc = mmap.mmap(
-      self.fd,
-      self.size,
-      flags=mmap.MAP_SHARED,
-      prot=mmap.PROT_READ | mmap.PROT_WRITE,
-      offset=self._mmap_offset_uc,
-    )
-    self.wc = mmap.mmap(
-      self.fd,
-      self.size,
-      flags=mmap.MAP_SHARED,
-      prot=mmap.PROT_READ | mmap.PROT_WRITE,
-      offset=self._mmap_offset_wc,
-    )
+    self.uc = mmap.mmap(self.fd, self.size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=self._mmap_offset_uc)
+    self.wc = mmap.mmap(self.fd, self.size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=self._mmap_offset_wc)
 
   def configure(self, config: TLBConfig):
     assert (config.addr & (self.size - 1)) == 0, f"tlb addr must be {self.size}-aligned"
@@ -82,8 +68,7 @@ class TLBWindow:
     self.config = config
 
   def write(self, addr: int, data: bytes, use_uc: bool = False, restore: bool = True):
-    if self.config is None:
-      raise RuntimeError("tlb window has no active config")
+    if self.config is None: raise RuntimeError("tlb window has no active config")
     config = self.config
     prev = config.addr
     try:

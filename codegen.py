@@ -127,8 +127,7 @@ class Compiler:
       fw = self._weaken_fw_symbols(build, self._fw_dir / f"{target}.elf")
       (build / "kernel_includes.hpp").write_text(kern)
       self._write_ckernel_headers(build)
-      if trisc:
-        self._write_trisc_stubs(build)
+      if trisc: self._write_trisc_stubs(build)
 
       # Compile
       mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \

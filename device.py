@@ -152,12 +152,7 @@ class Device:
         win.configure(l1_cfg)
         win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
-        win.write(
-          TensixL1.GO_MSG_INDEX,
-          (0).to_bytes(4, "little"),
-          use_uc=True,
-          restore=False,
-        )
+        win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
         win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, go_blob, use_uc=True, restore=False)
 
@@ -176,31 +171,14 @@ class Device:
     paths = [fw_dir / n for n in names]
     fws = [(p.name, load_pt_load(p)) for p in paths]
 
-    reg_base, reg_off = align_down(
-      TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2
-    )
+    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
 
     fw_map = {
-      "brisc.elf": (
-        TensixL1.BRISC_FIRMWARE_BASE,
-        TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
-      ),
-      "ncrisc.elf": (
-        TensixL1.NCRISC_FIRMWARE_BASE,
-        TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH,
-      ),
-      "trisc0.elf": (
-        TensixL1.TRISC0_BASE,
-        TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH,
-      ),
-      "trisc1.elf": (
-        TensixL1.TRISC1_BASE,
-        TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH,
-      ),
-      "trisc2.elf": (
-        TensixL1.TRISC2_BASE,
-        TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
-      ),
+      "brisc.elf": (TensixL1.BRISC_FIRMWARE_BASE, TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH),
+      "ncrisc.elf": (TensixL1.NCRISC_FIRMWARE_BASE, TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH),
+      "trisc0.elf": (TensixL1.TRISC0_BASE, TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH),
+      "trisc1.elf": (TensixL1.TRISC1_BASE, TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH),
+      "trisc2.elf": (TensixL1.TRISC2_BASE, TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH),
     }
 
     def stage_spans(name: str, segs) -> list[tuple[int, bytes]]:
@@ -265,12 +243,7 @@ class Device:
         cfg.start, cfg.end = (x0, y0), (x1, y1)
         cfg.addr, cfg.mode = 0, TLBMode.RELAXED
         win.configure(cfg)
-        win.write(
-          TensixL1.MEM_BANK_TO_NOC_SCRATCH,
-          bank_tables,
-          use_uc=True,
-          restore=False,
-        )
+        win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
 
       cfg.mcast = True
       for x0, x1 in TileGrid.TENSIX_MCAST:
@@ -284,9 +257,7 @@ class Device:
 
   def _wait_firmware_ready(self):
     tile = (1, 2) if (1, 2) in TileGrid.TENSIX else TileGrid.TENSIX[0]
-    cfg = TLBConfig(
-      addr=0, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT
-    )
+    cfg = TLBConfig(addr=0, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
       deadline = time.perf_counter() + 2.0
       while True:
@@ -327,33 +298,13 @@ class Device:
         mirror_east_bank = harvested_bank + half - 1
         map_banks(0, half - 1, START_X + 1)
         map_banks(half - 1, mirror_east_bank, START_X)
-        map_banks(
-          mirror_east_bank + 1,
-          TOTAL_BANKS - 1,
-          START_X,
-          START_Y + (mirror_east_bank - (half - 1)) * PORTS,
-        )
-        map_banks(
-          mirror_east_bank,
-          mirror_east_bank + 1,
-          START_X,
-          START_Y + (half - 1) * PORTS,
-        )
+        map_banks(mirror_east_bank + 1, TOTAL_BANKS - 1, START_X, START_Y + (mirror_east_bank - (half - 1)) * PORTS)
+        map_banks(mirror_east_bank, mirror_east_bank + 1, START_X, START_Y + (half - 1) * PORTS)
       else:
         mirror_west_bank = harvested_bank - half
         map_banks(0, mirror_west_bank, START_X)
-        map_banks(
-          mirror_west_bank + 1,
-          half,
-          START_X,
-          START_Y + mirror_west_bank * PORTS,
-        )
-        map_banks(
-          mirror_west_bank,
-          mirror_west_bank + 1,
-          START_X,
-          START_Y + (half - 1) * PORTS,
-        )
+        map_banks(mirror_west_bank + 1, half, START_X, START_Y + mirror_west_bank * PORTS)
+        map_banks(mirror_west_bank, mirror_west_bank + 1, START_X, START_Y + (half - 1) * PORTS)
         map_banks(half, TOTAL_BANKS - 1, START_X + 1)
       return m
 
@@ -389,14 +340,7 @@ class Device:
     return blob
 
   def _read_arc_boot_status(self) -> int:
-    cfg = TLBConfig(
-      addr=Arc.NOC_BASE,
-      start=TileGrid.ARC,
-      end=TileGrid.ARC,
-      noc=0,
-      mcast=False,
-      mode=TLBMode.STRICT,
-    )
+    cfg = TLBConfig(addr=Arc.NOC_BASE, start=TileGrid.ARC, end=TileGrid.ARC, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as arc:
       return arc.read32(Arc.SCRATCH_RAM_2)
 
@@ -408,24 +352,13 @@ class Device:
       status = self._read_arc_boot_status()
     if (status & 0x7) != 0x5:
       self._close()
-      raise RuntimeError(
-        f"ARC not booted (SCRATCH_RAM_2=0x{status:08x}, expected (status&0x7)==0x5)"
-      )
+      raise RuntimeError(f"ARC not booted (SCRATCH_RAM_2=0x{status:08x}, expected (status&0x7)==0x5)")
 
   def get_harvested_dram_bank(self) -> int:
-    tlb_config = TLBConfig(
-      addr=Arc.NOC_BASE,
-      start=TileGrid.ARC,
-      end=TileGrid.ARC,
-      noc=0,
-      mcast=False,
-      mode=TLBMode.STRICT,
-    )
+    tlb_config = TLBConfig(addr=Arc.NOC_BASE, start=TileGrid.ARC, end=TileGrid.ARC, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, tlb_config) as arc:
       telem_struct_addr = arc.read32(Arc.SCRATCH_RAM_13)
-      if telem_struct_addr == 0 or not (
-        Arc.CSM_START <= telem_struct_addr <= Arc.CSM_END
-      ):
+      if telem_struct_addr == 0 or not (Arc.CSM_START <= telem_struct_addr <= Arc.CSM_END):
         raise RuntimeError("device probably not working, try tt-smi -r")
       csm_base, csm_offset = align_down(telem_struct_addr, TLBSize.MiB_2)
       tlb_config.addr = csm_base
@@ -463,21 +396,11 @@ class Device:
     QUEUE_STRIDE = HEADER_BYTES + (MSG_QUEUE_SIZE * REQUEST_BYTES) + (MSG_QUEUE_SIZE * RESPONSE_BYTES)
     RESET_UNIT_ARC_MISC_CNTL = Arc.RESET_UNIT_OFFSET + 0x100
     IRQ0_TRIG_BIT = 1 << 16
-    if queue < 0 or queue >= 4:
-      raise ValueError("queue must be 0..3")
-
-    cfg = TLBConfig(
-      addr=Arc.NOC_BASE,
-      start=TileGrid.ARC,
-      end=TileGrid.ARC,
-      noc=0,
-      mcast=False,
-      mode=TLBMode.STRICT,
-    )
+    if queue < 0 or queue >= 4: raise ValueError("queue must be 0..3")
+    cfg = TLBConfig(addr=Arc.NOC_BASE, start=TileGrid.ARC, end=TileGrid.ARC, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as arc:
       info_ptr = arc.read32(Arc.SCRATCH_RAM_11)
-      if info_ptr == 0:
-        raise RuntimeError("msgqueue not initialized (SCRATCH_RAM_11 == 0)")
+      if info_ptr == 0: raise RuntimeError("msgqueue not initialized (SCRATCH_RAM_11 == 0)")
 
       info_base, info_off = align_down(info_ptr, TLBSize.MiB_2)
       cfg.addr = info_base
@@ -491,19 +414,14 @@ class Device:
 
       wptr = arc.read32(q + 0)
       req = q + HEADER_BYTES + (wptr % MSG_QUEUE_SIZE) * REQUEST_BYTES
-      words = [msg & 0xFF, arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF] + [0] * (
-        REQUEST_MSG_LEN - 3
-      )
+      words = [msg & 0xFF, arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF] + [0] * (REQUEST_MSG_LEN - 3)
       for i, word in enumerate(words):
         arc.write32(req + i * 4, word)
       arc.write32(q + 0, (wptr + 1) % MSG_QUEUE_POINTER_WRAP)
 
       cfg.addr = Arc.NOC_BASE
       arc.configure(cfg)
-      arc.write32(
-        RESET_UNIT_ARC_MISC_CNTL,
-        arc.read32(RESET_UNIT_ARC_MISC_CNTL) | IRQ0_TRIG_BIT,
-      )
+      arc.write32(RESET_UNIT_ARC_MISC_CNTL, arc.read32(RESET_UNIT_ARC_MISC_CNTL) | IRQ0_TRIG_BIT)
 
       cfg.addr = q_base
       arc.configure(cfg)
