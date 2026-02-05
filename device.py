@@ -47,8 +47,6 @@ class Device:
     self._assert_arc_booted()
     self.harvested_dram = self.get_harvested_dram_bank()
     self.tiles = TileGrid(self.harvested_dram)
-    ref_tile = (1, 2) if (1, 2) in TileGrid.TENSIX else TileGrid.TENSIX[0]
-    self.noc_translation_enabled = self.get_tile_noc_translation_enabled(ref_tile)
     if upload_firmware:
       self.upload_firmware()
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram)
@@ -164,13 +162,8 @@ class Device:
     go_blob = as_bytes(go)
 
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-    mmio_base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
-    mmio_cfg = TLBConfig(addr=mmio_base, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
       for x, y in cores:
-        self._set_tile_noc_translation_enabled(
-          win, mmio_cfg, (x, y), 1, self.noc_translation_enabled[1]
-        )
         l1_cfg.start = l1_cfg.end = (x, y)
         win.configure(l1_cfg)
         win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
@@ -416,40 +409,26 @@ class Device:
         map_banks(half, TOTAL_BANKS - 1, START_X + 1)
       return m
 
-    def noc_coord(noc: int, grid_size: int, coord: int) -> int:
-      if noc == 0 or self.noc_translation_enabled.get(noc, True):
-        return coord
-      return grid_size - 1 - coord
-
     def pack_xy(x: int, y: int) -> int:
       return ((y << 6) | x) & 0xFFFF
 
-    physical_channels = [c for c in range(8) if c != self.harvested_dram]
-    assert len(physical_channels) == NUM_DRAM_BANKS
     dram_translated = dram_translated_map(self.harvested_dram)
 
     dram_xy = []
     for noc in range(NUM_NOCS):
-      for logical_bank, phys_ch in enumerate(physical_channels):
+      for logical_bank in range(NUM_DRAM_BANKS):
         port = WORKER_EP_LOGICAL[logical_bank][noc]
-        if self.noc_translation_enabled.get(noc, True):
-          x, y = dram_translated[(logical_bank, port)]
-        else:
-          raw_x, raw_y = DRAM_PHYS_NOC0[phys_ch][port]
-          x = noc_coord(noc, GRID_X, raw_x)
-          y = noc_coord(noc, GRID_Y, raw_y)
+        x, y = dram_translated[(logical_bank, port)]
         dram_xy.append(pack_xy(x, y))
 
     tensix_cols = TileGrid.TENSIX_X
     l1_xy = []
-    for noc in range(NUM_NOCS):
+    for _ in range(NUM_NOCS):
       for bank_id in range(NUM_L1_BANKS):
         col_idx = bank_id % len(tensix_cols)
         row_idx = bank_id // len(tensix_cols)
-        raw_x = tensix_cols[col_idx]
-        raw_y = 2 + (row_idx % 10)
-        x = noc_coord(noc, GRID_X, raw_x)
-        y = noc_coord(noc, GRID_Y, raw_y)
+        x = tensix_cols[col_idx]
+        y = 2 + (row_idx % 10)
         l1_xy.append(pack_xy(x, y))
 
     dram_offsets = [0] * NUM_DRAM_BANKS
@@ -610,47 +589,6 @@ class Device:
           return out
         time.sleep(0.001)
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
-
-  def get_tile_noc_translation_enabled(self, tile: tuple[int, int]) -> dict[int, bool]:
-    base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
-    cfg = TLBConfig(
-      addr=base, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT
-    )
-    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      v0 = win.read32((TensixMMIO.NOC0_NIU_START + 0x100) - base)
-      v1 = win.read32((TensixMMIO.NOC1_NIU_START + 0x100) - base)
-    return {0: (v0 & bit) != 0, 1: (v1 & bit) != 0}
-
-  def _set_tile_noc_translation_enabled(
-    self,
-    win: TLBWindow,
-    cfg: TLBConfig,
-    tile: tuple[int, int],
-    noc: int,
-    enable: bool,
-  ):
-    if noc not in (0, 1):
-      raise ValueError("noc must be 0 or 1")
-    base, _ = align_down(TensixMMIO.LOCAL_RAM_START, TLBSize.MiB_2)
-    cfg.addr, cfg.start, cfg.end, cfg.mcast, cfg.mode = (
-      base,
-      tile,
-      tile,
-      False,
-      TLBMode.STRICT,
-    )
-    win.configure(cfg)
-    reg = (TensixMMIO.NOC0_NIU_START if noc == 0 else TensixMMIO.NOC1_NIU_START) + 0x100
-    off = reg - base
-    bit = 1 << NocNIU.NIU_CFG_0_NOC_ID_TRANSLATE_EN
-    prev = win.read32(off)
-    nextv = (prev | bit) if enable else (prev & ~bit)
-    if nextv != prev:
-      win.write32(off, nextv)
-      win.read32(off)
-
-
 
   def close(self):
     self._close()

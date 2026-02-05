@@ -52,8 +52,6 @@ class TensixL1:
 class TensixMMIO:
   LOCAL_RAM_START = 0xFFB00000
   LOCAL_RAM_END = 0xFFB01FFF
-  NOC0_NIU_START = 0xFFB20000
-  NOC1_NIU_START = 0xFFB30000
   RISCV_DEBUG_REG_SOFT_RESET_0 = 0xFFB121B0
   RISCV_DEBUG_REG_TRISC0_RESET_PC = 0xFFB12228
   RISCV_DEBUG_REG_TRISC1_RESET_PC = 0xFFB1222C
@@ -61,11 +59,6 @@ class TensixMMIO:
   RISCV_DEBUG_REG_NCRISC_RESET_PC = 0xFFB12238
   SOFT_RESET_ALL = 0x47800  # all 5 RISC-V cores
   SOFT_RESET_BRISC_ONLY_RUN = 0x47000  # keep TRISC/NCRISC in reset, release BRISC
-
-# -- NoC NIU -------------------------------------------------------------------
-
-class NocNIU:
-  NIU_CFG_0_NOC_ID_TRANSLATE_EN = 14
 
 # -- ARC -----------------------------------------------------------------------
 
