@@ -1,3 +1,4 @@
+from ctypes import sizeof
 from dataclasses import dataclass
 from enum import Enum
 from defs import *

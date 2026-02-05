@@ -6,7 +6,6 @@ from ctypes import (
   c_uint16 as u16,
   c_uint32 as u32,
   c_uint64 as u64,
-  sizeof,
 )
 from enum import Enum
 

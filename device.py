@@ -1,9 +1,9 @@
-import ctypes, fcntl, mmap, os, struct, time
+import os, struct, time
 from dataclasses import dataclass, field
 from typing import ClassVar
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_down, generate_jal_instruction, load_pt_load
+from helpers import align_down, generate_jal_instruction, load_pt_load
 from pathlib import Path
 from dram import DramAllocator
 from codegen import CompiledKernel
@@ -47,8 +47,7 @@ class Device:
     self._assert_arc_booted()
     self.harvested_dram = self.get_harvested_dram_bank()
     self.tiles = TileGrid(self.harvested_dram)
-    if upload_firmware:
-      self.upload_firmware()
+    if upload_firmware: self.upload_firmware()
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram)
 
   def _build_local_cb_blob(self, program: Program) -> tuple[int, bytes]:
@@ -88,13 +87,7 @@ class Device:
     if program.compute:
       for i, k in enumerate(program.compute):
         kernels[f"trisc{i}"] = k
-    proc = [
-      ("brisc", 0),
-      ("ncrisc", 1),
-      ("trisc0", 2),
-      ("trisc1", 3),
-      ("trisc2", 4),
-    ]
+    proc = [ ("brisc", 0), ("ncrisc", 1), ("trisc0", 2), ("trisc1", 3), ("trisc2", 4), ]
     kernel_text_off = [0] * len(proc)
     enables = 0
     off = kernel_off
@@ -129,19 +122,10 @@ class Device:
     cfg.brisc_noc_mode = 0
     cfg.mode = DevMsgs.DISPATCH_MODE_HOST
 
-    cfg.rta_offset[0].rta_offset, cfg.rta_offset[0].crta_offset = (
-      rta_offsets[0],
-      crta_off,
-    )
-    cfg.rta_offset[1].rta_offset, cfg.rta_offset[1].crta_offset = (
-      rta_offsets[1],
-      crta_off,
-    )
+    cfg.rta_offset[0].rta_offset, cfg.rta_offset[0].crta_offset = rta_offsets[0], crta_off
+    cfg.rta_offset[1].rta_offset, cfg.rta_offset[1].crta_offset = rta_offsets[1], crta_off
     for i in (2, 3, 4):
-      cfg.rta_offset[i].rta_offset, cfg.rta_offset[i].crta_offset = (
-        rta_offsets[2],
-        crta_off,
-      )
+      cfg.rta_offset[i].rta_offset, cfg.rta_offset[i].crta_offset = rta_offsets[2], crta_off
     for i, v in enumerate(kernel_text_off):
       cfg.kernel_text_offset[i] = v
 
@@ -226,9 +210,7 @@ class Device:
       for s in segs:
         if not s.data and s.memsz == 0:
           continue
-        data = (
-          s.data if s.memsz <= len(s.data) else s.data + b"\0" * (s.memsz - len(s.data))
-        )
+        data = s.data if s.memsz <= len(s.data) else s.data + b"\0" * (s.memsz - len(s.data))
         addr = s.paddr
         if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
           addr = init + (addr - TensixMMIO.LOCAL_RAM_START)
@@ -310,50 +292,16 @@ class Device:
       while True:
         go = win.uc[TensixL1.GO_MSG + 3]
         sync = win.read32(TensixL1.MAILBOX_BASE + 8)
-        dm1, tr0, tr1, tr2 = (
-          sync & 0xFF,
-          (sync >> 8) & 0xFF,
-          (sync >> 16) & 0xFF,
-          (sync >> 24) & 0xFF,
-        )
-        if (
-          go == DevMsgs.RUN_MSG_DONE
-          and dm1 == 0
-          and tr1 == 0
-          and tr2 == 0
-          and tr0 in (0, 3)
-        ):
+        dm1, tr0, tr1, tr2 = sync & 0xFF, (sync >> 8) & 0xFF, (sync >> 16) & 0xFF, (sync >> 24) & 0xFF
+        if go == DevMsgs.RUN_MSG_DONE and dm1 == 0 and tr1 == 0 and tr2 == 0 and tr0 in (0, 3):
           return
         if time.perf_counter() > deadline:
-          raise TimeoutError(
-            f"firmware not ready on tile {tile}: go={go:#x} sync={sync:#x}"
-          )
+          raise TimeoutError(f"firmware not ready on tile {tile}: go={go:#x} sync={sync:#x}")
         time.sleep(0.001)
 
   def _build_bank_noc_tables(self) -> bytes:
     NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
-    GRID_X, GRID_Y = 17, 12
-
-    DRAM_PHYS_NOC0 = {
-      0: [(0, 0), (0, 1), (0, 11)],
-      1: [(0, 2), (0, 10), (0, 3)],
-      2: [(0, 9), (0, 4), (0, 8)],
-      3: [(0, 5), (0, 7), (0, 6)],
-      4: [(9, 0), (9, 1), (9, 11)],
-      5: [(9, 2), (9, 10), (9, 3)],
-      6: [(9, 9), (9, 4), (9, 8)],
-      7: [(9, 5), (9, 7), (9, 6)],
-    }
-    WORKER_EP_LOGICAL = {
-      0: [2, 1],
-      1: [0, 1],
-      2: [0, 1],
-      3: [0, 1],
-      4: [2, 1],
-      5: [2, 1],
-      6: [2, 1],
-      7: [2, 1],
-    }
+    WORKER_EP_LOGICAL = {0: [2, 1], 1: [0, 1], 2: [0, 1], 3: [0, 1], 4: [2, 1], 5: [2, 1], 6: [2, 1], 7: [2, 1]}
 
     def dram_translated_map(
       harvested_bank: int | None,
@@ -507,26 +455,12 @@ class Device:
     os.close(self.fd)
 
   def arc_msg(
-    self,
-    msg: int,
-    arg0: int = 0,
-    arg1: int = 0,
-    *,
-    queue: int = 0,
-    timeout_ms: int = 1000,
+    self, msg: int, arg0: int = 0, arg1: int = 0, *, queue: int = 0, timeout_ms: int = 1000
   ) -> list[int]:
-    MSG_QUEUE_SIZE = 4
+    MSG_QUEUE_SIZE, REQUEST_MSG_LEN, RESPONSE_MSG_LEN = 4, 8, 8
     MSG_QUEUE_POINTER_WRAP = 2 * MSG_QUEUE_SIZE
-    REQUEST_MSG_LEN = 8
-    RESPONSE_MSG_LEN = 8
-    HEADER_BYTES = 8 * 4
-    REQUEST_BYTES = REQUEST_MSG_LEN * 4
-    RESPONSE_BYTES = RESPONSE_MSG_LEN * 4
-    QUEUE_STRIDE = (
-      HEADER_BYTES
-      + (MSG_QUEUE_SIZE * REQUEST_BYTES)
-      + (MSG_QUEUE_SIZE * RESPONSE_BYTES)
-    )
+    HEADER_BYTES, REQUEST_BYTES, RESPONSE_BYTES = 8 * 4, REQUEST_MSG_LEN * 4, RESPONSE_MSG_LEN * 4
+    QUEUE_STRIDE = HEADER_BYTES + (MSG_QUEUE_SIZE * REQUEST_BYTES) + (MSG_QUEUE_SIZE * RESPONSE_BYTES)
     RESET_UNIT_ARC_MISC_CNTL = Arc.RESET_UNIT_OFFSET + 0x100
     IRQ0_TRIG_BIT = 1 << 16
     if queue < 0 or queue >= 4:
@@ -578,12 +512,7 @@ class Device:
       while time.monotonic() < deadline:
         resp_wptr = arc.read32(q + 20)
         if resp_wptr != rptr:
-          resp = (
-            q
-            + HEADER_BYTES
-            + (MSG_QUEUE_SIZE * REQUEST_BYTES)
-            + (rptr % MSG_QUEUE_SIZE) * RESPONSE_BYTES
-          )
+          resp = q + HEADER_BYTES + (MSG_QUEUE_SIZE * REQUEST_BYTES) + (rptr % MSG_QUEUE_SIZE) * RESPONSE_BYTES
           out = [arc.read32(resp + i * 4) for i in range(RESPONSE_MSG_LEN)]
           arc.write32(q + 4, (rptr + 1) % MSG_QUEUE_POINTER_WRAP)
           return out
