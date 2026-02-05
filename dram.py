@@ -1,8 +1,10 @@
+import os, mmap, time, fcntl, ctypes
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
-from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize
+from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn, PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES
 from tlb import TLBConfig, TLBWindow, TLBMode
+from helpers import _IO, tlog
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
@@ -65,6 +67,37 @@ def untilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = 
     data = _grid_transform(data, bpe, rows, cols, forward=False)
   return data
 
+class Sysmem:
+  """Host memory visible to the device via IOMMU. Device writes here via NoC, host reads at RAM speed."""
+  PCIE_NOC_XY = (24 << 6) | 19  # translated PCIe tile: x=19, y=24
+
+  def __init__(self, fd: int, size: int = 16 * 1024 * 1024):
+    self.fd = fd
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    self.size = (size + page_size - 1) & ~(page_size - 1)
+    self.buf = mmap.mmap(-1, self.size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                         prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    self.buf[:] = b'\x00' * self.size  # fault in all pages
+    buf_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
+    pin_buf = bytearray(ctypes.sizeof(PinPagesIn) + ctypes.sizeof(PinPagesOutExtended))
+    pin_in = PinPagesIn.from_buffer(pin_buf)
+    pin_in.output_size_bytes = ctypes.sizeof(PinPagesOutExtended)
+    pin_in.flags = PIN_PAGES_NOC_DMA
+    pin_in.virtual_address = buf_addr
+    pin_in.size = self.size
+    fcntl.ioctl(self.fd, _IO(IOCTL_PIN_PAGES), pin_buf, True)
+    pin_out = PinPagesOutExtended.from_buffer(pin_buf, ctypes.sizeof(PinPagesIn))
+    self.noc_addr = pin_out.noc_address
+    self._va = buf_addr
+
+  def close(self):
+    unpin_buf = bytearray(ctypes.sizeof(UnpinPagesIn))
+    unpin_in = UnpinPagesIn.from_buffer(unpin_buf)
+    unpin_in.virtual_address = self._va
+    unpin_in.size = self.size
+    fcntl.ioctl(self.fd, _IO(IOCTL_UNPIN_PAGES), unpin_buf, False)
+    self.buf.close()
+
 @dataclass(frozen=True)
 class DramBuffer:
   name: str | None
@@ -74,12 +107,14 @@ class DramBuffer:
   dtype: DType | None = None
 
 class DramAllocator:
-  def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]]):
+  def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]], *, sysmem: Sysmem | None = None, run_fn: Callable | None = None):
     self.fd = fd
     self.bank_tiles = dram_tiles[:: Dram.TILES_PER_BANK]
     self.next = Dram.DRAM_WRITE_OFFSET
     self.max_page_size = 2 * 1024 * 1024
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
+    self.sysmem = sysmem
+    self._run_fn = run_fn
 
   def alloc(
     self, size: int, name: str | None = None, *, page_size: int | None = None, dtype: DType | None = None
@@ -138,10 +173,50 @@ class DramAllocator:
       page = view[off : off + buf.page_size]
       self.win.wc[addr : addr + len(page)] = page
 
+    t0 = time.perf_counter()
     touched = self._for_each_page(buf, len(data), TLBMode.POSTED, do_write)
     self.barrier(touched)
+    tlog("dram_write", time.perf_counter() - t0, len(data))
 
   def read(self, buf: DramBuffer) -> bytes:
+    if self.sysmem is not None and buf.size <= self.sysmem.size:
+      return self._read_fast(buf)
+    return self._read_slow(buf)
+
+  def _read_fast(self, buf: DramBuffer) -> bytes:
+    from codegen import get_drain_kernel
+    assert self.sysmem is not None and self._run_fn is not None
+    sm = self.sysmem
+    drain = get_drain_kernel()
+    n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
+    sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
+
+    # Import here to avoid circular dep at module level
+    from device import Program, TileGrid
+    num_cores = len(TileGrid.TENSIX)
+    tiles_per_core = (n_tiles + num_cores - 1) // num_cores
+    active_cores = min(num_cores, n_tiles)
+    cores = TileGrid.TENSIX[:active_cores]
+
+    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start = core_idx * tiles_per_core
+      count = min(tiles_per_core, n_tiles - start)
+      if start >= n_tiles: count = 0
+      return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size]
+
+    program = Program(
+      reader=drain, writer=None, compute=None,
+      reader_rt_args=reader_args, writer_rt_args=[], compute_rt_args=[],
+      cbs=[0], tile_size=buf.page_size, num_pages=2, cores=cores,
+    )
+    t0 = time.perf_counter()
+    self._run_fn(program)
+    result = bytes(sm.buf[:buf.size])
+    tlog("dram_read_fast", time.perf_counter() - t0, buf.size)
+    if buf.dtype is not None: return untilize(result, buf.dtype.value)
+    return result
+
+  def _read_slow(self, buf: DramBuffer) -> bytes:
     result = bytearray(buf.size)
 
     def do_read(addr: int, off: int):
@@ -149,9 +224,12 @@ class DramAllocator:
       n = min(buf.page_size, remaining)
       result[off : off + n] = self.win.wc[addr : addr + n]
 
+    t0 = time.perf_counter()
     self._for_each_page(buf, buf.size, TLBMode.RELAXED, do_read)
+    tlog("dram_read_slow", time.perf_counter() - t0, buf.size)
     if buf.dtype is not None: return untilize(bytes(result), buf.dtype.value)
     return bytes(result)
 
   def close(self):
+    if self.sysmem is not None: self.sysmem.close()
     self.win.free()

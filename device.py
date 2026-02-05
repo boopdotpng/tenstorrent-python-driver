@@ -1,15 +1,20 @@
 import os, struct, time
 from dataclasses import dataclass, field
-from typing import ClassVar, Callable
+from typing import ClassVar, Callable, NamedTuple
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import align_down, generate_jal_instruction, load_pt_load
+from helpers import align_down, generate_jal_instruction, load_pt_load, tlog
 from pathlib import Path
-from dram import DramAllocator
+from dram import DramAllocator, Sysmem
 from codegen import CompiledKernel
 
 # Per-core arg generator: (core_idx, core_xy, num_cores) -> list[int]
 ArgGen = Callable[[int, tuple[int, int], int], list[int]]
+
+class RunTiming(NamedTuple):
+  total: float      # dispatch + compute (seconds)
+  dispatch: float   # time to write GO_MSG to all cores (seconds)
+  compute: float    # time from last GO_MSG to last core done (seconds)
 
 @dataclass
 class Program:
@@ -52,7 +57,9 @@ class Device:
     self.harvested_dram = self.get_harvested_dram_bank()
     self.tiles = TileGrid(self.harvested_dram)
     if upload_firmware: self.upload_firmware()
-    self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram)
+    self.win = TLBWindow(self.fd, TLBSize.MiB_2)
+    sysmem = None if os.environ.get("TT_USB") else Sysmem(self.fd)
+    self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram, sysmem=sysmem, run_fn=self.run)
 
   def _build_local_cb_blob(self, program: Program) -> tuple[int, bytes]:
     mask = 0
@@ -72,15 +79,13 @@ class Device:
       addr += size
     return mask, as_bytes(arr)
 
-  def _pack_kernel_config(self, program: Program, reader_args: list[int], writer_args: list[int], compute_args: list[int]):
-    pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
+  def _pack_kernel_shared(self, program: Program, rta_sizes: tuple[int, int, int]):
+    """Build the shared (mcastable) portion of the kernel config image: CB config + kernel binaries.
+    Also builds the LaunchMsg. Returns (shared_img_offset, shared_img, launch_blob, rta_offsets)."""
     align16 = lambda n: (n + 15) & ~15
 
-    brisc_rta = pack(writer_args)
-    ncrisc_rta = pack(reader_args)
-    trisc_rta = pack(compute_args)
-    rta_offsets = [0, len(brisc_rta), len(brisc_rta) + len(ncrisc_rta)]
-    rta_total = align16(rta_offsets[2] + len(trisc_rta))
+    rta_offsets = [0, rta_sizes[0], rta_sizes[0] + rta_sizes[1]]
+    rta_total = align16(rta_offsets[2] + rta_sizes[2])
     crta_off = rta_total
 
     local_cb_mask, local_cb_blob = self._build_local_cb_blob(program)
@@ -91,27 +96,23 @@ class Device:
     if program.compute:
       for i, k in enumerate(program.compute):
         kernels[f"trisc{i}"] = k
-    proc = [ ("brisc", 0), ("ncrisc", 1), ("trisc0", 2), ("trisc1", 3), ("trisc2", 4), ]
+    proc = [("brisc", 0), ("ncrisc", 1), ("trisc0", 2), ("trisc1", 3), ("trisc2", 4)]
     kernel_text_off = [0] * len(proc)
     enables = 0
     off = kernel_off
     for name, idx in proc:
-      if (k := kernels.get(name)) is None:
-        continue
+      if (k := kernels.get(name)) is None: continue
       kernel_text_off[idx] = off
       off = align16(off + len(k.xip))
       enables |= 1 << idx
 
-    img = bytearray(off)
-    img[0 : len(brisc_rta)] = brisc_rta
-    img[rta_offsets[1] : rta_offsets[1] + len(ncrisc_rta)] = ncrisc_rta
-    img[rta_offsets[2] : rta_offsets[2] + len(trisc_rta)] = trisc_rta
-    img[local_cb_off : local_cb_off + len(local_cb_blob)] = local_cb_blob
+    # Shared image: from local_cb_off to end (CB config + kernel binaries)
+    shared = bytearray(off - local_cb_off)
+    shared[0 : len(local_cb_blob)] = local_cb_blob
     for name, idx in proc:
-      if (k := kernels.get(name)) is None:
-        continue
-      dst = kernel_text_off[idx]
-      img[dst : dst + len(k.xip)] = k.xip
+      if (k := kernels.get(name)) is None: continue
+      dst = kernel_text_off[idx] - local_cb_off
+      shared[dst : dst + len(k.xip)] = k.xip
 
     cfg = LaunchMsg().kernel_config
     cfg.kernel_config_base[0] = TensixL1.KERNEL_CONFIG_BASE
@@ -125,7 +126,6 @@ class Device:
     cfg.brisc_noc_id = 1
     cfg.brisc_noc_mode = 0
     cfg.mode = DevMsgs.DISPATCH_MODE_HOST
-
     cfg.rta_offset[0].rta_offset, cfg.rta_offset[0].crta_offset = rta_offsets[0], crta_off
     cfg.rta_offset[1].rta_offset, cfg.rta_offset[1].crta_offset = rta_offsets[1], crta_off
     for i in (2, 3, 4):
@@ -133,21 +133,34 @@ class Device:
     for i, v in enumerate(kernel_text_off):
       cfg.kernel_text_offset[i] = v
 
-    return bytes(img), cfg
+    launch = LaunchMsg()
+    launch.kernel_config = cfg
+    return local_cb_off, bytes(shared), as_bytes(launch), rta_offsets
+
+  @staticmethod
+  def _pack_rta(reader_args: list[int], writer_args: list[int], compute_args: list[int]) -> bytes:
+    """Pack per-core runtime args into a single blob."""
+    pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
+    return pack(writer_args) + pack(reader_args) + pack(compute_args)
 
   def _resolve_args(self, args: list[int] | ArgGen, core_idx: int, core_xy: tuple[int, int], num_cores: int) -> list[int]:
     return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
 
-  def run(self, program: Program, *, time_execution: bool = False) -> float | None:
-    """Run a program on the device.
-    
-    Args:
-      program: The program to run
-      time_execution: If True, returns execution time in seconds (excludes kernel upload)
-    
-    Returns:
-      Execution time in seconds if time_execution=True, else None
-    """
+  @staticmethod
+  def _mcast_rects(cores: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
+    """Compute minimal mcast rectangles (x0, x1, y0, y1) from a core list, split by DRAM column gap."""
+    west = [(x, y) for x, y in cores if x < 8]
+    east = [(x, y) for x, y in cores if x >= 10]
+    rects = []
+    for group in (west, east):
+      if group:
+        xs = [x for x, _ in group]
+        ys = [y for _, y in group]
+        rects.append((min(xs), max(xs), min(ys), max(ys)))
+    return rects
+
+  def run(self, program: Program) -> RunTiming:
+    """Run a program on the device. Returns RunTiming with dispatch/compute breakdown."""
     cores = program.cores if program.cores is not None else TileGrid.TENSIX
     num_cores = len(cores)
 
@@ -158,48 +171,61 @@ class Device:
     go.bits.signal = DevMsgs.RUN_MSG_GO
     go_blob = as_bytes(go)
 
+    # Compute rta sizes from core 0 to determine shared layout
+    first_r = self._resolve_args(program.reader_rt_args, 0, cores[0], num_cores)
+    first_w = self._resolve_args(program.writer_rt_args, 0, cores[0], num_cores)
+    first_c = self._resolve_args(program.compute_rt_args, 0, cores[0], num_cores)
+    rta_sizes = (len(first_w) * 4, len(first_r) * 4, len(first_c) * 4)
+    shared_off, shared_img, launch_blob, rta_offsets = self._pack_kernel_shared(program, rta_sizes)
+
+    mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2) as win:
-      # Upload kernel config to all cores first
-      for core_idx, (x, y) in enumerate(cores):
-        reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
-        writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
-        compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
-        img, kc = self._pack_kernel_config(program, reader_args, writer_args, compute_args)
-        launch = LaunchMsg()
-        launch.kernel_config = kc
-        launch_blob = as_bytes(launch)
+    rects = self._mcast_rects(cores)
+    win = self.win
+    # Mcast shared data: reset GO_MSG, GO_MSG_INDEX, CB config + kernel binaries, LAUNCH
+    for x0, x1, y0, y1 in rects:
+      mcast_cfg.start, mcast_cfg.end = (x0, y0), (x1, y1)
+      win.configure(mcast_cfg)
+      win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
+      win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
+      win.write(TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img, use_uc=True, restore=False)
+      win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
 
-        l1_cfg.start = l1_cfg.end = (x, y)
-        win.configure(l1_cfg)
-        win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
-        win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
-        win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
-        win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
+    # Unicast per-core runtime args
+    for core_idx, (x, y) in enumerate(cores):
+      reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
+      writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
+      compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
+      rta = self._pack_rta(reader_args, writer_args, compute_args)
+      l1_cfg.start = l1_cfg.end = (x, y)
+      win.configure(l1_cfg)
+      win.write(TensixL1.KERNEL_CONFIG_BASE, rta, use_uc=True, restore=False)
 
-      # Start timing after upload, before triggering execution
-      if time_execution:
-        start_time = time.perf_counter()
+    # Dispatch: multicast GO_MSG to all cores
+    t_dispatch_start = time.perf_counter()
+    mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
+    for x0, x1, y0, y1 in self._mcast_rects(cores):
+      mcast_cfg.start, mcast_cfg.end = (x0, y0), (x1, y1)
+      win.configure(mcast_cfg)
+      win.write(TensixL1.GO_MSG, go_blob, use_uc=True, restore=False)
+    t_compute_start = time.perf_counter()
 
-      # Trigger all cores to start
-      for x, y in cores:
-        l1_cfg.start = l1_cfg.end = (x, y)
-        win.configure(l1_cfg)
-        win.write(TensixL1.GO_MSG, go_blob, use_uc=True, restore=False)
+    # Wait for all cores to complete (unicast poll)
+    l1_cfg.mcast = False
+    for x, y in cores:
+      l1_cfg.start = l1_cfg.end = (x, y)
+      win.configure(l1_cfg)
+      deadline = time.perf_counter() + 10.0
+      while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
+        if time.perf_counter() > deadline:
+          raise TimeoutError(f"timeout waiting for core ({x}, {y})")
 
-      # Wait for all cores to complete
-      for x, y in cores:
-        l1_cfg.start = l1_cfg.end = (x, y)
-        win.configure(l1_cfg)
-        deadline = time.perf_counter() + 10.0
-        while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
-          if time.perf_counter() > deadline:
-            raise TimeoutError(f"timeout waiting for core ({x}, {y})")
-          time.sleep(0.001)
-
-    if time_execution:
-      return time.perf_counter() - start_time  # type: ignore
-    return None
+    t_end = time.perf_counter()
+    dispatch = t_compute_start - t_dispatch_start
+    compute = t_end - t_compute_start
+    tlog("dispatch", dispatch)
+    tlog("compute", compute)
+    return RunTiming(total=dispatch + compute, dispatch=dispatch, compute=compute)
 
   def upload_firmware(self):
     fw_dir = Path(__file__).parent / "riscv-firmware" / self.arch
@@ -421,6 +447,8 @@ class Device:
   def _close(self):
     if hasattr(self, "dram"):
       self.dram.close()
+    if hasattr(self, "win"):
+      self.win.free()
     os.close(self.fd)
 
   def arc_msg(

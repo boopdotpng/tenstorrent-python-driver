@@ -94,11 +94,24 @@ class Dram:
 # -- Kernel driver ioctls ------------------------------------------------------
 
 TENSTORRENT_IOCTL_MAGIC = 0xFA
+IOCTL_PIN_PAGES = 7
+IOCTL_UNPIN_PAGES = 10
 IOCTL_ALLOCATE_TLB = 11
 IOCTL_FREE_TLB = 12
 IOCTL_CONFIGURE_TLB = 13
 
+PIN_PAGES_NOC_DMA = 2
+
 # -- Ioctl structs -------------------------------------------------------------
+
+class PinPagesIn(S):
+  _fields_ = [("output_size_bytes", u32), ("flags", u32), ("virtual_address", u64), ("size", u64)]
+
+class PinPagesOutExtended(S):
+  _fields_ = [("physical_address", u64), ("noc_address", u64)]
+
+class UnpinPagesIn(S):
+  _fields_ = [("virtual_address", u64), ("size", u64), ("reserved", u64)]
 
 class AllocateTlbIn(S):
   _fields_ = [("size", u64), ("reserved", u64)]

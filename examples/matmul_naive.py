@@ -104,8 +104,12 @@ void kernel_main() {
 
 K_COMPUTE = f"""
 #include <cstdint>
-#include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/matmul.h"
+#ifdef TRISC_MATH
+  #include "ckernel_ops.h"
+  #include "cmath_common.h"
+  #include "ckernel_template.h"
+#endif
 
 namespace NAMESPACE {{
 void MAIN {{
@@ -116,6 +120,7 @@ void MAIN {{
   constexpr tt::CBIndex cb_b = tt::CBIndex::c_1;
   constexpr tt::CBIndex cb_out = tt::CBIndex::c_16;
 
+  // mm_init programs ADDR_MOD registers and MOP replay buffer with MVMUL sequences
   mm_init(cb_a, cb_b, cb_out);
 
   for (uint32_t i = 0; i < num_tiles; ++i) {{
@@ -123,7 +128,25 @@ void MAIN {{
     for (uint32_t kt = 0; kt < Kt; ++kt) {{
       cb_wait_front(cb_a, 1);
       cb_wait_front(cb_b, 1);
-      matmul_tiles(cb_a, cb_b, 0, 0, 0);
+
+      // Unpack: load tiles from CBs into SrcA/SrcB (TRISC0 only)
+      // Note: in0 (cb_a) -> SrcB, in1 (cb_b) -> SrcA (hardware swaps internally)
+      UNPACK((llk_unpack_AB_matmul(cb_a, cb_b, 0, 0)));
+
+#ifdef TRISC_MATH
+      // Set DST write address for tile 0 (with double-buffer offset)
+      ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(0);
+
+      // Execute the MOP which replays the MVMUL instruction sequence:
+      //   16x TTI_MVMUL across 4 faces: D[8,16] = B[8,16] * A[16,16]
+      //   with ADDR_MOD auto-incrementing srca/srcb/dest pointers
+      //   final MVMUL clears SrcA (CLR_A) since ct_dim >= rt_dim (reuse_a)
+      ckernel_template::run();
+
+      // Reset SrcB for next tile pair (end of reuse boundary)
+      TTI_SETRWC(p_setrwc::CLR_B, 0, 0, 0, 0, p_setrwc::SET_ABD_F);
+#endif
+
       cb_pop_front(cb_a, 1);
       cb_pop_front(cb_b, 1);
     }}
@@ -239,15 +262,10 @@ def main():
       cores=cores,
     )
 
-    # Run and time (only execution, not kernel upload)
     print("Running matmul...")
-    elapsed = device.run(program, time_execution=True)
-    assert elapsed is not None
-
-    # Calculate TFLOPS (2*M*N*K FLOPs for matmul)
+    t = device.run(program)
     flops = 2 * M * N * K
-    tflops = flops / elapsed / 1e12
-    print(f"Time: {elapsed*1000:.2f} ms, {tflops:.2f} TFLOPS")
+    print(f"TFLOPS (compute only): {flops / t.compute / 1e12:.2f}, TFLOPS (total): {flops / t.total / 1e12:.2f}")
 
     # Read result
     print("Reading result...")

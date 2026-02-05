@@ -1,7 +1,33 @@
-import os, struct
+import os, struct, atexit
 from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
 from dataclasses import dataclass
 from pathlib import Path
+
+class _Timer:
+  __slots__ = ('events',)
+  def __init__(self):
+    self.events: list[tuple[str, float, int]] = []
+  def log(self, cat: str, dt: float, nbytes: int = 0):
+    self.events.append((cat, dt, nbytes))
+  def summary(self):
+    if not self.events: return
+    cats: dict[str, tuple[float, int, int]] = {}
+    for cat, dt, nb in self.events:
+      s, b, c = cats.get(cat, (0.0, 0, 0))
+      cats[cat] = (s + dt, b + nb, c + 1)
+    print("\n--- timing summary ---")
+    for cat, (s, b, c) in cats.items():
+      bw = f" ({b / s / 1e9:.2f} GB/s)" if b else ""
+      cnt = f" x{c}" if c > 1 else ""
+      print(f"  {cat:20s} {s*1000:8.2f} ms{cnt}{bw}")
+    total = sum(s for s, _, _ in cats.values())
+    print(f"  {'total':20s} {total*1000:8.2f} ms")
+
+_timer: _Timer | None = _Timer() if os.environ.get("TIMING") else None
+if _timer: atexit.register(_timer.summary)
+
+def tlog(cat: str, dt: float, nbytes: int = 0):
+  if _timer is not None: _timer.log(cat, dt, nbytes)
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 

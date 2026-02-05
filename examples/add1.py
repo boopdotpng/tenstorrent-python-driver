@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Simple eltwise add +1.0 example with explicit dataflow kernels."""
+"""Simple eltwise add +1.0 on all cores -- each core processes a slice of tiles."""
 from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
 from codegen import Compiler, DataFormat
-from device import Device, Program
+from device import Device, Program, TileGrid
 from dram import tilize, untilize
 
-N_TILES = 64
+NUM_CORES = len(TileGrid.TENSIX)
+N_TILES = NUM_CORES * 4  # 4 tiles per core
 
 K_READER = r"""
 #include <cstdint>
 
 void kernel_main() {
   uint32_t in0_addr = get_arg_val<uint32_t>(0);
+  uint32_t tile_offset = get_arg_val<uint32_t>(1);
+  uint32_t n_tiles = get_arg_val<uint32_t>(2);
   constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
   const uint32_t tile_size_bytes = get_tile_size(cb_in0);
   const InterleavedAddrGenFast<true> in0 = {
@@ -21,10 +24,9 @@ void kernel_main() {
     .page_size = tile_size_bytes,
     .data_format = DataFormat::Float16_b,
   };
-  constexpr uint32_t n_tiles = 64;
   for (uint32_t i = 0; i < n_tiles; ++i) {
     cb_reserve_back(cb_in0, 1);
-    noc_async_read_tile(i, in0, get_write_ptr(cb_in0));
+    noc_async_read_tile(tile_offset + i, in0, get_write_ptr(cb_in0));
     noc_async_read_barrier();
     cb_push_back(cb_in0, 1);
   }
@@ -36,6 +38,8 @@ K_WRITER = r"""
 
 void kernel_main() {
   uint32_t out_addr = get_arg_val<uint32_t>(0);
+  uint32_t tile_offset = get_arg_val<uint32_t>(1);
+  uint32_t n_tiles = get_arg_val<uint32_t>(2);
   constexpr uint32_t cb_out0 = tt::CBIndex::c_16;
   const uint32_t tile_size_bytes = get_tile_size(cb_out0);
   const InterleavedAddrGenFast<true> out0 = {
@@ -43,10 +47,9 @@ void kernel_main() {
     .page_size = tile_size_bytes,
     .data_format = DataFormat::Float16_b,
   };
-  constexpr uint32_t n_tiles = 64;
   for (uint32_t i = 0; i < n_tiles; ++i) {
     cb_wait_front(cb_out0, 1);
-    noc_async_write_tile(i, out0, get_read_ptr(cb_out0));
+    noc_async_write_tile(tile_offset + i, out0, get_read_ptr(cb_out0));
     noc_async_write_barrier();
     cb_pop_front(cb_out0, 1);
   }
@@ -64,8 +67,8 @@ K_COMPUTE = r"""
 
 namespace NAMESPACE {
 void MAIN {
+  uint32_t n_tiles = get_arg_val<uint32_t>(0);
   init_sfpu(tt::CBIndex::c_0, tt::CBIndex::c_16);
-  constexpr uint32_t n_tiles = 64;
   for (uint32_t i = 0; i < n_tiles; ++i) {
     tile_regs_acquire();
     cb_wait_front(tt::CBIndex::c_0, 1);
@@ -105,18 +108,35 @@ def main():
   device = Device()
   try:
     tile_size_bytes = 32 * 32 * 2
+    tiles_per_core = (N_TILES + NUM_CORES - 1) // NUM_CORES
+
     src_rm = _make_bf16_buffer(N_TILES)
-    src = tilize(src_rm, 2)  # 2 bytes per bf16 element
+    src = tilize(src_rm, 2)
     src_buf = device.dram.alloc_write(src, name="src", page_size=tile_size_bytes)
     dst_buf = device.dram.alloc(tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes)
+
+    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start = core_idx * tiles_per_core
+      count = min(tiles_per_core, N_TILES - start)
+      return [src_buf.addr, start, max(count, 0)]
+
+    def writer_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start = core_idx * tiles_per_core
+      count = min(tiles_per_core, N_TILES - start)
+      return [dst_buf.addr, start, max(count, 0)]
+
+    def compute_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start = core_idx * tiles_per_core
+      count = min(tiles_per_core, N_TILES - start)
+      return [max(count, 0)]
 
     program = Program(
       reader=kernels.reader,
       writer=kernels.writer,
       compute=kernels.compute,
-      reader_rt_args=[src_buf.addr],
-      writer_rt_args=[dst_buf.addr],
-      compute_rt_args=[],
+      reader_rt_args=reader_args,
+      writer_rt_args=writer_args,
+      compute_rt_args=compute_args,
       cbs=[0, 16],
       tile_size=tile_size_bytes,
       num_pages=2,
@@ -124,7 +144,7 @@ def main():
     device.run(program)
 
     out_tiled = device.dram.read(dst_buf)
-    out = untilize(out_tiled, 2)  # 2 bytes per bf16 element
+    out = untilize(out_tiled, 2)
 
     for i in range(0, len(out), 2):
       src_bf16 = int.from_bytes(src_rm[i : i + 2], "little")
