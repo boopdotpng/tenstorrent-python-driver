@@ -102,11 +102,9 @@ class Compiler:
         self._compile_trisc(compute, 2),
       ),
     )
-    tlog("compile", time.perf_counter() - t0)
     return result
 
   def _compile_dataflow(self, src: str, target: str, noc_index: int) -> CompiledKernel:
-    """Compile BRISC/NCRISC dataflow kernel."""
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
       "-DDISPATCH_MESSAGE_ADDR=0", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
@@ -118,7 +116,6 @@ class Compiler:
     return self._build(src, target, defines, extra_objs, opt="-O2", trisc=False)
 
   def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
-    """Compile TRISC0/1/2 compute kernel."""
     stage = ("unpack", "math", "pack")[trisc_id]
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
@@ -160,7 +157,6 @@ class Compiler:
     subprocess.run([str(exe), *args], cwd=cwd, check=True, capture_output=True)
 
   def _weaken_fw_symbols(self, build: Path, fw: Path) -> Path:
-    """Copy firmware ELF and weaken/localize symbols to avoid collisions with kernel."""
     out = build / "fw.elf"
     out.write_bytes(fw.read_bytes())
 
@@ -186,14 +182,12 @@ class Compiler:
     return out
 
   def _write_trisc_stubs(self, build: Path):
-    """Generate TRISC stage stub files."""
     (build / "defines_generated.h").write_text("")
     for stage, macro in [("unpack", "TRISC_UNPACK"), ("math", "TRISC_MATH"), ("pack", "TRISC_PACK")]:
       (build / f"chlkc_{stage}.cpp").write_text(
         f'#define {macro}\n#include "defines_generated.h"\n#include <kernel_includes.hpp>\n')
 
   def _write_ckernel_headers(self, build: Path):
-    """Generate ckernel config headers (data formats, tile dims, math settings)."""
     cfg = self._ckernel
     in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
     formats = [in_fmt] * 16 + [out_fmt] * 16
@@ -270,7 +264,6 @@ def get_drain_kernel() -> CompiledKernel:
   return _drain_kernel
 
 def _tile_size(fmt: int) -> int:
-  """Tile size in bytes for 32x32 tile (1024 elements)."""
   return {
     0: 4096,                    # Float32
     1: 2048, 5: 2048,           # Float16, Float16_b

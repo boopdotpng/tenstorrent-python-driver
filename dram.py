@@ -24,7 +24,6 @@ def _align(x: int, a: int = DRAM_ALIGNMENT) -> int:
   return (x + a - 1) & ~(a - 1)
 
 def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
-  """Convert between row-major and TILED_NFACES (4 faces of 16x16 per 32x32 tile)."""
   n_tiles = len(data) // (TILE_ELEMS * bpe)
   out = bytearray(len(data))
   for t in range(n_tiles):
@@ -40,7 +39,6 @@ def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
   return bytes(out)
 
 def _grid_transform(data: bytes, bpe: int, rows: int, cols: int, forward: bool) -> bytes:
-  """Reorder between 2D row-major matrix and sequential tiles (row-major within each tile)."""
   assert rows % TILE_R == 0 and cols % TILE_C == 0, "Dimensions must be tile-aligned"
   tile_rows, tile_cols = rows // TILE_R, cols // TILE_C
   out = bytearray(len(data))
@@ -55,21 +53,18 @@ def _grid_transform(data: bytes, bpe: int, rows: int, cols: int, forward: bool) 
   return bytes(out)
 
 def tilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = None) -> bytes:
-  """Convert row-major data to tiled format (with face reordering)."""
   if rows is not None and cols is not None:
     data = _grid_transform(data, bpe, rows, cols, forward=True)
   return _face_transform(data, bpe, forward=True)
 
 def untilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = None) -> bytes:
-  """Convert tiled data back to row-major format."""
   data = _face_transform(data, bpe, forward=False)
   if rows is not None and cols is not None:
     data = _grid_transform(data, bpe, rows, cols, forward=False)
   return data
 
 class Sysmem:
-  """Host memory visible to the device via IOMMU. Device writes here via NoC, host reads at RAM speed."""
-  PCIE_NOC_XY = (24 << 6) | 19  # translated PCIe tile: x=19, y=24
+  PCIE_NOC_XY = (24 << 6) | 19
 
   def __init__(self, fd: int, size: int = 16 * 1024 * 1024):
     self.fd = fd
@@ -191,7 +186,6 @@ class DramAllocator:
     n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
     sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
 
-    # Import here to avoid circular dep at module level
     from device import Program, TileGrid
     num_cores = len(TileGrid.TENSIX)
     tiles_per_core = (n_tiles + num_cores - 1) // num_cores

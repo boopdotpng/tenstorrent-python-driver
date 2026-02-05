@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Simple eltwise add +1.0 on all cores -- each core processes a slice of tiles."""
 from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
@@ -8,7 +7,7 @@ from device import Device, Program, TileGrid
 from dram import tilize, untilize
 
 NUM_CORES = len(TileGrid.TENSIX)
-N_TILES = NUM_CORES * 4  # 4 tiles per core
+N_TILES = NUM_CORES * 4
 
 K_READER = r"""
 #include <cstdint>

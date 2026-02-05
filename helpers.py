@@ -22,6 +22,16 @@ class _Timer:
       print(f"  {cat:20s} {s*1000:8.2f} ms{cnt}{bw}")
     total = sum(s for s, _, _ in cats.values())
     print(f"  {'total':20s} {total*1000:8.2f} ms")
+    dispatch = cats.get("dispatch", (0.0, 0, 0))[0]
+    compute = cats.get("compute", (0.0, 0, 0))[0]
+    dataflow = cats.get("dram_write", (0.0, 0, 0))[0]
+    dataflow += cats.get("dram_read_fast", (0.0, 0, 0))[0]
+    dataflow += cats.get("dram_read_slow", (0.0, 0, 0))[0]
+    if total > 0 and (dispatch > 0 or compute > 0):
+      p_compute = (compute / total) * 100
+      p_dispatch = (dispatch / total) * 100
+      p_dataflow = (dataflow / total) * 100
+      print(f"  {'pct':20s} compute {p_compute:5.1f}%  dispatch {p_dispatch:5.1f}%  dataflow {p_dataflow:5.1f}%")
 
 _timer: _Timer | None = _Timer() if os.environ.get("TIMING") else None
 if _timer: atexit.register(_timer.summary)

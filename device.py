@@ -11,11 +11,6 @@ from codegen import CompiledKernel
 # Per-core arg generator: (core_idx, core_xy, num_cores) -> list[int]
 ArgGen = Callable[[int, tuple[int, int], int], list[int]]
 
-class RunTiming(NamedTuple):
-  total: float      # dispatch + compute (seconds)
-  dispatch: float   # time to write GO_MSG to all cores (seconds)
-  compute: float    # time from last GO_MSG to last core done (seconds)
-
 @dataclass
 class Program:
   reader: CompiledKernel | None
@@ -42,7 +37,7 @@ class TileGrid:
 
   def __post_init__(self):
     self.dram = [(bank, Dram.BANK_X[bank], y) for bank in range(Dram.BANK_COUNT)
-                 if bank != self.harvested_dram_bank for y in Dram.BANK_TILE_YS[bank]]
+    if bank != self.harvested_dram_bank for y in Dram.BANK_TILE_YS[bank]]
 
 class Device:
   def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
@@ -80,8 +75,6 @@ class Device:
     return mask, as_bytes(arr)
 
   def _pack_kernel_shared(self, program: Program, rta_sizes: tuple[int, int, int]):
-    """Build the shared (mcastable) portion of the kernel config image: CB config + kernel binaries.
-    Also builds the LaunchMsg. Returns (shared_img_offset, shared_img, launch_blob, rta_offsets)."""
     align16 = lambda n: (n + 15) & ~15
 
     rta_offsets = [0, rta_sizes[0], rta_sizes[0] + rta_sizes[1]]
@@ -139,7 +132,6 @@ class Device:
 
   @staticmethod
   def _pack_rta(reader_args: list[int], writer_args: list[int], compute_args: list[int]) -> bytes:
-    """Pack per-core runtime args into a single blob."""
     pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
     return pack(writer_args) + pack(reader_args) + pack(compute_args)
 
@@ -148,7 +140,6 @@ class Device:
 
   @staticmethod
   def _mcast_rects(cores: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
-    """Compute minimal mcast rectangles (x0, x1, y0, y1) from a core list, split by DRAM column gap."""
     west = [(x, y) for x, y in cores if x < 8]
     east = [(x, y) for x, y in cores if x >= 10]
     rects = []
@@ -159,8 +150,20 @@ class Device:
         rects.append((min(xs), max(xs), min(ys), max(ys)))
     return rects
 
-  def run(self, program: Program) -> RunTiming:
-    """Run a program on the device. Returns RunTiming with dispatch/compute breakdown."""
+  @staticmethod
+  def _mcast_write_rects(
+    win: TLBWindow,
+    cfg: TLBConfig,
+    rects: list[tuple[int, int, int, int]],
+    writes: list[tuple[int, bytes]],
+  ):
+    for x0, x1, y0, y1 in rects:
+      cfg.start, cfg.end = (x0, y0), (x1, y1)
+      win.configure(cfg)
+      for addr, data in writes:
+        win.write(addr, data, use_uc=True, restore=False)
+
+  def run(self, program: Program) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else TileGrid.TENSIX
     num_cores = len(cores)
 
@@ -183,31 +186,42 @@ class Device:
     rects = self._mcast_rects(cores)
     win = self.win
     # Mcast shared data: reset GO_MSG, GO_MSG_INDEX, CB config + kernel binaries, LAUNCH
-    for x0, x1, y0, y1 in rects:
-      mcast_cfg.start, mcast_cfg.end = (x0, y0), (x1, y1)
-      win.configure(mcast_cfg)
-      win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
-      win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
-      win.write(TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img, use_uc=True, restore=False)
-      win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
+    self._mcast_write_rects(
+      win,
+      mcast_cfg,
+      rects,
+      [
+        (TensixL1.GO_MSG, reset_blob),
+        (TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little")),
+        (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img),
+        (TensixL1.LAUNCH, launch_blob),
+      ],
+    )
+
+    shared_rta = None
+    if (
+      isinstance(program.reader_rt_args, list)
+      and isinstance(program.writer_rt_args, list)
+      and isinstance(program.compute_rt_args, list)
+    ):
+      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args)
 
     # Unicast per-core runtime args
     for core_idx, (x, y) in enumerate(cores):
-      reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
-      writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
-      compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
-      rta = self._pack_rta(reader_args, writer_args, compute_args)
+      if shared_rta is None:
+        reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
+        writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
+        compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
+        rta = self._pack_rta(reader_args, writer_args, compute_args)
+      else:
+        rta = shared_rta
       l1_cfg.start = l1_cfg.end = (x, y)
       win.configure(l1_cfg)
       win.write(TensixL1.KERNEL_CONFIG_BASE, rta, use_uc=True, restore=False)
 
     # Dispatch: multicast GO_MSG to all cores
     t_dispatch_start = time.perf_counter()
-    mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
-    for x0, x1, y0, y1 in self._mcast_rects(cores):
-      mcast_cfg.start, mcast_cfg.end = (x0, y0), (x1, y1)
-      win.configure(mcast_cfg)
-      win.write(TensixL1.GO_MSG, go_blob, use_uc=True, restore=False)
+    self._mcast_write_rects(win, mcast_cfg, rects, [(TensixL1.GO_MSG, go_blob)])
     t_compute_start = time.perf_counter()
 
     # Wait for all cores to complete (unicast poll)
@@ -222,10 +236,11 @@ class Device:
 
     t_end = time.perf_counter()
     dispatch = t_compute_start - t_dispatch_start
-    compute = t_end - t_compute_start
     tlog("dispatch", dispatch)
+    compute = t_end - t_compute_start
     tlog("compute", compute)
-    return RunTiming(total=dispatch + compute, dispatch=dispatch, compute=compute)
+    total = dispatch + compute
+    return total, dispatch
 
   def upload_firmware(self):
     fw_dir = Path(__file__).parent / "riscv-firmware" / self.arch
