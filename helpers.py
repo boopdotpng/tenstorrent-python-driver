@@ -3,8 +3,6 @@ from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
 from dataclasses import dataclass
 from pathlib import Path
 
-TT_HOME = Path(os.environ["TT_HOME"])
-
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
 def align_down(value: int, alignment: TLBSize) -> tuple[int, int]:

@@ -21,8 +21,8 @@ class DType(Enum):
 def _align(x: int, a: int = DRAM_ALIGNMENT) -> int:
   return (x + a - 1) & ~(a - 1)
 
-def _tile_transform(data: bytes, bpe: int, forward: bool) -> bytes:
-  """Convert between row-major and TILED_NFACES (4 faces per 32x32 tile)."""
+def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
+  """Convert between row-major and TILED_NFACES (4 faces of 16x16 per 32x32 tile)."""
   n_tiles = len(data) // (TILE_ELEMS * bpe)
   out = bytearray(len(data))
   for t in range(n_tiles):
@@ -31,19 +31,39 @@ def _tile_transform(data: bytes, bpe: int, forward: bool) -> bytes:
       for face_c in range(2):
         face_idx = face_r * 2 + face_c
         for r in range(FACE_R):
-          row = face_r * FACE_R + r
-          col = face_c * FACE_C
-          rm_off = toff + (row * TILE_C + col) * bpe
+          rm_off = toff + ((face_r * FACE_R + r) * TILE_C + face_c * FACE_C) * bpe
           tf_off = toff + (face_idx * FACE_R * FACE_C + r * FACE_C) * bpe
-          src_off, dst_off = (rm_off, tf_off) if forward else (tf_off, rm_off)
-          out[dst_off : dst_off + FACE_C * bpe] = data[src_off : src_off + FACE_C * bpe]
+          src, dst = (rm_off, tf_off) if forward else (tf_off, rm_off)
+          out[dst : dst + FACE_C * bpe] = data[src : src + FACE_C * bpe]
   return bytes(out)
 
-def tilize(data: bytes, bpe: int) -> bytes:
-  return _tile_transform(data, bpe, forward=True)
+def _grid_transform(data: bytes, bpe: int, rows: int, cols: int, forward: bool) -> bytes:
+  """Reorder between 2D row-major matrix and sequential tiles (row-major within each tile)."""
+  assert rows % TILE_R == 0 and cols % TILE_C == 0, "Dimensions must be tile-aligned"
+  tile_rows, tile_cols = rows // TILE_R, cols // TILE_C
+  out = bytearray(len(data))
+  for tr in range(tile_rows):
+    for tc in range(tile_cols):
+      tile_idx = tr * tile_cols + tc
+      for r in range(TILE_R):
+        grid_off = ((tr * TILE_R + r) * cols + tc * TILE_C) * bpe
+        tile_off = (tile_idx * TILE_ELEMS + r * TILE_C) * bpe
+        src, dst = (grid_off, tile_off) if forward else (tile_off, grid_off)
+        out[dst : dst + TILE_C * bpe] = data[src : src + TILE_C * bpe]
+  return bytes(out)
 
-def untilize(data: bytes, bpe: int) -> bytes:
-  return _tile_transform(data, bpe, forward=False)
+def tilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = None) -> bytes:
+  """Convert row-major data to tiled format (with face reordering)."""
+  if rows is not None and cols is not None:
+    data = _grid_transform(data, bpe, rows, cols, forward=True)
+  return _face_transform(data, bpe, forward=True)
+
+def untilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = None) -> bytes:
+  """Convert tiled data back to row-major format."""
+  data = _face_transform(data, bpe, forward=False)
+  if rows is not None and cols is not None:
+    data = _grid_transform(data, bpe, rows, cols, forward=False)
+  return data
 
 @dataclass(frozen=True)
 class DramBuffer:

@@ -1,6 +1,6 @@
 import os, struct, time
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import ClassVar, Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import align_down, generate_jal_instruction, load_pt_load
@@ -8,17 +8,21 @@ from pathlib import Path
 from dram import DramAllocator
 from codegen import CompiledKernel
 
+# Per-core arg generator: (core_idx, core_xy, num_cores) -> list[int]
+ArgGen = Callable[[int, tuple[int, int], int], list[int]]
+
 @dataclass
 class Program:
   reader: CompiledKernel | None
   writer: CompiledKernel | None
   compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel] | None
-  reader_rt_args: list[int]
-  writer_rt_args: list[int]
-  compute_rt_args: list[int]
+  reader_rt_args: list[int] | ArgGen   # Fixed args OR per-core generator
+  writer_rt_args: list[int] | ArgGen
+  compute_rt_args: list[int] | ArgGen
   cbs: list[int]
   tile_size: int
   num_pages: int
+  cores: list[tuple[int, int]] | None = None  # None = all cores
 
 @dataclass
 class TileGrid:
@@ -68,13 +72,13 @@ class Device:
       addr += size
     return mask, as_bytes(arr)
 
-  def _pack_kernel_config(self, program: Program):
+  def _pack_kernel_config(self, program: Program, reader_args: list[int], writer_args: list[int], compute_args: list[int]):
     pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
     align16 = lambda n: (n + 15) & ~15
 
-    brisc_rta = pack(program.writer_rt_args)
-    ncrisc_rta = pack(program.reader_rt_args)
-    trisc_rta = pack(program.compute_rt_args)
+    brisc_rta = pack(writer_args)
+    ncrisc_rta = pack(reader_args)
+    trisc_rta = pack(compute_args)
     rta_offsets = [0, len(brisc_rta), len(brisc_rta) + len(ncrisc_rta)]
     rta_total = align16(rta_offsets[2] + len(trisc_rta))
     crta_off = rta_total
@@ -131,31 +135,59 @@ class Device:
 
     return bytes(img), cfg
 
-  def run(self, program: Program):
-    img, kc = self._pack_kernel_config(program)
-    cores = TileGrid.TENSIX
+  def _resolve_args(self, args: list[int] | ArgGen, core_idx: int, core_xy: tuple[int, int], num_cores: int) -> list[int]:
+    return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
+
+  def run(self, program: Program, *, time_execution: bool = False) -> float | None:
+    """Run a program on the device.
+    
+    Args:
+      program: The program to run
+      time_execution: If True, returns execution time in seconds (excludes kernel upload)
+    
+    Returns:
+      Execution time in seconds if time_execution=True, else None
+    """
+    cores = program.cores if program.cores is not None else TileGrid.TENSIX
+    num_cores = len(cores)
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
     reset_blob = as_bytes(reset)
-    launch = LaunchMsg()
-    launch.kernel_config = kc
-    launch_blob = as_bytes(launch)
     go = GoMsg()
     go.bits.signal = DevMsgs.RUN_MSG_GO
     go_blob = as_bytes(go)
 
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
-      for x, y in cores:
+      # Upload kernel config to all cores first
+      for core_idx, (x, y) in enumerate(cores):
+        reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
+        writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
+        compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
+        img, kc = self._pack_kernel_config(program, reader_args, writer_args, compute_args)
+        launch = LaunchMsg()
+        launch.kernel_config = kc
+        launch_blob = as_bytes(launch)
+
         l1_cfg.start = l1_cfg.end = (x, y)
         win.configure(l1_cfg)
         win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
         win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
+
+      # Start timing after upload, before triggering execution
+      if time_execution:
+        start_time = time.perf_counter()
+
+      # Trigger all cores to start
+      for x, y in cores:
+        l1_cfg.start = l1_cfg.end = (x, y)
+        win.configure(l1_cfg)
         win.write(TensixL1.GO_MSG, go_blob, use_uc=True, restore=False)
 
+      # Wait for all cores to complete
       for x, y in cores:
         l1_cfg.start = l1_cfg.end = (x, y)
         win.configure(l1_cfg)
@@ -164,6 +196,10 @@ class Device:
           if time.perf_counter() > deadline:
             raise TimeoutError(f"timeout waiting for core ({x}, {y})")
           time.sleep(0.001)
+
+    if time_execution:
+      return time.perf_counter() - start_time  # type: ignore
+    return None
 
   def upload_firmware(self):
     fw_dir = Path(__file__).parent / "riscv-firmware" / self.arch

@@ -1,13 +1,23 @@
-from helpers import TT_HOME, pack_xip_elf
+from helpers import pack_xip_elf
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-import shutil, subprocess, tempfile
+import os, shutil, subprocess, tempfile
+
+# Local bundled dependencies (headers, libs, linker scripts, firmware sources)
+_DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
+# Compiler toolchain - check local first, then TT_HOME
+_SFPI = _DEPS / "sfpi-toolchain" / "bin"
+if not _SFPI.is_dir() and "TT_HOME" in os.environ:
+  _SFPI = Path(os.environ["TT_HOME"]) / "runtime" / "sfpi" / "compiler" / "bin"
 
 class DataFormat(Enum):
   Float32, Float16, Bfp8, Bfp4, Tf32, Float16_b, Bfp8_b, Bfp4_b = 0, 1, 2, 3, 4, 5, 6, 7
   Int32, UInt16, Lf8, Bfp2, Int8, Bfp2_b, UInt32, Fp8_e4m3, UInt8 = 8, 9, 10, 11, 14, 15, 24, 0x1A, 30
   Invalid = 0xFF
+
+  @property
+  def cname(self) -> str: return self.name  # C++ DataFormat::* enum name
 
 class MathFidelity(Enum):
   LoFi = 0   # Lowest precision, fastest
@@ -38,12 +48,8 @@ class CompiledKernels:
   writer: CompiledKernel
   compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel]
 
-_HW = TT_HOME / "runtime" / "hw"
-_FW_SRC = TT_HOME / "tt_metal" / "hw" / "firmware" / "src" / "tt-1xx"
-_SFPI = TT_HOME / "runtime" / "sfpi" / "compiler" / "bin"
-
-_INCLUDES = [
-  "tt_metal", "tt_metal/hw/inc", "tt_metal/hostdevcommon/api", "tt_metal/api",
+_INCLUDE_PATHS = [
+  "tt_metal/hw/inc", "tt_metal/hostdevcommon/api", "tt_metal/api",
   "tt_metal/include", "tt_metal/hw/inc/internal/tt-1xx",
   "tt_metal/hw/inc/internal/tt-1xx/blackhole",
   "tt_metal/hw/inc/internal/tt-1xx/blackhole/noc",
@@ -80,8 +86,9 @@ class Compiler:
     self._nm = _SFPI / "riscv-tt-elf-nm"
     self._fw_dir = Path(__file__).resolve().parent / "riscv-firmware" / "p100a"
     self._ckernel = ckernel
-    self._includes = ["-I."] + [f"-I{TT_HOME / p}" for p in _INCLUDES]
-    assert self._cc.is_file(), f"missing compiler: {self._cc}"
+    inc = _DEPS / "include"
+    self._includes = ["-I.", f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
+    assert self._cc.is_file(), f"missing compiler: {self._cc}\nDownload toolchain to {_DEPS / 'sfpi-toolchain'}"
     assert self._fw_dir.is_dir(), f"missing firmware: {self._fw_dir}"
 
   def compile(self, reader: str, writer: str, compute: str) -> CompiledKernels:
@@ -104,7 +111,7 @@ class Compiler:
       f"-DPROCESSOR_INDEX={0 if target == 'brisc' else 1}",
       f"-DNOC_INDEX={noc_index}", "-DNOC_MODE=0",
     ]
-    extra_objs = [str(_HW / "lib/blackhole/noc.o")] if target == "brisc" else []
+    extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
     return self._build(src, target, defines, extra_objs, opt="-O2", trisc=False)
 
   def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
@@ -132,12 +139,12 @@ class Compiler:
       # Compile
       mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
              ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
-      fw_src = _FW_SRC / ("trisck.cc" if trisc else f"{target}k.cc")
+      fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
       self._run(self._cc, [opt, *_CFLAGS, *mcpu, *self._includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
 
       # Link
-      ld = _HW / "toolchain" / "blackhole" / f"kernel_{target}.ld"
-      objs = ["out.o", *extra_objs, str(_HW / "lib/blackhole/substitutes.o")]
+      ld = _DEPS / "toolchain" / "blackhole" / f"kernel_{target}.ld"
+      objs = ["out.o", *extra_objs, str(_DEPS / "lib/blackhole/substitutes.o")]
       self._run(self._cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, f"-T{ld}",
                 "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw}", *objs, "-o", "out.elf"], build)
 

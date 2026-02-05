@@ -1,57 +1,15 @@
+#!/usr/bin/env python3
+"""Simple eltwise add +1.0 example using auto-generated dataflow kernels."""
 from __future__ import annotations
+import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
-from codegen import Compiler
+from codegen import Compiler, CBSpec, DataFormat
 from device import Device, Program
 from dram import tilize, untilize
 
 N_TILES = 64
 
-K_READER = r"""
-#include <cstdint>
-
-void kernel_main() {
-  uint32_t in0_addr = get_arg_val<uint32_t>(0);
-  constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
-  const uint32_t tile_size_bytes = get_tile_size(cb_in0);
-  const InterleavedAddrGenFast<true> in0 = {
-    .bank_base_address = in0_addr,
-    .page_size = tile_size_bytes,
-    .data_format = DataFormat::Float16_b,
-  };
-  constexpr uint32_t n_tiles = 64;
-  for (uint32_t i = 0; i < n_tiles; ++i) {
-    cb_reserve_back(cb_in0, 1);
-    uint32_t cb_in0_addr = get_write_ptr(cb_in0);
-    noc_async_read_tile(i, in0, cb_in0_addr);
-    noc_async_read_barrier();
-    cb_push_back(cb_in0, 1);
-  }
-}
-"""
-
-K_WRITER = r"""
-#include <cstdint>
-
-void kernel_main() {
-  uint32_t out_addr = get_arg_val<uint32_t>(0);
-  constexpr uint32_t cb_out0 = tt::CBIndex::c_16;
-  const uint32_t tile_size_bytes = get_tile_size(cb_out0);
-  const InterleavedAddrGenFast<true> out0 = {
-    .bank_base_address = out_addr,
-    .page_size = tile_size_bytes,
-    .data_format = DataFormat::Float16_b,
-  };
-  constexpr uint32_t n_tiles = 64;
-  for (uint32_t i = 0; i < n_tiles; ++i) {
-    cb_wait_front(cb_out0, 1);
-    uint32_t cb_out0_addr = get_read_ptr(cb_out0);
-    noc_async_write_tile(i, out0, cb_out0_addr);
-    noc_async_write_barrier();
-    cb_pop_front(cb_out0, 1);
-  }
-}
-"""
-
+# User only writes the compute kernel - dataflow is auto-generated!
 K_COMPUTE = r"""
 #include <cstdint>
 #include "compute_kernel_api/common.h"
@@ -100,16 +58,19 @@ def _make_bf16_buffer(n_tiles: int, *, seed: int = 0) -> bytes:
   return bytes(out)
 
 def main():
-  kernels = Compiler().compile(K_READER, K_WRITER, K_COMPUTE)
+  # Define CB specs - the dataflow kernels are auto-generated from these
+  cb_in0 = CBSpec(cb_id=0, fmt=DataFormat.Float16_b, arg_index=0)
+  cb_out0 = CBSpec(cb_id=16, fmt=DataFormat.Float16_b, arg_index=0)
+
+  # Compile: user only provides compute kernel, dataflow is generated
+  kernels = Compiler().compile_compute(K_COMPUTE, inputs=[cb_in0], output=cb_out0, n_tiles=N_TILES)
   device = Device()
   try:
     tile_size_bytes = 32 * 32 * 2
     src_rm = _make_bf16_buffer(N_TILES)
-    src = tilize(src_rm, N_TILES)
+    src = tilize(src_rm, 2)  # 2 bytes per bf16 element
     src_buf = device.dram.alloc_write(src, name="src", page_size=tile_size_bytes)
-    dst_buf = device.dram.alloc(
-      tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes
-    )
+    dst_buf = device.dram.alloc(tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes)
 
     program = Program(
       reader=kernels.reader,
@@ -125,7 +86,7 @@ def main():
     device.run(program)
 
     out_tiled = device.dram.read(dst_buf)
-    out = untilize(out_tiled, N_TILES)
+    out = untilize(out_tiled, 2)  # 2 bytes per bf16 element
 
     for i in range(0, len(out), 2):
       src_bf16 = int.from_bytes(src_rm[i : i + 2], "little")
