@@ -39,14 +39,12 @@ void kernel_main() {{
     uint32_t out_col = out_tile % Nt;
 
     for (uint32_t kt = 0; kt < Kt; ++kt) {{
-      // A tile at (out_row, kt)
       uint32_t a_tile = out_row * Kt + kt;
       cb_reserve_back(cb_a, 1);
       noc_async_read_tile(a_tile, a_gen, get_write_ptr(cb_a));
       noc_async_read_barrier();
       cb_push_back(cb_a, 1);
 
-      // B tile at (kt, out_col)
       uint32_t b_tile = kt * Nt + out_col;
       cb_reserve_back(cb_b, 1);
       noc_async_read_tile(b_tile, b_gen, get_write_ptr(cb_b));
@@ -99,7 +97,6 @@ void MAIN {{
   constexpr tt::CBIndex cb_b = tt::CBIndex::c_1;
   constexpr tt::CBIndex cb_out = tt::CBIndex::c_16;
 
-  // mm_init programs ADDR_MOD registers and MOP replay buffer with MVMUL sequences
   mm_init(cb_a, cb_b, cb_out);
 
   for (uint32_t i = 0; i < num_tiles; ++i) {{
@@ -107,22 +104,11 @@ void MAIN {{
     for (uint32_t kt = 0; kt < Kt; ++kt) {{
       cb_wait_front(cb_a, 1);
       cb_wait_front(cb_b, 1);
-
-      // Unpack: load tiles from CBs into SrcA/SrcB (TRISC0 only)
-      // Note: in0 (cb_a) -> SrcB, in1 (cb_b) -> SrcA (hardware swaps internally)
       UNPACK((llk_unpack_AB_matmul(cb_a, cb_b, 0, 0)));
 
 #ifdef TRISC_MATH
-      // Set DST write address for tile 0 (with double-buffer offset)
       ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(0);
-
-      // Execute the MOP which replays the MVMUL instruction sequence:
-      //   16x TTI_MVMUL across 4 faces: D[8,16] = B[8,16] * A[16,16]
-      //   with ADDR_MOD auto-incrementing srca/srcb/dest pointers
-      //   final MVMUL clears SrcA (CLR_A) since ct_dim >= rt_dim (reuse_a)
       ckernel_template::run();
-
-      // Reset SrcB for next tile pair (end of reuse boundary)
       TTI_SETRWC(p_setrwc::CLR_B, 0, 0, 0, 0, p_setrwc::SET_ABD_F);
 #endif
 
@@ -165,10 +151,7 @@ def matmul_ref(a: list[float], b: list[float], m: int, k: int, n: int) -> list[f
   return c
 
 def main():
-  print(f"Matmul: C[{M},{N}] = A[{M},{K}] @ B[{K},{N}]")
-  print(f"Tiles: Mt={Mt}, Kt={Kt}, Nt={Nt}, total_output_tiles={NUM_OUTPUT_TILES}")
-
-  # Compile - LoFi is 3.6x faster than HiFi4, HiFi2 is 2x faster
+  print(f"Matmul: C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] ({NUM_OUTPUT_TILES} output tiles)")
   cfg = CkernelConfig(
     input_format=DataFormat.Float16_b,
     output_format=DataFormat.Float16_b,
@@ -183,43 +166,34 @@ def main():
   try:
     tile_bytes = 32 * 32 * 2
 
-    print("Creating input matrices...")
     a_rm, a_f32 = make_bf16_matrix(M, K, seed=42)
     b_rm, b_f32 = make_bf16_matrix(K, N, seed=123)
 
-    print("Uploading to DRAM...")
     a_tiled = tilize(a_rm, 2, rows=M, cols=K)
     b_tiled = tilize(b_rm, 2, rows=K, cols=N)
     a_buf = device.dram.alloc_write(a_tiled, name="A", page_size=tile_bytes)
     b_buf = device.dram.alloc_write(b_tiled, name="B", page_size=tile_bytes)
     c_buf = device.dram.alloc(tile_bytes * NUM_OUTPUT_TILES, name="C", page_size=tile_bytes)
 
-    use_all_cores = True
-    if use_all_cores:
-      active_cores = min(num_cores, NUM_OUTPUT_TILES)
-      tiles_per_core = (NUM_OUTPUT_TILES + active_cores - 1) // active_cores
-      cores = TileGrid.TENSIX[:active_cores]
-    else:
-      tiles_per_core = NUM_OUTPUT_TILES
-      active_cores = 1
-      cores = [TileGrid.TENSIX[0]]
+    active_cores = min(num_cores, NUM_OUTPUT_TILES)
+    tiles_per_core = (NUM_OUTPUT_TILES + active_cores - 1) // active_cores
+    cores = TileGrid.TENSIX[:active_cores]
 
-    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+    def core_span(core_idx: int) -> tuple[int, int]:
       start = core_idx * tiles_per_core
       count = min(tiles_per_core, NUM_OUTPUT_TILES - start)
-      if start >= NUM_OUTPUT_TILES: count = 0
+      return start, 0 if start >= NUM_OUTPUT_TILES else count
+
+    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start, count = core_span(core_idx)
       return [a_buf.addr, b_buf.addr, start, count]
 
     def writer_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
-      start = core_idx * tiles_per_core
-      count = min(tiles_per_core, NUM_OUTPUT_TILES - start)
-      if start >= NUM_OUTPUT_TILES: count = 0
+      start, count = core_span(core_idx)
       return [c_buf.addr, count, start]
 
     def compute_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
-      start = core_idx * tiles_per_core
-      count = min(tiles_per_core, NUM_OUTPUT_TILES - start)
-      if start >= NUM_OUTPUT_TILES: count = 0
+      _, count = core_span(core_idx)
       return [count]
 
     program = Program(
@@ -235,23 +209,17 @@ def main():
       cores=cores,
     )
 
-    print("Running matmul...")
     total, dispatch = device.run(program)
     flops = 2 * M * N * K
     compute = total - dispatch
     print(f"TFLOPS (compute only): {flops / compute / 1e12:.2f}, TFLOPS (total): {flops / total / 1e12:.2f}")
 
-    print("Reading result...")
     c_tiled = device.dram.read(c_buf)
     c_rm = untilize(c_tiled, 2, rows=M, cols=N)
 
     if M * N <= 1024 * 1024:
-      print("Computing reference...")
       c_ref = matmul_ref(a_f32, b_f32, M, K, N)
-
-      c_got = []
-      for i in range(0, len(c_rm), 2):
-        c_got.append(f32_from_bf16(int.from_bytes(c_rm[i:i+2], "little")))
+      c_got = [f32_from_bf16(int.from_bytes(c_rm[i:i+2], "little")) for i in range(0, len(c_rm), 2)]
 
       mean_ref = sum(c_ref) / len(c_ref)
       mean_got = sum(c_got) / len(c_got)

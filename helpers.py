@@ -1,7 +1,6 @@
 import os, struct, atexit
 from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
 from dataclasses import dataclass
-from pathlib import Path
 
 class _Timer:
   __slots__ = ('events',)
@@ -24,9 +23,7 @@ class _Timer:
     print(f"  {'total':20s} {total*1000:8.2f} ms")
     dispatch = cats.get("dispatch", (0.0, 0, 0))[0]
     compute = cats.get("compute", (0.0, 0, 0))[0]
-    dataflow = cats.get("dram_write", (0.0, 0, 0))[0]
-    dataflow += cats.get("dram_read_fast", (0.0, 0, 0))[0]
-    dataflow += cats.get("dram_read_slow", (0.0, 0, 0))[0]
+    dataflow = sum(cats.get(k, (0.0, 0, 0))[0] for k in ("dram_write", "dram_read_fast", "dram_read_slow"))
     if total > 0 and (dispatch > 0 or compute > 0):
       p_compute = (compute / total) * 100
       p_dispatch = (dispatch / total) * 100
@@ -35,6 +32,8 @@ class _Timer:
 
 _timer: _Timer | None = _Timer() if os.environ.get("TIMING") else None
 if _timer: atexit.register(_timer.summary)
+
+USE_SLOW_DISPATCH = os.environ.get("TT_SLOW_DISPATCH") == "1"
 
 def tlog(cat: str, dt: float, nbytes: int = 0):
   if _timer is not None: _timer.log(cat, dt, nbytes)
@@ -57,10 +56,8 @@ class PTLoad:
 def iter_pt_load(elf: bytes):
   e_phoff = struct.unpack_from("<I", elf, 28)[0]
   e_phentsize, e_phnum = struct.unpack_from("<HH", elf, 42)
-  if e_phentsize < 32:
-    raise ValueError(f"bad e_phentsize: {e_phentsize}")
-  if e_phoff + e_phentsize * e_phnum > len(elf):
-    raise ValueError("ELF truncated")
+  if e_phentsize < 32: raise ValueError(f"bad e_phentsize: {e_phentsize}")
+  if e_phoff + e_phentsize * e_phnum > len(elf): raise ValueError("ELF truncated")
   for i in range(e_phnum):
     off = e_phoff + i * e_phentsize
     p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, _ = struct.unpack_from("<IIIIIIII", elf, off)
@@ -83,11 +80,9 @@ def generate_jal_instruction(target_addr: int) -> int:
 
 def pack_xip_elf(path: str | os.PathLike[str]) -> tuple[bytes, int]:
   segs = load_pt_load(path)
-  if not segs:
-    raise ValueError("no PT_LOAD segments")
+  if not segs: raise ValueError("no PT_LOAD segments")
   l1 = [s for s in segs if (s.memsz or s.data) and (0 <= s.paddr < TensixL1.SIZE)]
-  if not l1:
-    raise ValueError("no L1 PT_LOAD segments")
+  if not l1: raise ValueError("no L1 PT_LOAD segments")
   l1.sort(key=lambda s: s.paddr)
   base = l1[0].paddr
   out = bytearray()

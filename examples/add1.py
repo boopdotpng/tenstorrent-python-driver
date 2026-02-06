@@ -114,20 +114,22 @@ def main():
     src_buf = device.dram.alloc_write(src, name="src", page_size=tile_size_bytes)
     dst_buf = device.dram.alloc(tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes)
 
-    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+    def core_span(core_idx: int) -> tuple[int, int]:
       start = core_idx * tiles_per_core
       count = min(tiles_per_core, N_TILES - start)
-      return [src_buf.addr, start, max(count, 0)]
+      return start, max(count, 0)
+
+    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start, count = core_span(core_idx)
+      return [src_buf.addr, start, count]
 
     def writer_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
-      start = core_idx * tiles_per_core
-      count = min(tiles_per_core, N_TILES - start)
-      return [dst_buf.addr, start, max(count, 0)]
+      start, count = core_span(core_idx)
+      return [dst_buf.addr, start, count]
 
     def compute_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
-      start = core_idx * tiles_per_core
-      count = min(tiles_per_core, N_TILES - start)
-      return [max(count, 0)]
+      _, count = core_span(core_idx)
+      return [count]
 
     program = Program(
       reader=kernels.reader,
@@ -151,11 +153,7 @@ def main():
       exp_bf16 = _bf16_from_f32(src_f32 + 1.0)
       got_bf16 = int.from_bytes(out[i : i + 2], "little")
       if exp_bf16 != got_bf16:
-        raise SystemExit(
-          f"mismatch at bf16[{i // 2}]: "
-          f"src={src_f32} exp={_f32_from_bf16(exp_bf16)} got={_f32_from_bf16(got_bf16)} "
-          f"(src_bf16=0x{src_bf16:04x} exp_bf16=0x{exp_bf16:04x} got_bf16=0x{got_bf16:04x})"
-        )
+        raise SystemExit(f"mismatch at bf16[{i // 2}] src=0x{src_bf16:04x} exp=0x{exp_bf16:04x} got=0x{got_bf16:04x}")
     print("Test Passed")
   finally:
     device.close()

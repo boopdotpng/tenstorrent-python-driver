@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Callable
 from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn, PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, tlog
+from helpers import _IO, tlog, USE_SLOW_DISPATCH
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
@@ -102,14 +102,14 @@ class DramBuffer:
   dtype: DType | None = None
 
 class DramAllocator:
-  def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]], *, sysmem: Sysmem | None = None, run_fn: Callable | None = None):
+  def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]], *, run_fn: Callable | None = None):
     self.fd = fd
     self.bank_tiles = dram_tiles[:: Dram.TILES_PER_BANK]
     self.next = Dram.DRAM_WRITE_OFFSET
     self.max_page_size = 2 * 1024 * 1024
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
-    self.sysmem = sysmem
     self._run_fn = run_fn
+    self.sysmem = None if USE_SLOW_DISPATCH or run_fn is None else Sysmem(self.fd)
 
   def alloc(
     self, size: int, name: str | None = None, *, page_size: int | None = None, dtype: DType | None = None
@@ -186,7 +186,7 @@ class DramAllocator:
     n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
     sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
 
-    from device import Program, TileGrid
+    from device_runtime import Program, TileGrid
     num_cores = len(TileGrid.TENSIX)
     tiles_per_core = (n_tiles + num_cores - 1) // num_cores
     active_cores = min(num_cores, n_tiles)
