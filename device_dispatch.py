@@ -6,8 +6,8 @@ from dram import DramAllocator
 from device_runtime import CommonDevice, Program, TileGrid, ArgGen
 
 class SlowDevice(CommonDevice):
-  def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
-    super().__init__(path=path, upload_firmware=upload_firmware)
+  def __init__(self, device: int = 0):
+    super().__init__(device=device)
     self.win = TLBWindow(self.fd, TLBSize.MiB_2)
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram, run_fn=self.run)
 

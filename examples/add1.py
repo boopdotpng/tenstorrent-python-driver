@@ -4,7 +4,7 @@ import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.p
 import random, struct
 from codegen import Compiler, DataFormat
 from device import Device, Program, TileGrid
-from dram import tilize, untilize
+from dram import DType
 
 NUM_CORES = len(TileGrid.TENSIX)
 N_TILES = NUM_CORES * 4
@@ -110,9 +110,13 @@ def main():
     tiles_per_core = (N_TILES + NUM_CORES - 1) // NUM_CORES
 
     src_rm = _make_bf16_buffer(N_TILES)
-    src = tilize(src_rm, 2)
-    src_buf = device.dram.alloc_write(src, name="src", page_size=tile_size_bytes)
-    dst_buf = device.dram.alloc(tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes)
+    tensor_shape = (N_TILES, 32, 32)
+    src_buf = device.dram.alloc_write(
+      src_rm, name="src", page_size=tile_size_bytes, dtype=DType.bfloat16, shape=tensor_shape
+    )
+    dst_buf = device.dram.alloc(
+      tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes, dtype=DType.bfloat16, shape=tensor_shape
+    )
 
     def core_span(core_idx: int) -> tuple[int, int]:
       start = core_idx * tiles_per_core
@@ -144,8 +148,7 @@ def main():
     )
     device.run(program)
 
-    out_tiled = device.dram.read(dst_buf)
-    out = untilize(out_tiled, 2)
+    out = device.dram.read(dst_buf)
 
     for i in range(0, len(out), 2):
       src_bf16 = int.from_bytes(src_rm[i : i + 2], "little")

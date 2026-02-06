@@ -3,9 +3,9 @@ from device_dispatch import SlowDevice, FastDevice
 from helpers import USE_SLOW_DISPATCH
 
 class Device:
-  def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
+  def __init__(self, device: int = 0):
     impl = SlowDevice if USE_SLOW_DISPATCH else FastDevice
-    self._impl = impl(path=path, upload_firmware=upload_firmware)
+    self._impl = impl(device=device)
 
   def __getattr__(self, name: str):
     return getattr(self._impl, name)

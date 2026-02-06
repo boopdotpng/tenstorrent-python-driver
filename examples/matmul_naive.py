@@ -4,7 +4,7 @@ import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.p
 import time, struct, random
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
 from device import Device, Program, TileGrid
-from dram import tilize, untilize
+from dram import DType
 
 M, K, N = 2048, 2048, 2048
 Mt, Kt, Nt = M // 32, K // 32, N // 32
@@ -169,11 +169,15 @@ def main():
     a_rm, a_f32 = make_bf16_matrix(M, K, seed=42)
     b_rm, b_f32 = make_bf16_matrix(K, N, seed=123)
 
-    a_tiled = tilize(a_rm, 2, rows=M, cols=K)
-    b_tiled = tilize(b_rm, 2, rows=K, cols=N)
-    a_buf = device.dram.alloc_write(a_tiled, name="A", page_size=tile_bytes)
-    b_buf = device.dram.alloc_write(b_tiled, name="B", page_size=tile_bytes)
-    c_buf = device.dram.alloc(tile_bytes * NUM_OUTPUT_TILES, name="C", page_size=tile_bytes)
+    a_buf = device.dram.alloc_write(
+      a_rm, name="A", page_size=tile_bytes, dtype=DType.bfloat16, shape=(M, K)
+    )
+    b_buf = device.dram.alloc_write(
+      b_rm, name="B", page_size=tile_bytes, dtype=DType.bfloat16, shape=(K, N)
+    )
+    c_buf = device.dram.alloc(
+      tile_bytes * NUM_OUTPUT_TILES, name="C", page_size=tile_bytes, dtype=DType.bfloat16, shape=(M, N)
+    )
 
     active_cores = min(num_cores, NUM_OUTPUT_TILES)
     tiles_per_core = (NUM_OUTPUT_TILES + active_cores - 1) // active_cores
@@ -214,8 +218,7 @@ def main():
     compute = total - dispatch
     print(f"TFLOPS (compute only): {flops / compute / 1e12:.2f}, TFLOPS (total): {flops / total / 1e12:.2f}")
 
-    c_tiled = device.dram.read(c_buf)
-    c_rm = untilize(c_tiled, 2, rows=M, cols=N)
+    c_rm = device.dram.read(c_buf)
 
     if M * N <= 1024 * 1024:
       c_ref = matmul_ref(a_f32, b_f32, M, K, N)

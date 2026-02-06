@@ -38,30 +38,37 @@ def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
           out[dst : dst + FACE_C * bpe] = data[src : src + FACE_C * bpe]
   return bytes(out)
 
-def _grid_transform(data: bytes, bpe: int, rows: int, cols: int, forward: bool) -> bytes:
-  assert rows % TILE_R == 0 and cols % TILE_C == 0, "Dimensions must be tile-aligned"
+def _grid_transform(data: bytes, bpe: int, shape: tuple[int, ...], forward: bool) -> bytes:
+  assert len(shape) >= 2, "Expected at least 2 dimensions"
+  rows, cols = shape[-2], shape[-1]
+  assert rows % TILE_R == 0 and cols % TILE_C == 0, "Last two dimensions must be tile-aligned"
+  batch = 1
+  for dim in shape[:-2]:
+    batch *= dim
+  slice_bytes = rows * cols * bpe
+  assert len(data) == batch * slice_bytes, "Data size does not match shape"
   tile_rows, tile_cols = rows // TILE_R, cols // TILE_C
+  tiles_per_slice = tile_rows * tile_cols
   out = bytearray(len(data))
-  for tr in range(tile_rows):
-    for tc in range(tile_cols):
-      tile_idx = tr * tile_cols + tc
-      for r in range(TILE_R):
-        grid_off = ((tr * TILE_R + r) * cols + tc * TILE_C) * bpe
-        tile_off = (tile_idx * TILE_ELEMS + r * TILE_C) * bpe
-        src, dst = (grid_off, tile_off) if forward else (tile_off, grid_off)
-        out[dst : dst + TILE_C * bpe] = data[src : src + TILE_C * bpe]
+  for b in range(batch):
+    base = b * slice_bytes
+    for tr in range(tile_rows):
+      for tc in range(tile_cols):
+        tile_idx = tr * tile_cols + tc
+        for r in range(TILE_R):
+          grid_off = base + ((tr * TILE_R + r) * cols + tc * TILE_C) * bpe
+          tile_off = base + (tile_idx * TILE_ELEMS + r * TILE_C) * bpe
+          src, dst = (grid_off, tile_off) if forward else (tile_off, grid_off)
+          out[dst : dst + TILE_C * bpe] = data[src : src + TILE_C * bpe]
   return bytes(out)
 
-def tilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = None) -> bytes:
-  if rows is not None and cols is not None:
-    data = _grid_transform(data, bpe, rows, cols, forward=True)
+def tilize(data: bytes, bpe: int, shape: tuple[int, ...]) -> bytes:
+  data = _grid_transform(data, bpe, shape, forward=True)
   return _face_transform(data, bpe, forward=True)
 
-def untilize(data: bytes, bpe: int, rows: int | None = None, cols: int | None = None) -> bytes:
+def untilize(data: bytes, bpe: int, shape: tuple[int, ...]) -> bytes:
   data = _face_transform(data, bpe, forward=False)
-  if rows is not None and cols is not None:
-    data = _grid_transform(data, bpe, rows, cols, forward=False)
-  return data
+  return _grid_transform(data, bpe, shape, forward=False)
 
 class Sysmem:
   PCIE_NOC_XY = (24 << 6) | 19
@@ -70,8 +77,12 @@ class Sysmem:
     self.fd = fd
     page_size = os.sysconf("SC_PAGE_SIZE")
     self.size = (size + page_size - 1) & ~(page_size - 1)
-    self.buf = mmap.mmap(-1, self.size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-                         prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    self.buf = mmap.mmap(
+      -1,
+      self.size,
+      flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+      prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
     self.buf[:] = b'\x00' * self.size  # fault in all pages
     buf_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
     pin_buf = bytearray(ctypes.sizeof(PinPagesIn) + ctypes.sizeof(PinPagesOutExtended))
@@ -100,6 +111,7 @@ class DramBuffer:
   size: int
   page_size: int
   dtype: DType | None = None
+  shape: tuple[int, ...] | None = None
 
 class DramAllocator:
   def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]], *, run_fn: Callable | None = None):
@@ -112,7 +124,8 @@ class DramAllocator:
     self.sysmem = None if USE_SLOW_DISPATCH or run_fn is None else Sysmem(self.fd)
 
   def alloc(
-    self, size: int, name: str | None = None, *, page_size: int | None = None, dtype: DType | None = None
+    self, size: int, name: str | None = None, *, page_size: int | None = None,
+    dtype: DType | None = None, shape: tuple[int, ...] | None = None
   ) -> DramBuffer:
     num_banks = len(self.bank_tiles)
     page_size = min(
@@ -123,12 +136,13 @@ class DramAllocator:
     pages = (size + page_size - 1) // page_size
     pages_per_bank = (pages + num_banks - 1) // num_banks
     self.next = _align(self.next + pages_per_bank * page_size)
-    return DramBuffer(name=name, addr=addr, size=size, page_size=page_size, dtype=dtype)
+    return DramBuffer(name=name, addr=addr, size=size, page_size=page_size, dtype=dtype, shape=shape)
 
   def alloc_write(
-    self, data: bytes, name: str | None = None, *, page_size: int | None = None, dtype: DType | None = None
+    self, data: bytes, name: str | None = None, *, page_size: int | None = None,
+    dtype: DType | None = None, shape: tuple[int, ...] | None = None
   ) -> DramBuffer:
-    buf = self.alloc(len(data), name=name, page_size=page_size, dtype=dtype)
+    buf = self.alloc(len(data), name=name, page_size=page_size, dtype=dtype, shape=shape)
     self.write(buf, data)
     return buf
 
@@ -161,7 +175,9 @@ class DramAllocator:
   def write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
     assert buf.page_size >= DRAM_ALIGNMENT and (buf.page_size & (DRAM_ALIGNMENT - 1)) == 0
-    if buf.dtype is not None: data = tilize(data, buf.dtype.value)
+    if buf.dtype is not None:
+      assert buf.shape is not None, "Shape is required when dtype is set"
+      data = tilize(data, buf.dtype.value, buf.shape)
     view = memoryview(data)
 
     def do_write(addr: int, off: int):
@@ -207,7 +223,9 @@ class DramAllocator:
     self._run_fn(program)
     result = bytes(sm.buf[:buf.size])
     tlog("dram_read_fast", time.perf_counter() - t0, buf.size)
-    if buf.dtype is not None: return untilize(result, buf.dtype.value)
+    if buf.dtype is not None:
+      assert buf.shape is not None, "Shape is required when dtype is set"
+      return untilize(result, buf.dtype.value, buf.shape)
     return result
 
   def _read_slow(self, buf: DramBuffer) -> bytes:
@@ -221,7 +239,9 @@ class DramAllocator:
     t0 = time.perf_counter()
     self._for_each_page(buf, buf.size, TLBMode.RELAXED, do_read)
     tlog("dram_read_slow", time.perf_counter() - t0, buf.size)
-    if buf.dtype is not None: return untilize(bytes(result), buf.dtype.value)
+    if buf.dtype is not None:
+      assert buf.shape is not None, "Shape is required when dtype is set"
+      return untilize(bytes(result), buf.dtype.value, buf.shape)
     return bytes(result)
 
   def close(self):

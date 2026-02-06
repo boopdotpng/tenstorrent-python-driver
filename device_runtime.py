@@ -39,10 +39,13 @@ class TileGrid:
     if bank != self.harvested_dram_bank for y in Dram.BANK_TILE_YS[bank]]
 
 class CommonDevice:
-  def __init__(self, path: str = "/dev/tenstorrent/0", *, upload_firmware: bool = True):
-    self.path = path
+  def __init__(self, device: int = 0):
+    if device < 0:
+      raise ValueError("device must be >= 0")
+    self.device = device
+    self.path = f"/dev/tenstorrent/{device}"
     self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
-    ordinal = path.split("/")[-1]
+    ordinal = str(device)
     self.arch = Path(f"/sys/class/tenstorrent/tenstorrent!{ordinal}/tt_card_type").read_text().strip()
     if self.arch != "p100a":
       os.close(self.fd)
@@ -50,7 +53,7 @@ class CommonDevice:
     self._assert_arc_booted()
     self.harvested_dram = self.get_harvested_dram_bank()
     self.tiles = TileGrid(self.harvested_dram)
-    if upload_firmware: self.upload_firmware()
+    self.upload_firmware()
 
   @staticmethod
   def _tile_ready(win: TLBWindow) -> bool:
