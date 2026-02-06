@@ -11,7 +11,7 @@ if [ -f "$DEST/sfpi-toolchain/bin/riscv-tt-elf-g++" ]; then
   exit 0
 fi
 
-URL="https://github.com/boopdotpng/blackhole-py/releases/download/v0.1.0/tt-metal-deps.tar.gz"
+URL="https://github.com/boopdotpng/blackhole-py/releases/download/v0.2.0/tt-metal-deps.tar.gz"
 TARBALL="$SCRIPT_DIR/tt-metal-deps.tar.gz"
 
 echo "Downloading tt-metal dependencies..."
