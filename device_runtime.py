@@ -56,6 +56,7 @@ class CommonDevice:
     self.worker_cores = [core for core in TileGrid.TENSIX if self._core_exists(core)]
     if not self.worker_cores:
       raise RuntimeError("no active Tensix worker cores detected")
+    self.dispatchable_cores = list(self.worker_cores)
     self.upload_firmware()
 
   def _core_exists(self, core: tuple[int, int]) -> bool:

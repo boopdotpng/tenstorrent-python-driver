@@ -15,12 +15,21 @@
 //
 //  Using the normal NoC APIs for writes and/or inline_dw_writes are not allowed on this kernel.
 //
+// blackhole-py porting notes:
+//  - PCIE_NOC_X/Y must use TRANSLATED coordinates (19, 24), not physical (11, 0).
+//    Blackhole boots with NOC translation enabled. See codegen.py _DEVICE_DEFINES.
+//  - Switch statements are converted to if-else chains because the GCC RISC-V backend
+//    generates jump tables (.rodata) that are broken in XIP kernels — the table entries
+//    reference absolute addresses that don't match where the code is loaded.
+//    The -fno-jump-tables flag in codegen.py is the primary fix; the if-else conversion
+//    is kept as defense-in-depth.
+//
 
 #include "api/dataflow/dataflow_api.h"
 #include "internal/dataflow/dataflow_api_addrgen.h"
-#include "tt_metal/impl/dispatch/kernels/cq_commands.hpp"
-#include "tt_metal/impl/dispatch/kernels/cq_common.hpp"
-#include "tt_metal/impl/dispatch/kernels/cq_relay.hpp"
+#include "cq_commands.hpp"
+#include "cq_common.hpp"
+#include "cq_relay.hpp"
 #include "api/debug/dprint.h"
 #include "noc/noc_parameters.h"  // PCIE_ALIGNMENT
 
@@ -230,6 +239,9 @@ struct PrefetchExecBufState {
 static uint32_t pcie_read_ptr = pcie_base;
 static uint32_t downstream_data_ptr = downstream_cb_base;
 static uint32_t downstream_data_ptr_s = dispatch_s_buffer_base;
+static uint32_t pending_read_size = 0;
+static volatile tt_l1_ptr prefetch_q_entry_type* prefetch_q_rd_ptr =
+    (volatile tt_l1_ptr prefetch_q_entry_type*)prefetch_q_base;
 static uint32_t block_next_start_addr[cmddat_q_blocks];
 static uint32_t rd_block_idx = 0;
 static uint32_t upstream_total_acquired_page_count = 0;
@@ -368,9 +380,6 @@ FORCE_INLINE uint32_t read_from_pcie(
 //  -  cmd_ready,  prefetch_q_ready,  read_pending: issue and tag read
 template <uint32_t preamble_size>
 void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_ptr) {
-    static uint32_t pending_read_size = 0;
-    static volatile tt_l1_ptr prefetch_q_entry_type* prefetch_q_rd_ptr =
-        (volatile tt_l1_ptr prefetch_q_entry_type*)prefetch_q_base;
     constexpr uint32_t prefetch_q_msb_mask = 1u << (sizeof(prefetch_q_entry_type) * CHAR_BIT - 1);
 
     if (stall_state == STALLED) {
@@ -378,7 +387,6 @@ void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_pt
         return;
     }
 
-    // DPRINT << "fetch_q_get_cmds: " << cmd_ptr << " " << fence << ENDL();
     if (fence < cmd_ptr) {
         cmd_ptr = fence;
     }
@@ -470,8 +478,6 @@ static uint32_t process_relay_inline_cmd(uint32_t cmd_ptr, uint32_t& local_downs
     uint32_t npages =
         (length + RelayInlineState::downstream_page_size - 1) >> RelayInlineState::downstream_log_page_size;
 
-    // Assume the downstream buffer is big relative to cmddat command size that we can
-    // grab what we need in one chunk
     RelayInlineState::cb_writer.acquire_pages(npages);
 
     uint32_t remaining = cmddat_q_end - data_ptr;
@@ -1526,133 +1532,80 @@ bool process_cmd(
     volatile CQPrefetchCmd tt_l1_ptr* cmd = (volatile CQPrefetchCmd tt_l1_ptr*)cmd_ptr;
     bool done = false;
 
-    switch (cmd->base.cmd_id) {
-        case CQ_PREFETCH_CMD_RELAY_LINEAR:
-            // DPRINT << "relay linear: " << cmd_ptr << ENDL();
-            stride = process_relay_linear_cmd(cmd_ptr, downstream_data_ptr);
-            break;
+    // NOTE: Using if-else chain instead of switch statement because the compiler
+    // generates a jump table for switch, and jump tables are broken in XIP kernels
+    // on Blackhole (the .rodata section containing the table is not at the address
+    // the code expects, causing the computed jump to land in garbage).
+    uint8_t raw_cmd_id = cmd->base.cmd_id;
 
-        case CQ_PREFETCH_CMD_RELAY_PAGED:
-            // DPRINT << "relay paged: " << cmd_ptr << ENDL();
-            {
-                uint32_t is_dram_and_length_adjust = cmd->relay_paged.is_dram_and_length_adjust;
-                uint32_t is_dram = is_dram_and_length_adjust & (1 << CQ_PREFETCH_RELAY_PAGED_IS_DRAM_SHIFT);
-                uint32_t start_page = cmd->relay_paged.start_page;
-                if (is_dram) {
-                    stride = process_relay_paged_cmd<true>(cmd_ptr, downstream_data_ptr, start_page);
-                } else {
-                    stride = process_relay_paged_cmd<false>(cmd_ptr, downstream_data_ptr, start_page);
-                }
-            }
-            break;
-
-        case CQ_PREFETCH_CMD_RELAY_PAGED_PACKED:
-            // DPRINT << "relay paged packed" << ENDL();
-            if (exec_buf) {
-                stride =
-                    process_exec_buf_relay_paged_packed_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
+    if (raw_cmd_id == CQ_PREFETCH_CMD_RELAY_INLINE) {
+        if constexpr (exec_buf) {
+            if (cmd->relay_inline.dispatcher_type == DispatcherSelect::DISPATCH_MASTER) {
+                stride = process_exec_buf_relay_inline_cmd<DispatchRelayInlineState>(
+                    cmd_ptr, downstream_data_ptr, exec_buf_state);
             } else {
-                stride = process_relay_paged_packed_cmd<cmddat_wrap_enable>(cmd_ptr, downstream_data_ptr, l1_cache);
+                stride = process_exec_buf_relay_inline_cmd<DispatchSRelayInlineState>(
+                    cmd_ptr, downstream_data_ptr_s, exec_buf_state);
             }
-            break;
-
-        case CQ_PREFETCH_CMD_RELAY_INLINE:
-            // DPRINT << "relay inline" << ENDL();
-            if constexpr (exec_buf) {
-                if (cmd->relay_inline.dispatcher_type == DispatcherSelect::DISPATCH_MASTER) {
-                    stride = process_exec_buf_relay_inline_cmd<DispatchRelayInlineState>(
-                        cmd_ptr, downstream_data_ptr, exec_buf_state);
-                } else {
-                    stride = process_exec_buf_relay_inline_cmd<DispatchSRelayInlineState>(
-                        cmd_ptr, downstream_data_ptr_s, exec_buf_state);
-                }
+        } else {
+            if (cmd->relay_inline.dispatcher_type == DispatcherSelect::DISPATCH_MASTER) {
+                stride = process_relay_inline_cmd<cmddat_wrap_enable, DispatchRelayInlineState>(
+                    cmd_ptr, downstream_data_ptr);
             } else {
-                if (cmd->relay_inline.dispatcher_type == DispatcherSelect::DISPATCH_MASTER) {
-                    stride = process_relay_inline_cmd<cmddat_wrap_enable, DispatchRelayInlineState>(
-                        cmd_ptr, downstream_data_ptr);
-                } else {
-                    stride = process_relay_inline_cmd<cmddat_wrap_enable, DispatchSRelayInlineState>(
-                        cmd_ptr, downstream_data_ptr_s);
-                }
+                stride = process_relay_inline_cmd<cmddat_wrap_enable, DispatchSRelayInlineState>(
+                    cmd_ptr, downstream_data_ptr_s);
             }
-            break;
-
-        case CQ_PREFETCH_CMD_RELAY_INLINE_NOFLUSH:
-            // DPRINT << "inline no flush" << ENDL();
-            if (exec_buf) {
-                stride = process_exec_buf_relay_inline_noflush_cmd(cmd_ptr, downstream_data_ptr, exec_buf_state);
-            } else {
-                stride = process_relay_inline_noflush_cmd<cmddat_wrap_enable>(cmd_ptr, downstream_data_ptr);
-            }
-            break;
-
-        case CQ_PREFETCH_CMD_EXEC_BUF:
-            // DPRINT << "exec buf: " << cmd_ptr << ENDL();
-            ASSERT(!exec_buf);
-            if (is_h_variant) {
-                ASSERT(stall_state == STALLED);  // ExecBuf must be preceded by a prefetcher stall
-            }
-            stride = process_exec_buf_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
-            stall_state = NOT_STALLED;  // Stall is no longer required after ExecBuf finished.
-            break;
-
-        case CQ_PREFETCH_CMD_EXEC_BUF_END:
-            // DPRINT << "exec buf end: " << cmd_ptr << ENDL();
-            ASSERT(exec_buf);
-            stride = process_exec_buf_relay_inline_cmd<DispatchRelayInlineState>(
-                cmd_ptr, downstream_data_ptr, exec_buf_state);
-            done = true;
-            break;
-
-        case CQ_PREFETCH_CMD_STALL:
-            // DPRINT << "stall" << ENDL();
-            stride = process_stall(cmd_ptr);
-            break;
-
-        case CQ_PREFETCH_CMD_DEBUG:
-            // DPRINT << "debug" << ENDL();
-            //  Splitting debug cmds not implemented for exec_bufs (yet)
-            if (exec_buf) {
-                ASSERT(0);
-            }
-            stride = process_debug_cmd(cmd_ptr);
-            break;
-
-        case CQ_PREFETCH_CMD_TERMINATE:
-            // DPRINT << "prefetch terminating_" << is_h_variant << is_d_variant << ENDL();
-            ASSERT(!exec_buf);
-            done = true;
-            break;
-
-        case CQ_PREFETCH_CMD_PAGED_TO_RINGBUFFER:
-            // DPRINT << "paged to ringbuffer" << ENDL();
-            stride = process_paged_to_ringbuffer_cmd(cmd_ptr, downstream_data_ptr);
-            break;
-
-        case CQ_PREFETCH_CMD_SET_RINGBUFFER_OFFSET:
-            // DPRINT << "set ringbuffer offset" << ENDL();
-            stride = process_set_ringbuffer_offset(cmd_ptr);
-            break;
-
-        case CQ_PREFETCH_CMD_RELAY_RINGBUFFER:
-            // DPRINT << "relay ringbuffer" << ENDL();
-            if (exec_buf) {
-                stride = process_exec_buf_relay_ringbuffer_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
-            } else {
-                stride = process_relay_ringbuffer_cmd<cmddat_wrap_enable>(cmd_ptr, downstream_data_ptr, l1_cache);
-            }
-            break;
-
-        default:
-            //  DPRINT << "prefetch invalid command:" << (uint32_t)cmd->base.cmd_id << " " << cmd_ptr << " " <<
-            //                           cmddat_q_base << ENDL();
-            //  DPRINT << HEX() << *(uint32_t*)cmd_ptr << ENDL();
-            //  DPRINT << HEX() << *((uint32_t*)cmd_ptr+1) << ENDL();
-            //  DPRINT << HEX() << *((uint32_t*)cmd_ptr+2) << ENDL();
-            //  DPRINT << HEX() << *((uint32_t*)cmd_ptr+3) << ENDL();
-            //  DPRINT << HEX() << *((uint32_t*)cmd_ptr+4) << ENDL();
-            WAYPOINT("!CMD");
-            ASSERT(0);
+        }
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_RELAY_LINEAR) {
+        stride = process_relay_linear_cmd(cmd_ptr, downstream_data_ptr);
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_RELAY_PAGED) {
+        uint32_t is_dram_and_length_adjust = cmd->relay_paged.is_dram_and_length_adjust;
+        uint32_t is_dram = is_dram_and_length_adjust & (1 << CQ_PREFETCH_RELAY_PAGED_IS_DRAM_SHIFT);
+        uint32_t start_page = cmd->relay_paged.start_page;
+        if (is_dram) {
+            stride = process_relay_paged_cmd<true>(cmd_ptr, downstream_data_ptr, start_page);
+        } else {
+            stride = process_relay_paged_cmd<false>(cmd_ptr, downstream_data_ptr, start_page);
+        }
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_RELAY_PAGED_PACKED) {
+        if (exec_buf) {
+            stride =
+                process_exec_buf_relay_paged_packed_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
+        } else {
+            stride = process_relay_paged_packed_cmd<cmddat_wrap_enable>(cmd_ptr, downstream_data_ptr, l1_cache);
+        }
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_RELAY_INLINE_NOFLUSH) {
+        if (exec_buf) {
+            stride = process_exec_buf_relay_inline_noflush_cmd(cmd_ptr, downstream_data_ptr, exec_buf_state);
+        } else {
+            stride = process_relay_inline_noflush_cmd<cmddat_wrap_enable>(cmd_ptr, downstream_data_ptr);
+        }
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_EXEC_BUF) {
+        stride = process_exec_buf_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
+        stall_state = NOT_STALLED;
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_EXEC_BUF_END) {
+        stride = process_exec_buf_relay_inline_cmd<DispatchRelayInlineState>(
+            cmd_ptr, downstream_data_ptr, exec_buf_state);
+        done = true;
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_STALL) {
+        stride = process_stall(cmd_ptr);
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_DEBUG) {
+        stride = process_debug_cmd(cmd_ptr);
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_TERMINATE) {
+        done = true;
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_PAGED_TO_RINGBUFFER) {
+        stride = process_paged_to_ringbuffer_cmd(cmd_ptr, downstream_data_ptr);
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_SET_RINGBUFFER_OFFSET) {
+        stride = process_set_ringbuffer_offset(cmd_ptr);
+    } else if (raw_cmd_id == CQ_PREFETCH_CMD_RELAY_RINGBUFFER) {
+        if (exec_buf) {
+            stride = process_exec_buf_relay_ringbuffer_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
+        } else {
+            stride = process_relay_ringbuffer_cmd<cmddat_wrap_enable>(cmd_ptr, downstream_data_ptr, l1_cache);
+        }
+    } else {
+        *(volatile uint32_t*)(0x37058) = 0xDEAD0000 | raw_cmd_id;
+        while(1) { asm volatile("" ::: "memory"); }
     }
 
     return done;
@@ -2045,8 +1998,6 @@ void kernel_main_hd() {
 
         IDLE_ERISC_HEARTBEAT_AND_RETURN(heartbeat);
 
-        volatile CQPrefetchCmd tt_l1_ptr* cmd = (volatile CQPrefetchCmd tt_l1_ptr*)cmd_ptr;
-
         uint32_t stride;
         done = process_cmd<false, false>(cmd_ptr, downstream_data_ptr, stride, l1_cache, exec_buf_state);
         cmd_ptr += stride;
@@ -2055,17 +2006,24 @@ void kernel_main_hd() {
 
 void kernel_main() {
     set_l1_data_cache<true>();
-#if defined(FABRIC_RELAY)
-    DPRINT << "prefetcher_" << is_h_variant << is_d_variant << ": start (fabric relay. 2d = " << (uint32_t)is_2d_fabric
-           << ")" << ENDL();
-#else
-    DPRINT << "prefetcher_" << is_h_variant << is_d_variant << ": start" << ENDL();
-#endif
 
     // Get runtime args
     my_dev_id = get_arg_val<uint32_t>(OFFSETOF_MY_DEV_ID);
     to_dev_id = get_arg_val<uint32_t>(OFFSETOF_TO_DEV_ID);
     router_direction = get_arg_val<uint32_t>(OFFSETOF_ROUTER_DIRECTION);
+
+    // Explicitly re-initialize mutable globals for safety.
+    // do_crt1() in brisck.cc handles .data/.bss init, but this is belt-and-suspenders.
+    pcie_read_ptr = pcie_base;
+    downstream_data_ptr = downstream_cb_base;
+    downstream_data_ptr_s = dispatch_s_buffer_base;
+    pending_read_size = 0;
+    prefetch_q_rd_ptr = (volatile tt_l1_ptr prefetch_q_entry_type*)prefetch_q_base;
+    rd_block_idx = 0;
+    upstream_total_acquired_page_count = 0;
+    ringbuffer_wp = scratch_db_base;
+    ringbuffer_offset = 0;
+    stall_state = NOT_STALLED;
 
     if (is_h_variant and is_d_variant) {
         kernel_main_hd();

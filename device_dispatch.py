@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import tlog, _IO, align_down, iter_pt_load, generate_jal_instruction
+from helpers import tlog, _IO, align_down
+from codegen import CQConfig, compile_cq_kernels
 from dram import DramAllocator
 from device_runtime import CommonDevice, Program, TileGrid, ArgGen
 
@@ -104,7 +105,7 @@ class _FastCQ:
     self.sysmem = mmap.mmap(
       -1,
       self.host.sysmem_size,
-      flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE,
+      flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE,
       prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
     self.sysmem_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.sysmem))
@@ -330,7 +331,7 @@ class SlowDevice(CommonDevice):
         win.write(addr, data, use_uc=True, restore=False)
 
   def run(self, program: Program) -> tuple[float, float]:
-    cores = program.cores if program.cores is not None else self.worker_cores
+    cores = program.cores if program.cores is not None else self.dispatchable_cores
     num_cores = len(cores)
 
     reset = GoMsg()
@@ -429,8 +430,9 @@ class FastDevice(SlowDevice):
     return (x, y0), (x, y1)
 
   def _firmware_skip_cores(self) -> set[tuple[int, int]]:
+    # Don't skip dispatch cores — they need base firmware so CQ kernels can launch on top
     self._dispatch_core_pair = self._select_dispatch_cores()
-    return set(self._dispatch_core_pair)
+    return set()
 
   def __init__(
     self,
@@ -442,6 +444,8 @@ class FastDevice(SlowDevice):
   ):
     super().__init__(device=device)
     self.prefetch_core, self.dispatch_core = getattr(self, "_dispatch_core_pair", self._select_dispatch_cores())
+    reserved = {self.prefetch_core, self.dispatch_core}
+    self.dispatchable_cores = [core for core in self.worker_cores if core not in reserved]
     self._cq = _FastCQ(
       self.fd,
       prefetch_core=self.prefetch_core,
@@ -456,29 +460,58 @@ class FastDevice(SlowDevice):
     if hasattr(self, "_cq"): self._cq.close()
     super().close()
 
-  @staticmethod
-  def _load_dispatch_elf(path: Path) -> tuple[list, int]:
-    elf = path.read_bytes()
-    entry = struct.unpack_from("<I", elf, 24)[0]
-    return list(iter_pt_load(elf)), entry
+  def _wait_core_done(self, core: tuple[int, int], timeout_s: float = 2.0):
+    """Wait for a core's firmware init to complete (GO_MSG signal = RUN_MSG_DONE)."""
+    cfg = TLBConfig(addr=0, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
+    deadline = time.perf_counter() + timeout_s
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+      while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
+        if time.perf_counter() > deadline:
+          go = win.uc[TensixL1.GO_MSG + 3]
+          raise TimeoutError(f"core {core} firmware init timeout (GO_MSG signal=0x{go:02x})")
+        time.sleep(0.001)
+
+  def _build_cq_config(self) -> CQConfig:
+    """Build CQ compile config from the current device state and CQ layout."""
+    dev = self._cq.dev
+    host = self._cq.host
+    px, py = self.prefetch_core
+    dx, dy = self.dispatch_core
+    reserved = {self.prefetch_core, self.dispatch_core}
+    workers = [c for c in self.worker_cores if c not in reserved]
+    xs = [x for x, _ in workers]
+    ys = [y for _, y in workers]
+    dispatch_cb_base = (dev.l1_base + FastDispatch.BH_UNRESERVED_OFF + 4095) & ~4095
+    dispatch_s_base = dispatch_cb_base + (dev.dispatch_cb_pages << 12)
+    return CQConfig(
+      prefetch_xy=(px, py), dispatch_xy=(dx, dy),
+      pcie_base=self._cq.noc_local + host.issue_base,
+      pcie_size=host.issue_size,
+      completion_base=self._cq.noc_local + host.completion_base,
+      completion_size=host.completion_size,
+      prefetch_q_base=dev.prefetch_q_base, prefetch_q_size=dev.prefetch_q_size,
+      prefetch_q_rd_ptr_addr=dev.prefetch_q_rd_ptr_addr,
+      prefetch_q_pcie_rd_ptr_addr=dev.prefetch_q_pcie_rd_ptr_addr,
+      cmddat_q_base=dev.cmddat_q_base, cmddat_q_size=FastDispatch.PREFETCH_CMDDAT_Q_SIZE,
+      scratch_db_base=dev.scratch_db_base, scratch_db_size=FastDispatch.PREFETCH_SCRATCH_DB_SIZE,
+      dispatch_cb_base=dispatch_cb_base, dispatch_cb_pages=dev.dispatch_cb_pages,
+      dispatch_s_buffer_base=dispatch_s_base, dispatch_s_buffer_size=32 * 1024,
+      completion_q_wr_ptr_addr=dev.completion_q_wr_ptr_addr,
+      completion_q_rd_ptr_addr=dev.completion_q_rd_ptr_addr,
+      dispatch_s_sync_sem_addr=dev.dispatch_s_sync_sem_addr,
+      worker_grid_start=(min(xs), min(ys)), worker_grid_end=(max(xs), max(ys)),
+      num_worker_cores=len(workers),
+    )
 
   @staticmethod
-  def _write_dispatch_segs(win: TLBWindow, segs: list, local_init_base: int):
-    for seg in segs:
-      if not seg.data and seg.memsz == 0: continue
-      data = seg.data if seg.memsz <= len(seg.data) else seg.data + b"\0" * (seg.memsz - len(seg.data))
-      addr = seg.paddr
-      if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
-        addr = local_init_base + (addr - TensixMMIO.LOCAL_RAM_START)
-      if 0 <= addr < TensixL1.SIZE:
-        win.write(addr, data, use_uc=True, restore=False)
-
-  @staticmethod
-  def _build_dispatch_launch(*, rt_args: list[int], sem_values: list[int], entry: int) -> tuple[bytes, KernelConfigMsg]:
+  def _build_cq_launch(*, rt_args: list[int], sem_values: list[int],
+                        kernel_text_off: int, ncrisc_text_off: int = 0) -> tuple[bytes, LaunchMsg]:
+    """Build kernel config image (rt_args + semaphores) and LaunchMsg for a CQ kernel."""
     l1a = FastDispatch.L1_ALIGNMENT
     rt_blob = b"".join((a & 0xFFFFFFFF).to_bytes(4, "little") for a in rt_args).ljust(l1a, b"\0")
     sem_blob = b"".join((v & 0xFFFFFFFF).to_bytes(4, "little").ljust(l1a, b"\0") for v in sem_values)
     img = rt_blob + sem_blob
+
     kc = KernelConfigMsg()
     kc.kernel_config_base[0] = TensixL1.KERNEL_CONFIG_BASE
     kc.kernel_config_base[1] = TensixL1.KERNEL_CONFIG_BASE
@@ -486,104 +519,79 @@ class FastDevice(SlowDevice):
     kc.sem_offset[0] = l1a
     kc.rta_offset[0].rta_offset = 0
     kc.rta_offset[0].crta_offset = len(rt_blob)
-    kc.kernel_text_offset[0] = (entry - TensixL1.KERNEL_CONFIG_BASE) & 0xFFFFFFFF
-    kc.enables = 1
+    kc.kernel_text_offset[0] = kernel_text_off  # BRISC
+    kc.kernel_text_offset[1] = ncrisc_text_off   # NCRISC
+    kc.enables = 1 | (2 if ncrisc_text_off else 0)  # bit 0 = BRISC, bit 1 = NCRISC
     kc.mode = DevMsgs.DISPATCH_MODE_HOST
     kc.local_cb_mask = 0
     kc.min_remote_cb_start_index = CB.NUM_CIRCULAR_BUFFERS
-    return img, kc
-
-  def _set_soft_reset(self, core: tuple[int, int], value: int):
-    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
-    cfg = TLBConfig(addr=reg_base, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      win.read32(reg_off)
-      win.write32(reg_off, value)
-
-  def _write_mmio32(self, core: tuple[int, int], addr: int, value: int):
-    reg_base, reg_off = align_down(addr, TLBSize.MiB_2)
-    cfg = TLBConfig(addr=reg_base, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      win.write32(reg_off, value)
-
-  def _wait_dispatch_core_ready(self, core: tuple[int, int], timeout_s: float = 0.5):
-    cfg = TLBConfig(addr=0, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
-    deadline = time.perf_counter() + timeout_s
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      while True:
-        go = win.uc[TensixL1.GO_MSG + 3]
-        if go != 0xFF:
-          return
-        if time.perf_counter() > deadline:
-          raise TimeoutError(f"dispatch core {core} did not become readable (GO_MSG=0xFF)")
-        time.sleep(0.001)
+    launch = LaunchMsg()
+    launch.kernel_config = kc
+    return img, launch
 
   def _start_dispatch_cores(self):
-    fw_dir = Path(__file__).parent / "riscv-firmware" / self.arch
-    prefetch_path = fw_dir / "cq_prefetch_brisc.elf"
-    dispatch_path = fw_dir / "cq_dispatch_brisc.elf"
-    sub_path = fw_dir / "cq_dispatch_subordinate_ncrisc.elf"
-    missing = [str(p) for p in (prefetch_path, dispatch_path, sub_path) if not p.exists()]
-    if missing:
-      raise RuntimeError("missing fast-dispatch firmware: " + ", ".join(missing))
+    # Wait for firmware init to complete on dispatch cores before launching CQ kernels
+    self._wait_core_done(self.prefetch_core)
+    self._wait_core_done(self.dispatch_core)
 
-    prefetch_segs, prefetch_entry = self._load_dispatch_elf(prefetch_path)
-    dispatch_segs, dispatch_entry = self._load_dispatch_elf(dispatch_path)
-    subordinate_segs, subordinate_entry = self._load_dispatch_elf(sub_path)
+    cq_cfg = self._build_cq_config()
+    cq = compile_cq_kernels(cq_cfg)
 
-    self._set_soft_reset(self.prefetch_core, TensixMMIO.SOFT_RESET_ALL)
-    self._set_soft_reset(self.dispatch_core, TensixMMIO.SOFT_RESET_ALL)
+    # Kernel config layout: [rt_args(16B)] [sem0(16B)] [sem1(16B)] ... then kernel XIP blobs
+    # Offsets are relative to KERNEL_CONFIG_BASE
+    l1a = FastDispatch.L1_ALIGNMENT
+    # rt_args = [my_dev_id=0, to_dev_id=0, router_direction=0] -> 12 bytes, padded to 16
+    n_rt = l1a  # 16 bytes for 3 rt args
+    # Kernel text starts after rt_args + semaphores
 
-    cfg_pref = TLBConfig(addr=0, start=self.prefetch_core, end=self.prefetch_core, noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg_pref) as win:
-      self._write_dispatch_segs(win, prefetch_segs, TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH)
-      win.write(0x0, generate_jal_instruction(prefetch_entry).to_bytes(4, "little"), use_uc=True, restore=False)
-      win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, self._build_bank_noc_tables(), use_uc=True, restore=False)
-      img, kc = self._build_dispatch_launch(rt_args=[0, 0, 0], sem_values=[self._cq.dev.dispatch_cb_pages, 0], entry=prefetch_entry)
+    # -- Prefetch core: BRISC only, 2 semaphores --
+    pref_sem = [self._cq.dev.dispatch_cb_pages, 0]  # sem0=downstream credits, sem1=dispatch_s credits
+    pref_kernel_off = n_rt + len(pref_sem) * l1a
+    pref_img, pref_launch = self._build_cq_launch(
+      rt_args=[0, 0, 0], sem_values=pref_sem, kernel_text_off=pref_kernel_off)
+
+    # -- Dispatch core: BRISC + NCRISC, 2 semaphores --
+    disp_sem = [0, 0]  # sem0=upstream CB (starts at 0), sem1=dispatch_s upstream
+    disp_brisc_off = n_rt + len(disp_sem) * l1a
+    disp_ncrisc_off = _align_up(disp_brisc_off + len(cq.dispatch_brisc.xip), l1a)
+    disp_img, disp_launch = self._build_cq_launch(
+      rt_args=[0, 0, 0], sem_values=disp_sem,
+      kernel_text_off=disp_brisc_off, ncrisc_text_off=disp_ncrisc_off)
+
+    # Upload to prefetch core
+    cfg = TLBConfig(addr=0, start=self.prefetch_core, end=self.prefetch_core, noc=0, mcast=False, mode=TLBMode.STRICT)
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
       self._cq.init_prefetch_l1()
-      win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
-      reset = GoMsg(); reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
-      launch = LaunchMsg(); launch.kernel_config = kc
+      win.write(TensixL1.KERNEL_CONFIG_BASE, pref_img, use_uc=True, restore=False)
+      win.write(TensixL1.KERNEL_CONFIG_BASE + pref_kernel_off, cq.prefetch_brisc.xip, use_uc=True, restore=False)
+      win.write(TensixL1.LAUNCH, as_bytes(pref_launch), use_uc=True, restore=False)
       go = GoMsg(); go.bits.signal = DevMsgs.RUN_MSG_GO
-      win.write(TensixL1.GO_MSG, as_bytes(reset), use_uc=True, restore=False)
-      win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
-      win.write(TensixL1.LAUNCH, as_bytes(launch), use_uc=True, restore=False)
       win.write(TensixL1.GO_MSG, as_bytes(go), use_uc=True, restore=False)
 
-    cfg_disp = TLBConfig(addr=0, start=self.dispatch_core, end=self.dispatch_core, noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg_disp) as win:
-      self._write_dispatch_segs(win, dispatch_segs, TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH)
-      self._write_dispatch_segs(win, subordinate_segs, TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH)
-      win.write(0x0, generate_jal_instruction(dispatch_entry).to_bytes(4, "little"), use_uc=True, restore=False)
-      win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, self._build_bank_noc_tables(), use_uc=True, restore=False)
-      img, kc = self._build_dispatch_launch(rt_args=[0, 0, 0], sem_values=[0, 0], entry=dispatch_entry)
-      win.write(TensixL1.KERNEL_CONFIG_BASE, img, use_uc=True, restore=False)
+    # Upload to dispatch core
+    cfg.start = cfg.end = self.dispatch_core
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+      # Init completion queue pointers
       base_16b = ((self._cq.noc_local + self._cq.host.completion_base) >> 4) & 0x7FFF_FFFF
       win.write32(self._cq.dev.completion_q_wr_ptr_addr, base_16b)
       win.write32(self._cq.dev.completion_q_rd_ptr_addr, base_16b)
       win.write32(self._cq.dev.completion_q0_last_event_ptr_addr, 0)
       win.write32(self._cq.dev.completion_q1_last_event_ptr_addr, 0)
-      win.uc[self._cq.dev.dispatch_s_sync_sem_addr : self._cq.dev.dispatch_s_sync_sem_addr + (8 * FastDispatch.L1_ALIGNMENT)] = b"\0" * (8 * FastDispatch.L1_ALIGNMENT)
-      reset = GoMsg(); reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
-      launch = LaunchMsg(); launch.kernel_config = kc
+      win.uc[self._cq.dev.dispatch_s_sync_sem_addr :
+             self._cq.dev.dispatch_s_sync_sem_addr + 8 * l1a] = b"\0" * (8 * l1a)
+      # Write kernel config + kernel binaries
+      win.write(TensixL1.KERNEL_CONFIG_BASE, disp_img, use_uc=True, restore=False)
+      win.write(TensixL1.KERNEL_CONFIG_BASE + disp_brisc_off, cq.dispatch_brisc.xip, use_uc=True, restore=False)
+      win.write(TensixL1.KERNEL_CONFIG_BASE + disp_ncrisc_off, cq.dispatch_s_ncrisc.xip, use_uc=True, restore=False)
+      win.write(TensixL1.LAUNCH, as_bytes(disp_launch), use_uc=True, restore=False)
       go = GoMsg(); go.bits.signal = DevMsgs.RUN_MSG_GO
-      win.write(TensixL1.GO_MSG, as_bytes(reset), use_uc=True, restore=False)
-      win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
-      win.write(TensixL1.LAUNCH, as_bytes(launch), use_uc=True, restore=False)
       win.write(TensixL1.GO_MSG, as_bytes(go), use_uc=True, restore=False)
-
-    self._write_mmio32(self.dispatch_core, TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC, subordinate_entry)
-    self._set_soft_reset(self.prefetch_core, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
-    self._set_soft_reset(self.dispatch_core, TensixMMIO.SOFT_RESET_BRISC_NCRISC_RUN)
-    self._wait_dispatch_core_ready(self.prefetch_core)
-    self._wait_dispatch_core_ready(self.dispatch_core)
 
   def run(self, program: Program) -> tuple[float, float]:
     if program.cores is not None:
       cores = program.cores
     else:
-      reserved = {self.prefetch_core, self.dispatch_core}
-      cores = [core for core in self.worker_cores if core not in reserved]
+      cores = self.dispatchable_cores
     num_cores = len(cores)
 
     reset = GoMsg()
@@ -599,21 +607,18 @@ class FastDevice(SlowDevice):
     rta_sizes = (len(first_w) * 4, len(first_r) * 4, len(first_c) * 4)
     shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes)
 
-    mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-    rects = self._mcast_rects(cores)
     win = self.win
-    self._mcast_write_rects(
-      win,
-      mcast_cfg,
-      rects,
-      [
-        (TensixL1.GO_MSG, reset_blob),
-        (TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little")),
-        (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img),
-        (TensixL1.LAUNCH, launch_blob),
-      ],
-    )
+    # In fast-dispatch mode we reserve two worker cores for CQ (prefetch/dispatch).
+    # A rectangular multicast over the worker grid can include those reserved cores,
+    # clobbering CQ kernel state. Use explicit unicast writes per target worker.
+    for x, y in cores:
+      l1_cfg.start = l1_cfg.end = (x, y)
+      win.configure(l1_cfg)
+      win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
+      win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
+      win.write(TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img, use_uc=True, restore=False)
+      win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
 
     shared_rta = None
     if (
@@ -635,7 +640,6 @@ class FastDevice(SlowDevice):
       win.configure(l1_cfg)
       win.write(TensixL1.KERNEL_CONFIG_BASE, rta, use_uc=True, restore=False)
 
-    self._cq.reset_run_state()
     t_dispatch_start = time.perf_counter()
     for core in cores:
       self._cq.enqueue_write_linear(tile=core, addr=TensixL1.GO_MSG, data=go_blob)

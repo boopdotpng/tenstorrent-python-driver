@@ -13,8 +13,8 @@
 
 #include "api/debug/assert.h"
 #include "api/debug/dprint.h"
-#include "tt_metal/impl/dispatch/kernels/cq_commands.hpp"
-#include "tt_metal/impl/dispatch/kernels/cq_common.hpp"
+#include "cq_commands.hpp"
+#include "cq_common.hpp"
 
 // dispatch_s has a customized command buffer allocation for NOC 1.
 // Cmd Buf 0 is used for regular writes.
@@ -360,13 +360,21 @@ void kernel_main() {
 
         volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
         DeviceTimestampedData("process_cmd_d_dispatch_subordinate", (uint32_t)cmd->base.cmd_id);
-        switch (cmd->base.cmd_id) {
-            case CQ_DISPATCH_CMD_SEND_GO_SIGNAL: process_go_signal_mcast_cmd(); break;
-            case CQ_DISPATCH_SET_NUM_WORKER_SEMS: set_num_worker_sems(); break;
-            case CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA: set_go_signal_noc_data(); break;
-            case CQ_DISPATCH_CMD_WAIT: process_dispatch_s_wait_cmd(); break;
-            case CQ_DISPATCH_CMD_TERMINATE: done = true; break;
-            default: DPRINT << "dispatcher_s invalid command" << ENDL(); ASSERT(0);
+        // NOTE: if-else instead of switch — jump tables broken in XIP kernels on Blackhole
+        uint8_t cmd_id = cmd->base.cmd_id;
+        if (cmd_id == CQ_DISPATCH_CMD_SEND_GO_SIGNAL) {
+          process_go_signal_mcast_cmd();
+        } else if (cmd_id == CQ_DISPATCH_SET_NUM_WORKER_SEMS) {
+          set_num_worker_sems();
+        } else if (cmd_id == CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA) {
+          set_go_signal_noc_data();
+        } else if (cmd_id == CQ_DISPATCH_CMD_WAIT) {
+          process_dispatch_s_wait_cmd();
+        } else if (cmd_id == CQ_DISPATCH_CMD_TERMINATE) {
+          done = true;
+        } else {
+          DPRINT << "dispatcher_s invalid command" << ENDL();
+          ASSERT(0);
         }
         // Dispatch s only supports single page commands for now
         ASSERT(cmd_ptr <= ((uint32_t)cmd + cb_page_size));

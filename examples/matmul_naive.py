@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import time, struct, random
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
-from device import Device, Program, TileGrid
+from device import Device, Program
 from dram import DType
 
 M, K, N = 2048, 2048, 2048
@@ -160,7 +160,7 @@ def main():
   kernels = Compiler(cfg).compile(K_READER, K_WRITER, K_COMPUTE)
 
   device = Device()
-  num_cores = len(TileGrid.TENSIX)
+  num_cores = len(device.dispatchable_cores)
   print(f"Using {num_cores} cores")
 
   try:
@@ -181,7 +181,7 @@ def main():
 
     active_cores = min(num_cores, NUM_OUTPUT_TILES)
     tiles_per_core = (NUM_OUTPUT_TILES + active_cores - 1) // active_cores
-    cores = TileGrid.TENSIX[:active_cores]
+    cores = device.dispatchable_cores[:active_cores]
 
     def core_span(core_idx: int) -> tuple[int, int]:
       start = core_idx * tiles_per_core

@@ -69,7 +69,9 @@ _INCLUDE_PATHS = [
 
 _CFLAGS = (
   "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
-  "-fno-use-cxa-atexit", "-Wall", "-Werror", "-Wno-unknown-pragmas",
+  "-fno-use-cxa-atexit",
+  "-fno-jump-tables",  # XIP kernels: jump tables land in .rodata at wrong addresses
+  "-Wall", "-Werror", "-Wno-unknown-pragmas",
   "-Wno-deprecated-declarations", "-Wno-error=multistatement-macros",
   "-Wno-error=parentheses", "-Wno-error=unused-but-set-variable",
   "-Wno-unused-variable", "-Wno-unused-function",
@@ -79,7 +81,7 @@ _LFLAGS = ("-Wl,-z,max-page-size=16", "-Wl,-z,common-page-size=16", "-nostartfil
 _DEVICE_DEFINES = [
   "-DNUM_DRAM_BANKS=7", "-DIS_NOT_POW2_NUM_DRAM_BANKS=1",
   "-DNUM_L1_BANKS=110", "-DIS_NOT_POW2_NUM_L1_BANKS=1",
-  "-DPCIE_NOC_X=0", "-DPCIE_NOC_Y=3",
+  "-DPCIE_NOC_X=19", "-DPCIE_NOC_Y=24",
 ]
 
 def _run(exe: Path, args: list[str], cwd: Path):
@@ -177,16 +179,20 @@ class Compiler:
       ),
     )
 
-  def _compile_dataflow(self, src: str, target: str, noc_index: int) -> CompiledKernel:
+  def _compile_dataflow(self, src: str, target: str, noc_index: int,
+                        extra_defines: list[str] | None = None,
+                        extra_includes: list[str] | None = None) -> CompiledKernel:
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
       "-DDISPATCH_MESSAGE_ADDR=0", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
       f"-DCOMPILE_FOR_{target.upper()}",
       f"-DPROCESSOR_INDEX={0 if target == 'brisc' else 1}",
       f"-DNOC_INDEX={noc_index}", "-DNOC_MODE=0",
+      *(extra_defines or []),
     ]
     extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
-    return self._build(src, target, defines, extra_objs, opt="-O2", trisc=False)
+    return self._build(src, target, defines, extra_objs, opt="-O2", trisc=False,
+                       extra_includes=extra_includes)
 
   def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
     stage = ("unpack", "math", "pack")[trisc_id]
@@ -200,7 +206,7 @@ class Compiler:
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
   def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str],
-             opt: str, trisc: bool) -> CompiledKernel:
+             opt: str, trisc: bool, extra_includes: list[str] | None = None) -> CompiledKernel:
     build = Path(tempfile.mkdtemp(prefix=f"tt-{target}-"))
     try:
       # Get the compiled firmware ELF for this target (for --just-symbols)
@@ -214,7 +220,8 @@ class Compiler:
       mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
              ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
       fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
-      _run(self._cc, [opt, *_CFLAGS, "-MMD", *mcpu, *self._includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
+      includes = [*self._includes, *(f"-I{p}" for p in (extra_includes or []))]
+      _run(self._cc, [opt, *_CFLAGS, "-MMD", *mcpu, *includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
 
       # Link
       ld = _DEPS / "toolchain" / "blackhole" / f"kernel_{target}.ld"
@@ -292,6 +299,205 @@ class Compiler:
     (build / "chlkc_dst_sync_mode.h").write_text(f"#define DST_SYNC_MODE DstSync::{'SyncFull' if cfg.dst_full_sync else 'SyncHalf'}\n")
     (build / "chlkc_math_fidelity.h").write_text(f"constexpr std::int32_t MATH_FIDELITY = {cfg.math_fidelity.value};\n")
     (build / "chlkc_math_approx_mode.h").write_text(f"constexpr bool APPROX = {str(cfg.approx).lower()};\n")
+
+# === CQ (command queue) kernel compiler ===
+
+@dataclass(frozen=True)
+class CQConfig:
+  """Runtime parameters needed to compile CQ kernels. All addresses are L1 or NOC."""
+  # Core coordinates (NOC physical)
+  prefetch_xy: tuple[int, int]
+  dispatch_xy: tuple[int, int]
+  # PCIe hugepage layout
+  pcie_base: int          # offset into hugepage where issue queue starts
+  pcie_size: int          # size of issue queue region
+  completion_base: int    # NOC address of completion queue region
+  completion_size: int    # size of completion queue region
+  # Device L1 layout (on prefetch core)
+  prefetch_q_base: int
+  prefetch_q_size: int
+  prefetch_q_rd_ptr_addr: int
+  prefetch_q_pcie_rd_ptr_addr: int
+  cmddat_q_base: int
+  cmddat_q_size: int
+  scratch_db_base: int
+  scratch_db_size: int
+  # Dispatch circular buffer (on dispatch core)
+  dispatch_cb_base: int
+  dispatch_cb_pages: int
+  dispatch_cb_log_page_size: int = 12  # 4KB pages
+  dispatch_cb_blocks: int = 4
+  # Dispatch subordinate buffer (on dispatch core)
+  dispatch_s_buffer_base: int = 0
+  dispatch_s_buffer_size: int = 32 * 1024
+  dispatch_s_cb_log_page_size: int = 8  # 256B pages
+  # Completion queue device pointers (on dispatch core)
+  completion_q_wr_ptr_addr: int = 0
+  completion_q_rd_ptr_addr: int = 0
+  dispatch_s_sync_sem_addr: int = 0
+  # Worker grid for go-signal multicast
+  worker_grid_start: tuple[int, int] = (0, 0)
+  worker_grid_end: tuple[int, int] = (0, 0)
+  num_worker_cores: int = 0
+
+@dataclass(frozen=True)
+class CompiledCQKernels:
+  prefetch_brisc: CompiledKernel     # cq_prefetch on prefetch core BRISC
+  dispatch_brisc: CompiledKernel     # cq_dispatch on dispatch core BRISC
+  dispatch_s_ncrisc: CompiledKernel  # cq_dispatch_subordinate on dispatch core NCRISC
+
+def _noc_mcast_encoding(x0: int, y0: int, x1: int, y1: int) -> int:
+  """Encode a multicast rectangle as a 32-bit NOC address. BH NOC encoding: (y << 6) | x."""
+  start = (y0 << 6) | x0
+  end = (y1 << 6) | x1
+  return (start << 16) | end
+
+def _noc_xy(x: int, y: int) -> int:
+  return (y << 6) | x
+
+def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
+  """Compile the 3 CQ kernels (prefetch, dispatch, dispatch_subordinate) with baked-in config."""
+  compiler = Compiler()
+  px, py = cfg.prefetch_xy
+  dx, dy = cfg.dispatch_xy
+  go_msg_addr = 0x370  # TensixL1.GO_MSG (MAILBOX_BASE + 0x310)
+
+  # NOC multicast grid for worker go signals
+  gx0, gy0 = cfg.worker_grid_start
+  gx1, gy1 = cfg.worker_grid_end
+  mcast_grid = _noc_mcast_encoding(gx0, gy0, gx1, gy1)
+
+  # Shared fabric defines (unused in HD mode, but consumed unconditionally as constexpr)
+  fabric_zeros = {
+    "FABRIC_HEADER_RB_BASE": 0, "FABRIC_HEADER_RB_ENTRIES": 0,
+    "MY_FABRIC_SYNC_STATUS_ADDR": 0, "FABRIC_MUX_X": 0, "FABRIC_MUX_Y": 0,
+    "FABRIC_MUX_NUM_BUFFERS_PER_CHANNEL": 1, "FABRIC_MUX_CHANNEL_BUFFER_SIZE_BYTES": 1,
+    "FABRIC_MUX_CHANNEL_BASE_ADDRESS": 0, "FABRIC_MUX_CONNECTION_INFO_ADDRESS": 0,
+    "FABRIC_MUX_CONNECTION_HANDSHAKE_ADDRESS": 0, "FABRIC_MUX_FLOW_CONTROL_ADDRESS": 0,
+    "FABRIC_MUX_BUFFER_INDEX_ADDRESS": 0, "FABRIC_MUX_STATUS_ADDRESS": 0,
+    "FABRIC_MUX_TERMINATION_SIGNAL_ADDRESS": 0, "WORKER_CREDITS_STREAM_ID": 0,
+    "FABRIC_WORKER_FLOW_CONTROL_SEM": 0, "FABRIC_WORKER_TEARDOWN_SEM": 0,
+    "FABRIC_WORKER_BUFFER_INDEX_SEM": 0, "NUM_HOPS": 0, "EW_DIM": 0,
+    "TO_MESH_ID": 0, "FABRIC_2D": 0,
+  }
+
+  # Semaphore IDs: prefetch sem 0 = downstream credits, sem 1 = dispatch_s credits, sem 2 = sync
+  # Dispatch sem 0 = upstream CB pages available
+  prefetch_defs = {
+    "IS_H_VARIANT": 1, "IS_D_VARIANT": 1, "DISPATCH_KERNEL": 1, "FD_CORE_TYPE": 0,
+    "MY_NOC_X": px, "MY_NOC_Y": py,
+    "UPSTREAM_NOC_X": px, "UPSTREAM_NOC_Y": py,  # HD: no upstream, point to self
+    "DOWNSTREAM_NOC_X": dx, "DOWNSTREAM_NOC_Y": dy,
+    "DOWNSTREAM_SUBORDINATE_NOC_X": dx, "DOWNSTREAM_SUBORDINATE_NOC_Y": dy,
+    "UPSTREAM_NOC_INDEX": 0,
+    # Prefetch -> Dispatch CB flow control
+    "DOWNSTREAM_CB_BASE": cfg.dispatch_cb_base,
+    "DOWNSTREAM_CB_LOG_PAGE_SIZE": cfg.dispatch_cb_log_page_size,
+    "DOWNSTREAM_CB_PAGES": cfg.dispatch_cb_pages,
+    "MY_DOWNSTREAM_CB_SEM_ID": 0,
+    "DOWNSTREAM_CB_SEM_ID": 0,
+    # PCIe
+    "PCIE_BASE": cfg.pcie_base, "PCIE_SIZE": cfg.pcie_size,
+    # Prefetch queue
+    "PREFETCH_Q_BASE": cfg.prefetch_q_base, "PREFETCH_Q_SIZE": cfg.prefetch_q_size,
+    "PREFETCH_Q_RD_PTR_ADDR": cfg.prefetch_q_rd_ptr_addr,
+    "PREFETCH_Q_PCIE_RD_PTR_ADDR": cfg.prefetch_q_pcie_rd_ptr_addr,
+    # Command/data queue
+    "CMDDAT_Q_BASE": cfg.cmddat_q_base, "CMDDAT_Q_SIZE": cfg.cmddat_q_size,
+    "SCRATCH_DB_BASE": cfg.scratch_db_base, "SCRATCH_DB_SIZE": cfg.scratch_db_size,
+    "DOWNSTREAM_SYNC_SEM_ID": 2,
+    # D-variant prefetch_d buffer (unused in HD, but constexpr needs values)
+    "CMDDAT_Q_PAGES": cfg.cmddat_q_size >> 12, "MY_UPSTREAM_CB_SEM_ID": 3,
+    "UPSTREAM_CB_SEM_ID": 3, "CMDDAT_Q_LOG_PAGE_SIZE": 12, "CMDDAT_Q_BLOCKS": 4,
+    # Dispatch subordinate buffer
+    "DISPATCH_S_BUFFER_BASE": cfg.dispatch_s_buffer_base,
+    "MY_DISPATCH_S_CB_SEM_ID": 1, "DOWNSTREAM_DISPATCH_S_CB_SEM_ID": 0,
+    "DISPATCH_S_BUFFER_SIZE": cfg.dispatch_s_buffer_size,
+    "DISPATCH_S_CB_LOG_PAGE_SIZE": cfg.dispatch_s_cb_log_page_size,
+    # Ringbuffer (used by exec_buf, set to 0 for basic usage)
+    "RINGBUFFER_SIZE": 0,
+    # Runtime arg offsets
+    "OFFSETOF_MY_DEV_ID": 0, "OFFSETOF_TO_DEV_ID": 1, "OFFSETOF_ROUTER_DIRECTION": 2,
+    **fabric_zeros,
+  }
+
+  dispatch_defs = {
+    "IS_H_VARIANT": 1, "IS_D_VARIANT": 1, "DISPATCH_KERNEL": 1, "FD_CORE_TYPE": 0,
+    "MY_NOC_X": dx, "MY_NOC_Y": dy,
+    "UPSTREAM_NOC_X": px, "UPSTREAM_NOC_Y": py,
+    "DOWNSTREAM_NOC_X": dx, "DOWNSTREAM_NOC_Y": dy,  # HD: no downstream dispatch_h
+    "DOWNSTREAM_SUBORDINATE_NOC_X": dx, "DOWNSTREAM_SUBORDINATE_NOC_Y": dy,
+    "UPSTREAM_NOC_INDEX": 0,
+    # Dispatch CB
+    "DISPATCH_CB_BASE": cfg.dispatch_cb_base,
+    "DISPATCH_CB_LOG_PAGE_SIZE": cfg.dispatch_cb_log_page_size,
+    "DISPATCH_CB_PAGES": cfg.dispatch_cb_pages,
+    "DISPATCH_CB_BLOCKS": cfg.dispatch_cb_blocks,
+    "MY_DISPATCH_CB_SEM_ID": 0, "UPSTREAM_DISPATCH_CB_SEM_ID": 0,
+    "UPSTREAM_SYNC_SEM": 2,
+    # Completion queue
+    "COMMAND_QUEUE_BASE_ADDR": 0,
+    "COMPLETION_QUEUE_BASE_ADDR": cfg.completion_base,
+    "COMPLETION_QUEUE_SIZE": cfg.completion_size,
+    "HOST_COMPLETION_Q_WR_PTR": 2 * 64,  # HOST_COMPLETION_Q_WR_OFF
+    "DEV_COMPLETION_Q_WR_PTR": cfg.completion_q_wr_ptr_addr,
+    "DEV_COMPLETION_Q_RD_PTR": cfg.completion_q_rd_ptr_addr,
+    # Downstream (unused in HD, but constexpr needs values)
+    "DOWNSTREAM_CB_BASE": 0, "DOWNSTREAM_CB_SIZE": 0,
+    "MY_DOWNSTREAM_CB_SEM_ID": 1, "DOWNSTREAM_CB_SEM_ID": 1,
+    # Split dispatch (disabled)
+    "SPLIT_DISPATCH_PAGE_PREAMBLE_SIZE": 0, "SPLIT_PREFETCH": 0,
+    "PREFETCH_H_NOC_XY": 0, "PREFETCH_H_LOCAL_DOWNSTREAM_SEM_ADDR": 0,
+    "PREFETCH_H_MAX_CREDITS": 0,
+    # Worker dispatch
+    "PACKED_WRITE_MAX_UNICAST_SUB_CMDS": cfg.num_worker_cores,
+    "DISPATCH_S_SYNC_SEM_BASE_ADDR": cfg.dispatch_s_sync_sem_addr,
+    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 64,
+    "MCAST_GO_SIGNAL_ADDR": go_msg_addr, "UNICAST_GO_SIGNAL_ADDR": go_msg_addr,
+    "DISTRIBUTED_DISPATCHER": 0, "FIRST_STREAM_USED": 48,
+    "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
+    "NUM_PHYSICAL_UNICAST_CORES": 0,
+    "WORKER_MCAST_GRID": mcast_grid, "NUM_WORKER_CORES_TO_MCAST": cfg.num_worker_cores,
+    # Runtime arg offsets
+    "OFFSETOF_MY_DEV_ID": 0, "OFFSETOF_TO_DEV_ID": 1, "OFFSETOF_ROUTER_DIRECTION": 2,
+    **fabric_zeros,
+  }
+
+  dispatch_s_defs = {
+    "DISPATCH_KERNEL": 1, "FD_CORE_TYPE": 0,
+    "MY_NOC_X": dx, "MY_NOC_Y": dy,
+    "UPSTREAM_NOC_X": px, "UPSTREAM_NOC_Y": py,
+    "DOWNSTREAM_NOC_X": dx, "DOWNSTREAM_NOC_Y": dy,
+    "CB_BASE": cfg.dispatch_s_buffer_base,
+    "CB_LOG_PAGE_SIZE": cfg.dispatch_s_cb_log_page_size,
+    "CB_SIZE": cfg.dispatch_s_buffer_size,
+    "MY_DISPATCH_CB_SEM_ID": 0, "UPSTREAM_DISPATCH_CB_SEM_ID": 1,
+    "DISPATCH_S_SYNC_SEM_BASE_ADDR": cfg.dispatch_s_sync_sem_addr,
+    "MCAST_GO_SIGNAL_ADDR": go_msg_addr, "UNICAST_GO_SIGNAL_ADDR": go_msg_addr,
+    "DISTRIBUTED_DISPATCHER": 0, "FIRST_STREAM_USED": 48,
+    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 64,
+    "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
+    "NUM_PHYSICAL_UNICAST_CORES": 0,
+    "WORKER_MCAST_GRID": mcast_grid, "NUM_WORKER_CORES_TO_MCAST": cfg.num_worker_cores,
+  }
+
+  def _to_defs(d: dict) -> list[str]:
+    return [f"-D{k}={v}" for k, v in d.items()]
+
+  cq_src = _REPO / "firmware" / "cq"
+  cq_inc = [str(cq_src)]
+  prefetch_src = (cq_src / "cq_prefetch.cpp").read_text()
+  dispatch_src = (cq_src / "cq_dispatch.cpp").read_text()
+  dispatch_s_src = (cq_src / "cq_dispatch_subordinate.cpp").read_text()
+
+  return CompiledCQKernels(
+    prefetch_brisc=compiler._compile_dataflow(prefetch_src, "brisc", noc_index=0,
+      extra_defines=_to_defs(prefetch_defs), extra_includes=cq_inc),
+    dispatch_brisc=compiler._compile_dataflow(dispatch_src, "brisc", noc_index=1,
+      extra_defines=_to_defs(dispatch_defs), extra_includes=cq_inc),
+    dispatch_s_ncrisc=compiler._compile_dataflow(dispatch_s_src, "ncrisc", noc_index=1,
+      extra_defines=_to_defs(dispatch_s_defs), extra_includes=cq_inc),
+  )
 
 DRAIN_KERNEL_SRC = r"""
 #include <cstdint>

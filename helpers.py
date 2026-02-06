@@ -23,7 +23,12 @@ class _Timer:
     print(f"  {'total':20s} {total*1000:8.2f} ms")
     dispatch = cats.get("dispatch", (0.0, 0, 0))[0]
     compute = cats.get("compute", (0.0, 0, 0))[0]
+    kernel_total = dispatch + compute
     dataflow = sum(cats.get(k, (0.0, 0, 0))[0] for k in ("dram_write", "dram_read_fast", "dram_read_slow"))
+    mode = "slow" if USE_SLOW_DISPATCH else "fast"
+    print(f"  {'dispatch_mode':20s} {mode}")
+    if kernel_total > 0:
+      print(f"  {'kernel_total':20s} {kernel_total*1000:8.2f} ms")
     if total > 0 and (dispatch > 0 or compute > 0):
       p_compute = (compute / total) * 100
       p_dispatch = (dispatch / total) * 100

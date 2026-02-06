@@ -3,11 +3,8 @@ from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
 from codegen import Compiler, DataFormat
-from device import Device, Program, TileGrid
+from device import Device, Program
 from dram import DType
-
-NUM_CORES = len(TileGrid.TENSIX)
-N_TILES = NUM_CORES * 4
 
 K_READER = r"""
 #include <cstdint>
@@ -106,21 +103,23 @@ def main():
   kernels = Compiler().compile(K_READER, K_WRITER, K_COMPUTE)
   device = Device()
   try:
+    num_cores = len(device.dispatchable_cores)
+    n_tiles = num_cores * 4
     tile_size_bytes = 32 * 32 * 2
-    tiles_per_core = (N_TILES + NUM_CORES - 1) // NUM_CORES
+    tiles_per_core = (n_tiles + num_cores - 1) // num_cores
 
-    src_rm = _make_bf16_buffer(N_TILES)
-    tensor_shape = (N_TILES, 32, 32)
+    src_rm = _make_bf16_buffer(n_tiles)
+    tensor_shape = (n_tiles, 32, 32)
     src_buf = device.dram.alloc_write(
       src_rm, name="src", page_size=tile_size_bytes, dtype=DType.bfloat16, shape=tensor_shape
     )
     dst_buf = device.dram.alloc(
-      tile_size_bytes * N_TILES, name="dst", page_size=tile_size_bytes, dtype=DType.bfloat16, shape=tensor_shape
+      tile_size_bytes * n_tiles, name="dst", page_size=tile_size_bytes, dtype=DType.bfloat16, shape=tensor_shape
     )
 
     def core_span(core_idx: int) -> tuple[int, int]:
       start = core_idx * tiles_per_core
-      count = min(tiles_per_core, N_TILES - start)
+      count = min(tiles_per_core, n_tiles - start)
       return start, max(count, 0)
 
     def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:

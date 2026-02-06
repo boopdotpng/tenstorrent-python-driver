@@ -204,10 +204,10 @@ class DramAllocator:
 
     from device_runtime import Program, TileGrid
     dev = getattr(self._run_fn, "__self__", None)
-    reserved = set()
-    if dev is not None and hasattr(dev, "prefetch_core") and hasattr(dev, "dispatch_core"):
-      reserved = {dev.prefetch_core, dev.dispatch_core}
-    all_cores = [core for core in TileGrid.TENSIX if core not in reserved]
+    if dev is not None and hasattr(dev, "dispatchable_cores"):
+      all_cores = list(dev.dispatchable_cores)
+    else:
+      all_cores = list(TileGrid.TENSIX)
     num_cores = len(all_cores)
     tiles_per_core = (n_tiles + num_cores - 1) // num_cores
     active_cores = min(num_cores, n_tiles)
