@@ -203,10 +203,15 @@ class DramAllocator:
     sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
 
     from device_runtime import Program, TileGrid
-    num_cores = len(TileGrid.TENSIX)
+    dev = getattr(self._run_fn, "__self__", None)
+    reserved = set()
+    if dev is not None and hasattr(dev, "prefetch_core") and hasattr(dev, "dispatch_core"):
+      reserved = {dev.prefetch_core, dev.dispatch_core}
+    all_cores = [core for core in TileGrid.TENSIX if core not in reserved]
+    num_cores = len(all_cores)
     tiles_per_core = (n_tiles + num_cores - 1) // num_cores
     active_cores = min(num_cores, n_tiles)
-    cores = TileGrid.TENSIX[:active_cores]
+    cores = all_cores[:active_cores]
 
     def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
       start = core_idx * tiles_per_core

@@ -4,8 +4,15 @@ from helpers import USE_SLOW_DISPATCH
 
 class Device:
   def __init__(self, device: int = 0):
-    impl = SlowDevice if USE_SLOW_DISPATCH else FastDevice
-    self._impl = impl(device=device)
+    if USE_SLOW_DISPATCH:
+      self._impl = SlowDevice(device=device)
+      return
+    try:
+      self._impl = FastDevice(device=device)
+    except RuntimeError as exc:
+      if "missing fast-dispatch firmware" not in str(exc): raise
+      print(f"[blackhole-py] {exc}; falling back to slow dispatch")
+      self._impl = SlowDevice(device=device)
 
   def __getattr__(self, name: str):
     return getattr(self._impl, name)

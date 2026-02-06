@@ -56,8 +56,14 @@ class TensixMMIO:
   RISCV_DEBUG_REG_TRISC1_RESET_PC = 0xFFB1222C
   RISCV_DEBUG_REG_TRISC2_RESET_PC = 0xFFB12230
   RISCV_DEBUG_REG_NCRISC_RESET_PC = 0xFFB12238
+  SOFT_RESET_BRISC = 1 << 11
+  SOFT_RESET_TRISC0 = 1 << 12
+  SOFT_RESET_TRISC1 = 1 << 13
+  SOFT_RESET_TRISC2 = 1 << 14
+  SOFT_RESET_NCRISC = 1 << 18
   SOFT_RESET_ALL = 0x47800  # all 5 RISC-V cores
   SOFT_RESET_BRISC_ONLY_RUN = 0x47000  # keep TRISC/NCRISC in reset, release BRISC
+  SOFT_RESET_BRISC_NCRISC_RUN = 0x7000  # keep TRISC in reset, release BRISC/NCRISC
 
 # -- ARC -----------------------------------------------------------------------
 
@@ -100,6 +106,7 @@ IOCTL_ALLOCATE_TLB = 11
 IOCTL_FREE_TLB = 12
 IOCTL_CONFIGURE_TLB = 13
 
+PIN_PAGES_CONTIGUOUS = 1
 PIN_PAGES_NOC_DMA = 2
 
 # -- Ioctl structs -------------------------------------------------------------
@@ -222,3 +229,72 @@ class GoMsgBits(S):
 class GoMsg(ctypes.Union):
   _pack_ = 1
   _fields_ = [("all", u32), ("bits", GoMsgBits)]
+
+class FastDispatch:
+  CQ_CMD_ALIGN = 16
+  L1_ALIGNMENT = 16
+  PCIE_ALIGNMENT = 64
+  PCIE_NOC_BASE = 1 << 60
+  MAX_HUGEPAGE_SIZE = 1 << 30
+  MAX_DEV_CHANNEL_SIZE = 1 << 28
+  DEVICES_PER_UMD_CHANNEL = MAX_HUGEPAGE_SIZE // MAX_DEV_CHANNEL_SIZE
+
+  BH_TENSIX_DEFAULT_UNRESERVED = 0x196C0
+  BH_PREFETCH_Q_RD_PTR_OFF = 0x00
+  BH_PREFETCH_Q_PCIE_RD_PTR_OFF = 0x04
+  BH_COMPLETION_Q_WR_PTR_OFF = 0x10
+  BH_COMPLETION_Q_RD_PTR_OFF = 0x20
+  BH_COMPLETION_Q0_LAST_EVENT_PTR_OFF = 0x30
+  BH_COMPLETION_Q1_LAST_EVENT_PTR_OFF = 0x40
+  BH_DISPATCH_S_SYNC_SEM_OFF = 0x50
+  BH_FABRIC_HEADER_RB_OFF = 0xD0
+  BH_FABRIC_SYNC_STATUS_OFF = 0x150
+  BH_UNRESERVED_OFF = 0x180
+
+  HOST_ISSUE_Q_RD_OFF = 0 * PCIE_ALIGNMENT
+  HOST_ISSUE_Q_WR_OFF = 1 * PCIE_ALIGNMENT
+  HOST_COMPLETION_Q_WR_OFF = 2 * PCIE_ALIGNMENT
+  HOST_COMPLETION_Q_RD_OFF = 3 * PCIE_ALIGNMENT
+  HOST_UNRESERVED_OFF = 4 * PCIE_ALIGNMENT
+
+  PREFETCH_Q_ENTRY_BYTES = 2
+  PREFETCH_Q_ENTRIES_WORKER_DEFAULT = 1534
+  PREFETCH_CMDDAT_Q_SIZE = 256 * 1024
+  PREFETCH_SCRATCH_DB_SIZE = 128 * 1024
+
+class CQPrefetchCmdId:
+  RELAY_INLINE = 5
+
+class CQDispatchCmdId:
+  WRITE_LINEAR = 1
+
+class CQPrefetchRelayInlineCmd(S):
+  _pack_ = 1
+  _fields_ = [("dispatcher_type", u8), ("pad", u16), ("length", u32), ("stride", u32)]
+
+class CQPrefetchCmdPayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [("relay_inline", CQPrefetchRelayInlineCmd), ("raw", u8 * 15)]
+
+class CQPrefetchCmd(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQPrefetchCmdPayload)]
+
+class CQDispatchWriteCmd(S):
+  _pack_ = 1
+  _fields_ = [
+    ("num_mcast_dests", u8),
+    ("write_offset_index", u8),
+    ("pad1", u8),
+    ("noc_xy_addr", u32),
+    ("addr", u64),
+    ("length", u64),
+  ]
+
+class CQDispatchCmdLargePayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [("write_linear", CQDispatchWriteCmd), ("raw", u8 * 31)]
+
+class CQDispatchCmdLarge(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdLargePayload)]

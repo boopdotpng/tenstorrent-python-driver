@@ -3,9 +3,9 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Callable
 from pathlib import Path
 from defs import *
-from codegen import CompiledKernel
+from codegen import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import align_down, generate_jal_instruction, load_pt_load
+from helpers import align_down, generate_jal_instruction
 
 # Per-core arg generator: (core_idx, core_xy, num_cores) -> list[int]
 ArgGen = Callable[[int, tuple[int, int], int], list[int]]
@@ -53,7 +53,16 @@ class CommonDevice:
     self._assert_arc_booted()
     self.harvested_dram = self.get_harvested_dram_bank()
     self.tiles = TileGrid(self.harvested_dram)
+    self.worker_cores = [core for core in TileGrid.TENSIX if self._core_exists(core)]
+    if not self.worker_cores:
+      raise RuntimeError("no active Tensix worker cores detected")
     self.upload_firmware()
+
+  def _core_exists(self, core: tuple[int, int]) -> bool:
+    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
+    cfg = TLBConfig(addr=reg_base, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+      return win.read32(reg_off) != 0xFFFF_FFFF
 
   @staticmethod
   def _tile_ready(win: TLBWindow) -> bool:
@@ -62,74 +71,76 @@ class CommonDevice:
     dm1, tr0, tr1, tr2 = sync & 0xFF, (sync >> 8) & 0xFF, (sync >> 16) & 0xFF, (sync >> 24) & 0xFF
     return go == DevMsgs.RUN_MSG_DONE and dm1 == 0 and tr1 == 0 and tr2 == 0 and tr0 in (0, 3)
 
-  @staticmethod
-  def _firmware_layout() -> dict[str, tuple[int, int]]:
-    return {
-      "brisc.elf": (TensixL1.BRISC_FIRMWARE_BASE, TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH),
-      "ncrisc.elf": (TensixL1.NCRISC_FIRMWARE_BASE, TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH),
-      "trisc0.elf": (TensixL1.TRISC0_BASE, TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH),
-      "trisc1.elf": (TensixL1.TRISC1_BASE, TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH),
-      "trisc2.elf": (TensixL1.TRISC2_BASE, TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH),
-    }
+  # Map each firmware target to its init scratch area in L1 (for local-mem data relocation)
+  _INIT_SCRATCH = {
+    "brisc":  TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
+    "ncrisc": TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH,
+    "trisc0": TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH,
+    "trisc1": TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH,
+    "trisc2": TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
+  }
 
   def upload_firmware(self):
-    fw_dir = Path(__file__).parent / "riscv-firmware" / self.arch
-    names = ("brisc.elf", "ncrisc.elf", "trisc0.elf", "trisc1.elf", "trisc2.elf")
-    paths = [fw_dir / n for n in names]
-    fws = [(p.name, load_pt_load(p)) for p in paths]
-
+    fw = compile_firmware()
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
-    fw_map = self._firmware_layout()
 
-    def stage_spans(name: str, segs) -> list[tuple[int, bytes]]:
-      base, init = fw_map[name]
-      assert any(s.paddr == base for s in segs), f"{name}: missing text base 0x{base:x}"
+    # Prepare upload spans: resolve local-mem segments to L1 scratch addresses
+    staged: dict[str, list[tuple[int, bytes]]] = {}
+    for name, cfw in fw.items():
+      init_scratch = self._INIT_SCRATCH[name]
       spans = []
-      for s in segs:
+      for s in cfw.segments:
         if not s.data and s.memsz == 0: continue
         data = s.data if s.memsz <= len(s.data) else s.data + b"\0" * (s.memsz - len(s.data))
         addr = s.paddr
         if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
-          addr = init + (addr - TensixMMIO.LOCAL_RAM_START)
-          assert 0 <= addr < TensixL1.SIZE
-        else:
-          assert 0 <= addr < TensixL1.SIZE, f"{name}: unexpected paddr 0x{addr:x}"
+          addr = init_scratch + (addr - TensixMMIO.LOCAL_RAM_START)
+        assert 0 <= addr < TensixL1.SIZE, f"{name}: bad paddr 0x{s.paddr:x} -> 0x{addr:x}"
         spans.append((addr, data))
-      return spans
+      staged[name] = spans
 
-    staged = {name: stage_spans(name, segs) for name, segs in fws}
     cfg = TLBConfig(addr=reg_base, noc=0, mcast=True, mode=TLBMode.STRICT)
-    y0, y1 = self.tiles.TENSIX_Y
+    # BRISC has no configurable reset PC — it always boots from address 0.
+    # We place a JAL instruction there to jump to the firmware entry point.
     jal_insn = generate_jal_instruction(TensixL1.BRISC_FIRMWARE_BASE)
     go_msg = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
+    skip = self._firmware_skip_cores()
+    cores = [core for core in self.worker_cores if core not in skip]
+
+    def _for_target_tiles(write_fn):
+      cfg.mcast = False
+      for core in cores:
+        cfg.start = cfg.end = core
+        write_fn()
 
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
-      for x0, x1 in TileGrid.TENSIX_MCAST:
-        cfg.start, cfg.end = (x0, y0), (x1, y1)
+      def _reset_and_stage():
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.write32(reg_off, TensixMMIO.SOFT_RESET_ALL)
 
         cfg.mode = TLBMode.RELAXED
-        for _, spans in staged.items():
+        for spans in staged.values():
           for addr, data in spans:
             win.write(addr, data, use_uc=True, restore=False)
 
         win.write(0x0, jal_insn.to_bytes(4, "little"), use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, go_msg, use_uc=True, restore=False)
 
+        # Set reset PCs for NCRISC and TRISCs (BRISC uses the JAL at addr 0)
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
-        trisc0_pc_off = TensixMMIO.RISCV_DEBUG_REG_TRISC0_RESET_PC - reg_base
-        trisc1_pc_off = TensixMMIO.RISCV_DEBUG_REG_TRISC1_RESET_PC - reg_base
-        trisc2_pc_off = TensixMMIO.RISCV_DEBUG_REG_TRISC2_RESET_PC - reg_base
-        ncrisc_pc_off = TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC - reg_base
-        win.write32(trisc0_pc_off, TensixL1.TRISC0_BASE)
-        win.write32(trisc1_pc_off, TensixL1.TRISC1_BASE)
-        win.write32(trisc2_pc_off, TensixL1.TRISC2_BASE)
-        win.write32(ncrisc_pc_off, TensixL1.NCRISC_FIRMWARE_BASE)
+        for reg, base in [
+          (TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC, fw["ncrisc"].text_base),
+          (TensixMMIO.RISCV_DEBUG_REG_TRISC0_RESET_PC, fw["trisc0"].text_base),
+          (TensixMMIO.RISCV_DEBUG_REG_TRISC1_RESET_PC, fw["trisc1"].text_base),
+          (TensixMMIO.RISCV_DEBUG_REG_TRISC2_RESET_PC, fw["trisc2"].text_base),
+        ]:
+          win.write32(reg - reg_base, base)
 
-      test_tile = TileGrid.TENSIX[0]
+      _for_target_tiles(_reset_and_stage)
+
+      test_tile = cores[0]
       cfg.start, cfg.end = test_tile, test_tile
       cfg.addr, cfg.mode = 0, TLBMode.STRICT
       cfg.mcast = False
@@ -137,23 +148,28 @@ class CommonDevice:
       cfg.mcast = True
 
       bank_tables = self._build_bank_noc_tables()
-      for x0, x1 in TileGrid.TENSIX_MCAST:
-        cfg.start, cfg.end = (x0, y0), (x1, y1)
+      def _write_bank_tables():
         cfg.addr, cfg.mode = 0, TLBMode.RELAXED
         win.configure(cfg)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
+      _for_target_tiles(_write_bank_tables)
 
-      for x0, x1 in TileGrid.TENSIX_MCAST:
-        cfg.start, cfg.end = (x0, y0), (x1, y1)
+      def _release_brisc():
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.read32(reg_off)
         win.write32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
+      _for_target_tiles(_release_brisc)
 
     self._wait_firmware_ready()
 
+  def _firmware_skip_cores(self) -> set[tuple[int, int]]:
+    return set()
+
   def _wait_firmware_ready(self):
-    tile = (1, 2) if (1, 2) in TileGrid.TENSIX else TileGrid.TENSIX[0]
+    skip = self._firmware_skip_cores()
+    candidates = [core for core in self.worker_cores if core not in skip]
+    tile = (1, 2) if (1, 2) in candidates else candidates[0]
     cfg = TLBConfig(addr=0, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
       deadline = time.perf_counter() + 2.0
@@ -211,7 +227,7 @@ class CommonDevice:
         x, y = dram_translated[(logical_bank, port)]
         dram_xy.append(pack_xy(x, y))
 
-    tensix_cols = TileGrid.TENSIX_X
+    tensix_cols = sorted({x for x, _ in self.worker_cores})
     l1_xy = []
     for _ in range(NUM_NOCS):
       for bank_id in range(NUM_L1_BANKS):

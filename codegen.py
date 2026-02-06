@@ -1,4 +1,4 @@
-from helpers import pack_xip_elf, tlog
+from helpers import pack_xip_elf, load_pt_load, PTLoad
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -6,10 +6,8 @@ import os, shutil, subprocess, tempfile, time
 
 # Local bundled dependencies (headers, libs, linker scripts, firmware sources)
 _DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
-# Compiler toolchain - check local first, then TT_HOME
+_REPO = Path(__file__).resolve().parent
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
-if not _SFPI.is_dir() and "TT_HOME" in os.environ:
-  _SFPI = Path(os.environ["TT_HOME"]) / "runtime" / "sfpi" / "compiler" / "bin"
 
 class DataFormat(Enum):
   Float32, Float16, Bfp8, Bfp4, Tf32, Float16_b, Bfp8_b, Bfp4_b = 0, 1, 2, 3, 4, 5, 6, 7
@@ -48,6 +46,13 @@ class CompiledKernels:
   writer: CompiledKernel
   compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel]
 
+@dataclass(frozen=True)
+class CompiledFirmware:
+  """A compiled firmware ELF ready for upload to a Tensix core."""
+  elf_path: Path             # path to the ELF on disk (in cache dir)
+  segments: list[PTLoad]     # PT_LOAD segments for upload
+  text_base: int             # where .text starts in L1
+
 _INCLUDE_PATHS = [
   "tt_metal/hw/inc", "tt_metal/hostdevcommon/api", "tt_metal/api",
   "tt_metal/include", "tt_metal/hw/inc/internal/tt-1xx",
@@ -63,7 +68,7 @@ _INCLUDE_PATHS = [
 ]
 
 _CFLAGS = (
-  "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions", "-MMD",
+  "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
   "-fno-use-cxa-atexit", "-Wall", "-Werror", "-Wno-unknown-pragmas",
   "-Wno-deprecated-declarations", "-Wno-error=multistatement-macros",
   "-Wno-error=parentheses", "-Wno-error=unused-but-set-variable",
@@ -71,29 +76,98 @@ _CFLAGS = (
 )
 _LFLAGS = ("-Wl,-z,max-page-size=16", "-Wl,-z,common-page-size=16", "-nostartfiles")
 
-# === Compiler ===
-
 _DEVICE_DEFINES = [
   "-DNUM_DRAM_BANKS=7", "-DIS_NOT_POW2_NUM_DRAM_BANKS=1",
   "-DNUM_L1_BANKS=110", "-DIS_NOT_POW2_NUM_L1_BANKS=1",
   "-DPCIE_NOC_X=0", "-DPCIE_NOC_Y=3",
 ]
 
+def _run(exe: Path, args: list[str], cwd: Path):
+  r = subprocess.run([str(exe), *args], cwd=cwd, capture_output=True)
+  if r.returncode != 0:
+    raise RuntimeError(f"{exe.name} failed:\n{r.stderr.decode()}")
+
+# === Firmware compiler ===
+
+# Firmware build targets: (source, target_name, defines, mcpu_flags, opt, extra_objs)
+_FW_TARGETS = [
+  ("brisc.cc", "brisc", ["-DCOMPILE_FOR_BRISC", "-DPROCESSOR_INDEX=0", "-DNOC_INDEX=1", "-DNOC_MODE=0"],
+   ["-mcpu=tt-bh", "-fno-tree-loop-distribute-patterns"], "-Os", ["noc.o"]),
+  ("ncrisc.cc", "ncrisc", ["-DCOMPILE_FOR_NCRISC", "-DPROCESSOR_INDEX=1", "-DNOC_INDEX=0", "-DNOC_MODE=0"],
+   ["-mcpu=tt-bh", "-fno-tree-loop-distribute-patterns"], "-Os", []),
+  ("trisc.cc", "trisc0", ["-DCOMPILE_FOR_TRISC=0", "-DPROCESSOR_INDEX=2", "-DUCK_CHLKC_UNPACK", "-DNAMESPACE=chlkc_unpack"],
+   ["-mcpu=tt-bh-tensix"], "-O3", []),
+  ("trisc.cc", "trisc1", ["-DCOMPILE_FOR_TRISC=1", "-DPROCESSOR_INDEX=3", "-DUCK_CHLKC_MATH", "-DNAMESPACE=chlkc_math"],
+   ["-mcpu=tt-bh-tensix"], "-O3", []),
+  ("trisc.cc", "trisc2", ["-DCOMPILE_FOR_TRISC=2", "-DPROCESSOR_INDEX=4", "-DUCK_CHLKC_PACK", "-DNAMESPACE=chlkc_pack"],
+   ["-mcpu=tt-bh-tensix"], "-O3", []),
+]
+
+_fw_cache: dict[str, CompiledFirmware] | None = None
+
+def compile_firmware() -> dict[str, CompiledFirmware]:
+  """Compile all 5 slow-dispatch firmware ELFs from source. Cached after first call."""
+  global _fw_cache
+  if _fw_cache is not None: return _fw_cache
+
+  cc = _SFPI / "riscv-tt-elf-g++"
+  assert cc.is_file(), f"missing compiler: {cc}"
+
+  inc = _DEPS / "include"
+  includes = [f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
+  common_defines = [
+    "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
+    "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0", *_DEVICE_DEFINES,
+  ]
+  lib = _DEPS / "lib" / "blackhole"
+  ld_dir = _DEPS / "toolchain" / "blackhole"
+  fw_src_dir = _REPO / "firmware"
+
+  cache_dir = Path(tempfile.mkdtemp(prefix="tt-fw-"))
+  result: dict[str, CompiledFirmware] = {}
+
+  for src_name, target, target_defs, mcpu, opt, extra in _FW_TARGETS:
+    obj = cache_dir / f"{target}.o"
+    elf = cache_dir / f"{target}.elf"
+    ld = ld_dir / f"firmware_{target}.ld"
+    assert ld.is_file(), f"missing linker script: {ld}"
+
+    # Compile
+    _run(cc, [opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
+              *common_defines, *target_defs, *includes,
+              "-c", "-o", str(obj), str(fw_src_dir / src_name)], cache_dir)
+
+    # Link: tmu-crt0.o + firmware.o + [noc.o] + substitutes.o
+    link_objs = [str(lib / "tmu-crt0.o"), str(obj)]
+    link_objs += [str(lib / o) for o in extra]
+    link_objs.append(str(lib / "substitutes.o"))
+    _run(cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
+              f"-T{ld}", *link_objs, "-o", str(elf)], cache_dir)
+
+    segs = load_pt_load(elf)
+    # Text base comes from the first PT_LOAD segment (placed by the linker script)
+    text_base = segs[0].paddr
+    result[target] = CompiledFirmware(elf_path=elf, segments=segs, text_base=text_base)
+
+  _fw_cache = result
+  return result
+
+# === Kernel compiler ===
+
 class Compiler:
   def __init__(self, ckernel: CkernelConfig = CkernelConfig()):
     self._cc = _SFPI / "riscv-tt-elf-g++"
     self._objcopy = _SFPI / "riscv-tt-elf-objcopy"
     self._nm = _SFPI / "riscv-tt-elf-nm"
-    self._fw_dir = Path(__file__).resolve().parent / "riscv-firmware" / "p100a"
     self._ckernel = ckernel
     inc = _DEPS / "include"
     self._includes = ["-I.", f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
     assert self._cc.is_file(), f"missing compiler: {self._cc}\nDownload toolchain to {_DEPS / 'sfpi-toolchain'}"
-    assert self._fw_dir.is_dir(), f"missing firmware: {self._fw_dir}"
+    # Ensure firmware is compiled (needed for --just-symbols linking)
+    self._fw = compile_firmware()
 
   def compile(self, reader: str, writer: str, compute: str) -> CompiledKernels:
-    t0 = time.perf_counter()
-    result = CompiledKernels(
+    return CompiledKernels(
       reader=self._compile_dataflow(reader, "ncrisc", noc_index=0),
       writer=self._compile_dataflow(writer, "brisc", noc_index=1),
       compute=(
@@ -102,7 +176,6 @@ class Compiler:
         self._compile_trisc(compute, 2),
       ),
     )
-    return result
 
   def _compile_dataflow(self, src: str, target: str, noc_index: int) -> CompiledKernel:
     defines = [
@@ -130,8 +203,9 @@ class Compiler:
              opt: str, trisc: bool) -> CompiledKernel:
     build = Path(tempfile.mkdtemp(prefix=f"tt-{target}-"))
     try:
-      # Setup build directory
-      fw = self._weaken_fw_symbols(build, self._fw_dir / f"{target}.elf")
+      # Get the compiled firmware ELF for this target (for --just-symbols)
+      fw_elf = self._fw[target].elf_path
+      fw = self._weaken_fw_symbols(build, fw_elf)
       (build / "kernel_includes.hpp").write_text(kern)
       self._write_ckernel_headers(build)
       if trisc: self._write_trisc_stubs(build)
@@ -140,21 +214,18 @@ class Compiler:
       mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
              ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
       fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
-      self._run(self._cc, [opt, *_CFLAGS, *mcpu, *self._includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
+      _run(self._cc, [opt, *_CFLAGS, "-MMD", *mcpu, *self._includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
 
       # Link
       ld = _DEPS / "toolchain" / "blackhole" / f"kernel_{target}.ld"
       objs = ["out.o", *extra_objs, str(_DEPS / "lib/blackhole/substitutes.o")]
-      self._run(self._cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, f"-T{ld}",
+      _run(self._cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, f"-T{ld}",
                 "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw}", *objs, "-o", "out.elf"], build)
 
       xip, text_size = pack_xip_elf(build / "out.elf")
       return CompiledKernel(xip=xip, xip_text_bytes=text_size)
     finally:
       shutil.rmtree(build, ignore_errors=True)
-
-  def _run(self, exe: Path, args: list[str], cwd: Path):
-    subprocess.run([str(exe), *args], cwd=cwd, check=True, capture_output=True)
 
   def _weaken_fw_symbols(self, build: Path, fw: Path) -> Path:
     out = build / "fw.elf"
@@ -178,7 +249,7 @@ class Compiler:
     # Apply
     (build / "localize.txt").write_text("\n".join(sorted(set(localize))))
     (build / "weaken.txt").write_text("\n".join(sorted(set(weaken))))
-    self._run(self._objcopy, [f"--localize-symbols=localize.txt", f"--weaken-symbols=weaken.txt", str(out)], build)
+    _run(self._objcopy, ["--localize-symbols=localize.txt", "--weaken-symbols=weaken.txt", str(out)], build)
     return out
 
   def _write_trisc_stubs(self, build: Path):

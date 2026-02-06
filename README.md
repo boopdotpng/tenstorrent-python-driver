@@ -15,3 +15,11 @@ Currently, I have add1 and a very naive, slow matmul working.
 - Fast dispatch is selected by default.
 - Set `TT_SLOW_DISPATCH=1` to force slow dispatch.
 - Fast DRAM read path is only enabled in fast-dispatch mode.
+
+### fast-dispatch firmware
+Fast dispatch requires three extra firmware ELFs in `riscv-firmware/p100a/`:
+- `cq_prefetch_brisc.elf`
+- `cq_dispatch_brisc.elf`
+- `cq_dispatch_subordinate_ncrisc.elf`
+
+If they are missing, blackhole-py prints a warning and falls back to slow dispatch.
