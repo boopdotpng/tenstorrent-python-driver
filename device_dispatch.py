@@ -330,7 +330,7 @@ class SlowDevice(CommonDevice):
       for addr, data in writes:
         win.write(addr, data, use_uc=True, restore=False)
 
-  def run(self, program: Program) -> tuple[float, float]:
+  def run(self, program: Program, *, _log_timing: bool = True) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else self.dispatchable_cores
     num_cores = len(cores)
 
@@ -403,11 +403,11 @@ class SlowDevice(CommonDevice):
 
     t_end = time.perf_counter()
     dispatch = t_compute_start - t_dispatch_start
-    tlog("dispatch", dispatch)
     compute = t_end - t_compute_start
-    tlog("compute", compute)
-    total = dispatch + compute
-    return total, dispatch
+    if _log_timing:
+      tlog("dispatch", dispatch)
+      tlog("compute", compute)
+    return dispatch + compute, dispatch
 
 class FastDevice(SlowDevice):
   def _core_exists(self, core: tuple[int, int]) -> bool:
@@ -587,7 +587,7 @@ class FastDevice(SlowDevice):
       go = GoMsg(); go.bits.signal = DevMsgs.RUN_MSG_GO
       win.write(TensixL1.GO_MSG, as_bytes(go), use_uc=True, restore=False)
 
-  def run(self, program: Program) -> tuple[float, float]:
+  def run(self, program: Program, *, _log_timing: bool = True) -> tuple[float, float]:
     if program.cores is not None:
       cores = program.cores
     else:
@@ -607,19 +607,16 @@ class FastDevice(SlowDevice):
     rta_sizes = (len(first_w) * 4, len(first_r) * 4, len(first_c) * 4)
     shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes)
 
+    # Reset GO_MSG via MMIO (must be synchronous to prevent poll race with stale RUN_MSG_DONE)
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     win = self.win
-    # In fast-dispatch mode we reserve two worker cores for CQ (prefetch/dispatch).
-    # A rectangular multicast over the worker grid can include those reserved cores,
-    # clobbering CQ kernel state. Use explicit unicast writes per target worker.
     for x, y in cores:
       l1_cfg.start = l1_cfg.end = (x, y)
       win.configure(l1_cfg)
       win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
       win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
-      win.write(TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img, use_uc=True, restore=False)
-      win.write(TensixL1.LAUNCH, launch_blob, use_uc=True, restore=False)
 
+    # Setup via CQ (avoids slow MMIO unicast for kernel config + binaries)
     shared_rta = None
     if (
       isinstance(program.reader_rt_args, list)
@@ -636,28 +633,29 @@ class FastDevice(SlowDevice):
         rta = self._pack_rta(reader_args, writer_args, compute_args)
       else:
         rta = shared_rta
-      l1_cfg.start = l1_cfg.end = (x, y)
-      win.configure(l1_cfg)
-      win.write(TensixL1.KERNEL_CONFIG_BASE, rta, use_uc=True, restore=False)
+      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.KERNEL_CONFIG_BASE, data=rta)
+      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.KERNEL_CONFIG_BASE + shared_off, data=shared_img)
+      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.LAUNCH, data=launch_blob)
 
+    # Dispatch GO via CQ
     t_dispatch_start = time.perf_counter()
-    for core in cores:
-      self._cq.enqueue_write_linear(tile=core, addr=TensixL1.GO_MSG, data=go_blob)
+    for x, y in cores:
+      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.GO_MSG, data=go_blob)
     t_compute_start = time.perf_counter()
 
-    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+    # Poll for completion
     for x, y in cores:
       l1_cfg.start = l1_cfg.end = (x, y)
-      self.win.configure(l1_cfg)
+      win.configure(l1_cfg)
       deadline = time.perf_counter() + 10.0
-      while self.win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
+      while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
         if time.perf_counter() > deadline:
           raise TimeoutError(f"timeout waiting for core ({x}, {y})")
 
     t_end = time.perf_counter()
     dispatch = t_compute_start - t_dispatch_start
-    tlog("dispatch", dispatch)
     compute = t_end - t_compute_start
-    tlog("compute", compute)
-    total = dispatch + compute
-    return total, dispatch
+    if _log_timing:
+      tlog("dispatch", dispatch)
+      tlog("compute", compute)
+    return dispatch + compute, dispatch

@@ -225,7 +225,7 @@ class DramAllocator:
       cbs=[0], tile_size=buf.page_size, num_pages=2, cores=cores,
     )
     t0 = time.perf_counter()
-    self._run_fn(program)
+    self._run_fn(program, _log_timing=False)
     result = bytes(sm.buf[:buf.size])
     tlog("dram_read_fast", time.perf_counter() - t0, buf.size)
     if buf.dtype is not None:
