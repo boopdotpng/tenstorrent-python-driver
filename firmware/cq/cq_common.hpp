@@ -188,7 +188,6 @@ FORCE_INLINE void cq_noc_async_wwrite_init_state(
 template <enum CQNocInlineFlags flags, enum CQNocWait wait = CQ_NOC_WAIT, enum CQNocSend send = CQ_NOC_SEND>
 FORCE_INLINE void cq_noc_inline_dw_write_with_state(
     uint64_t dst_addr, uint32_t val = 0, uint8_t be = 0xF, uint8_t noc = noc_index) {
-#if defined(ARCH_BLACKHOLE)
     noc_async_writes_flushed();  // ensure inline_l1_src_addr is not overwritten
     uint32_t inline_l1_src_addr = noc_get_interim_inline_value_addr(noc, dst_addr);
     volatile tt_l1_ptr uint32_t* inline_l1_src_addr_ptr =
@@ -196,51 +195,19 @@ FORCE_INLINE void cq_noc_inline_dw_write_with_state(
     *inline_l1_src_addr_ptr = val;
     cq_noc_async_write_with_state<CQ_NOC_SnDL, CQ_NOC_WAIT, CQ_NOC_SEND, NCRISC_WR_REG_CMD_BUF>(
         inline_l1_src_addr, dst_addr, 4);
-#else
-    if constexpr (wait) {
-        WAYPOINT("NISW");
-        while (!noc_cmd_buf_ready(noc, NCRISC_WR_REG_CMD_BUF));
-        WAYPOINT("NISD");
-    }
-
-    noc_inline_dw_write_with_state<NCRISC_WR_REG_CMD_BUF, flags, CQ_NOC_wait, CQ_NOC_send>(noc, dst_addr, val, be);
-
-    if constexpr (send) {
-        DEBUG_SANITIZE_NOC_ADDR_FROM_STATE(noc, NCRISC_WR_REG_CMD_BUF);
-        noc_inline_dw_write_with_state<NCRISC_WR_REG_CMD_BUF, CQ_NOC_INLINE_ndvb, CQ_NOC_wait, send>(
-            noc, dst_addr, val, be);
-    }
-#endif
 }
 
 // TODO: noc_inline_dw_write currently hardcodes most of these parameters, which we copied here
 // If needed, add templates for setting these
+// Inline writes are disabled on Blackhole, so use cq_noc_async_write_init_state with inline write cmd buf
+// See comment in `noc_inline_dw_write` for more details
 template <enum CQNocInlineFlags flags>
 FORCE_INLINE void cq_noc_inline_dw_write_init_state(
-    uint64_t dst_addr, uint32_t val = 0, uint8_t be = 0xF, uint8_t noc = noc_index) {
-#if defined(ARCH_BLACKHOLE)
-    // On Blackhole inline writes are disabled so use cq_noc_async_write_init_state with inline write cmd buf
-    // See comment in `noc_inline_dw_write` for more details
+    uint64_t dst_addr, [[maybe_unused]] uint32_t val = 0, [[maybe_unused]] uint8_t be = 0xF, uint8_t noc = noc_index) {
     uint32_t inline_l1_src_addr = noc_get_interim_inline_value_addr(noc, dst_addr);
     volatile tt_l1_ptr uint32_t* inline_l1_src_addr_ptr =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(inline_l1_src_addr);
     cq_noc_async_write_init_state<CQ_NOC_sNdl, false, false, NCRISC_WR_REG_CMD_BUF>(0, dst_addr, 0);
-#else
-    WAYPOINT("NIIW");
-    uint32_t heartbeat = 0;
-    while (!noc_cmd_buf_ready(noc, NCRISC_WR_REG_CMD_BUF)) {
-        IDLE_ERISC_HEARTBEAT_AND_RETURN(heartbeat);
-    }
-    WAYPOINT("NIID");
-
-    constexpr uint32_t static_vc = NOC_UNICAST_WRITE_VC;
-    constexpr enum CQNocCmdFlags cmd_flags = CQ_NOC_mkp;
-    DEBUG_SANITIZE_NO_LINKED_TRANSACTION(
-        noc, (cmd_flags & CQ_NOC_CMD_FLAG_MCAST) ? DEBUG_SANITIZE_NOC_MULTICAST : DEBUG_SANITIZE_NOC_UNICAST);
-
-    noc_inline_dw_write_init_state<NCRISC_WR_REG_CMD_BUF, cmd_flags>(noc, static_vc);
-    cq_noc_inline_dw_write_with_state<flags, CQ_NOC_wait, CQ_NOC_send>(dst_addr, val, be);
-#endif
 }
 
 template <uint32_t sem_id>

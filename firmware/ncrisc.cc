@@ -15,7 +15,6 @@
 #include "internal/risc_attribs.h"
 #include "internal/circular_buffer_interface.h"
 #include "internal/circular_buffer_init.h"
-#include "tdma_xmov.h"
 
 #include "api/debug/waypoint.h"
 #include "api/debug/dprint.h"
@@ -64,41 +63,17 @@ uint32_t sumIDs[SUM_COUNT] __attribute__((used));
 }  // namespace kernel_profiler
 #endif
 
-#ifdef ARCH_WORMHOLE
-extern "C" uint32_t wh_iram_trampoline(uint32_t status, uint32_t first_argument);
-#endif
-
 inline __attribute__((always_inline)) void wait_for_brisc_notification() {
     while (true) {
         uint8_t run_value = *ncrisc_run;
         if (run_value == RUN_SYNC_MSG_GO || run_value == RUN_SYNC_MSG_LOAD) {
             break;
         }
-#if defined(ARCH_WORMHOLE)
-        // Avoid hammering L1 while other cores are trying to work. Seems not to
-        // be needed on Blackhole, probably because invalidate_l1_cache takes
-        // time.
-        asm volatile("nop; nop; nop; nop; nop");
-#endif
         invalidate_l1_cache();
     }
 }
 
 inline __attribute__((always_inline)) void signal_ncrisc_completion() { *ncrisc_run = RUN_SYNC_MSG_DONE; }
-
-#if defined(ARCH_WORMHOLE)
-#define MEM_MOVER_VIEW_IRAM_BASE_ADDR (0x4 << 12)
-void l1_to_ncrisc_iram_copy(uint32_t src_addr, uint16_t size, uint32_t address_offset = 0) {
-    // Always copy ncrisc even if its size is 0 (save branch)...
-    // Copy NCRISC firmware from L1 to local IRAM using tensix DMA
-    tdma_xmov(TDMA_MOVER0, src_addr, MEM_MOVER_VIEW_IRAM_BASE_ADDR + address_offset, size, XMOV_L1_TO_L0);
-}
-
-void l1_to_ncrisc_iram_copy_wait() {
-    // Wait for DMA to finish
-    wait_tdma_movers_done(RISCV_TDMA_STATUS_FLAG_MOVER0_BUSY_MASK);
-}
-#endif
 
 int main(int argc, char* argv[]) {
     configure_csr();
@@ -129,18 +104,10 @@ int main(int argc, char* argv[]) {
         int index = static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1);
 
         uint32_t kernel_lma = kernel_config_base + launch_msg->kernel_config.kernel_text_offset[index];
-#if defined(ARCH_WORMHOLE)
-        static_assert(MEM_NCRISC_KERNEL_BASE == MEM_NCRISC_IRAM_BASE, "NCRISC kernel vma mismatch");
-        l1_to_ncrisc_iram_copy(kernel_lma >> 4, launch_msg->kernel_config.ncrisc_kernel_size16, 0);
-#endif
         uint32_t tt_l1_ptr* cb_l1_base =
             (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.local_cb_offset);
         uint32_t local_cb_mask = launch_msg->kernel_config.local_cb_mask;
         setup_local_cb_read_write_interfaces<true, true, false>(cb_l1_base, 0, local_cb_mask);
-
-#if defined(ARCH_WORMHOLE)
-        l1_to_ncrisc_iram_copy_wait();
-#endif
 
         cb_l1_base = (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.remote_cb_offset);
         uint32_t end_cb_index = launch_msg->kernel_config.min_remote_cb_start_index;
@@ -151,39 +118,14 @@ int main(int argc, char* argv[]) {
 
         WAYPOINT("R");
 
-#if defined(ARCH_WORMHOLE)
-        // Jumping to IRAM causes bizarre behavior, so signal the
-        // brisc to reset the ncrisc to the IRAM address
-        uint32_t kernel_vma = MEM_NCRISC_KERNEL_BASE;
-        mailboxes->ncrisc_halt.resume_addr = kernel_vma;
-        auto stack_free = wh_iram_trampoline(RUN_SYNC_MSG_WAITING_FOR_RESET, kernel_lma - kernel_vma);
-#else
         while (*ncrisc_run != RUN_SYNC_MSG_GO) {
             invalidate_l1_cache();
         }
         auto stack_free = reinterpret_cast<uint32_t (*)()>(kernel_lma)();
-#endif
         record_stack_usage(stack_free);
         WAYPOINT("D");
 
         signal_ncrisc_completion();
-#if defined(ARCH_WORMHOLE)
-        // Ensure branch predictor will only ever predict into L1. Otherwise, the branch predictor may predict an IRAM
-        // address, which can cause an instruction to be fetched from IRAM while the mover is writing to IRAM, which can
-        // cause corruption.  See
-        // https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/InstructionRAM.md
-        // for more details.
-        // This loop unrolls to 54 instructions, taking 110 cycles (assuming all branches are mispredicted).
-        asm volatile(
-            ".rept 13\n"
-            "bne x0, x0, .\n"
-            "bne x0, x0, .\n"
-            "nop\n"
-            "nop\n"
-            ".endr\n"
-            "bne x0, x0, .\n"
-            "bne x0, x0, .");
-#endif
     }
 
     return 0;

@@ -84,8 +84,6 @@ uint8_t prev_noc_mode = DM_DEDICATED_NOC;
 uint8_t worker_logical_col_to_virtual_col[round_up_to_mult_of_4(noc_size_x)] __attribute__((used));
 uint8_t worker_logical_row_to_virtual_row[round_up_to_mult_of_4(noc_size_y)] __attribute__((used));
 
-#define MEM_MOVER_VIEW_IRAM_BASE_ADDR (0x4 << 12)
-
 #if defined(PROFILE_KERNEL)
 namespace kernel_profiler {
 uint32_t wIndex __attribute__((used));
@@ -101,12 +99,7 @@ void enable_power_management() {
     uint32_t pm_mask = 0xFFFF;
     uint32_t pm_hyst = 32;
 
-#ifdef ARCH_BLACKHOLE
     uint32_t hyst_val = pm_hyst;
-#else
-    // Important: program hyteresis first then enable, otherwise the en_pulse will fail to latch the value
-    uint32_t hyst_val = pm_hyst & 0x7f;
-#endif
 
     {
         // Program slightly off values for each CG
@@ -123,14 +116,9 @@ void enable_power_management() {
         WRITE_REG(RISCV_DEBUG_REG_CG_CTRL_HYST2, hyst2_reg_data);
     }
 
-#ifdef ARCH_BLACKHOLE
     /*FIXME: need to deal with srcb ctrl bit not fitting in 16 bits. For  */
     /*now just always turn it on */
     *((volatile uint32_t*)RISCV_DEBUG_REG_CG_CTRL_EN) = 0x10000 | (pm_mask);
-#else
-    // core.ex_setc16(CG_CTRL_EN_Hyst_ADDR32, command_data[1] >> 16, instrn_buf[0]);
-    core.ex_setc16(CG_CTRL_EN_Regblocks_ADDR32, pm_mask, instrn_buf[0]);
-#endif
 
     if (((pm_mask & 0x0100) >> 8) == 1) {  // enable noc clk gatting
 
@@ -169,23 +157,12 @@ void enable_power_management() {
 }
 
 void set_deassert_addresses() {
-    volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
-
-#ifdef ARCH_BLACKHOLE
     WRITE_REG(RISCV_DEBUG_REG_NCRISC_RESET_PC, MEM_NCRISC_FIRMWARE_BASE);
     WRITE_REG(RISCV_DEBUG_REG_TRISC0_RESET_PC, MEM_TRISC0_FIRMWARE_BASE);
     WRITE_REG(RISCV_DEBUG_REG_TRISC1_RESET_PC, MEM_TRISC1_FIRMWARE_BASE);
     WRITE_REG(RISCV_DEBUG_REG_TRISC2_RESET_PC, MEM_TRISC2_FIRMWARE_BASE);
     WRITE_REG(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE, 0b111);
     WRITE_REG(RISCV_DEBUG_REG_NCRISC_RESET_PC_OVERRIDE, 0x1);
-#else
-    cfg_regs[NCRISC_RESET_PC_PC_ADDR32] = MEM_NCRISC_FIRMWARE_BASE;
-    cfg_regs[TRISC_RESET_PC_SEC0_PC_ADDR32] = MEM_TRISC0_FIRMWARE_BASE;
-    cfg_regs[TRISC_RESET_PC_SEC1_PC_ADDR32] = MEM_TRISC1_FIRMWARE_BASE;
-    cfg_regs[TRISC_RESET_PC_SEC2_PC_ADDR32] = MEM_TRISC2_FIRMWARE_BASE;
-    cfg_regs[TRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en_ADDR32] = 0b111;
-    cfg_regs[NCRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en_ADDR32] = 0x1;
-#endif
 }
 
 void device_setup() {
@@ -202,10 +179,8 @@ void device_setup() {
     // FIXME MT: enable later
     // enable_power_management();
 
-#ifdef ARCH_BLACKHOLE
     // Disable DEST CG
     *((volatile uint32_t*)RISCV_DEBUG_REG_DEST_CG_CTRL) = 0;
-#endif
 
     WRITE_REG(RISCV_TDMA_REG_CLK_GATE_EN, 0x3f);  // Enable clock gating
 
@@ -278,44 +253,17 @@ inline void run_triscs(uint32_t enables) {
 }
 
 inline void start_ncrisc_kernel_run_early(uint32_t enables) {
-    // On Wormhole, start_ncrisc_kernel_run will reset NCRISC to start the
-    // kernel running. We delay it until later to give the NCRISC time to load
-    // CBs before we wait on it.
-#if !defined(ARCH_WORMHOLE)
     if (enables & (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
         subordinate_sync->dm1 = RUN_SYNC_MSG_GO;
     }
-#endif
 }
 
-inline void start_ncrisc_kernel_run(uint32_t enables) {
-#if defined(ARCH_WORMHOLE)
-    if (enables & (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
-        // The NCRISC behaves badly if it jumps from L1 to IRAM, so instead halt it and then reset it to the IRAM
-        // address it provides.
-        while (subordinate_sync->dm1 != RUN_SYNC_MSG_WAITING_FOR_RESET);
-        subordinate_sync->dm1 = RUN_SYNC_MSG_GO;
-        volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
-        cfg_regs[NCRISC_RESET_PC_PC_ADDR32] = mailboxes->ncrisc_halt.resume_addr;
-        assert_just_ncrisc_reset();
-        // Wait a bit to ensure NCRISC has time to actually reset (otherwise it
-        // may just continue where it left off). This wait value was chosen
-        // empirically.
-        riscv_wait(5);
-        deassert_all_reset();
-    }
-#endif
+inline void start_ncrisc_kernel_run([[maybe_unused]] uint32_t enables) {
 }
 
 inline void wait_ncrisc_trisc() {
     WAYPOINT("NTW");
     while (subordinate_sync->all != RUN_SYNC_MSG_ALL_SUBORDINATES_DONE) {
-#if defined(ARCH_WORMHOLE)
-        // Avoid hammering L1 while other cores are trying to work. Seems not to
-        // be needed on Blackhole, probably because invalidate_l1_cache takes
-        // time.
-        asm volatile("nop; nop; nop; nop; nop");
-#endif
         invalidate_l1_cache();
     }
     WAYPOINT("NTD");
@@ -324,12 +272,10 @@ inline void wait_ncrisc_trisc() {
 inline void trigger_sync_register_init() { subordinate_sync->trisc0 = RUN_SYNC_MSG_INIT_SYNC_REGISTERS; }
 
 inline void barrier_remote_cb_interface_setup(uint8_t noc_index, uint32_t end_cb_index) {
-#if defined(ARCH_BLACKHOLE)
     // cq_dispatch does not update noc transaction counts so skip this barrier on the dispatch core
     if (end_cb_index != NUM_CIRCULAR_BUFFERS) {
         noc_async_atomic_barrier(noc_index);
     }
-#endif
 }
 
 int main() {
@@ -416,12 +362,11 @@ int main() {
             DeviceValidateProfiler(launch_msg_address->kernel_config.enables);
             DeviceZoneSetCounter(launch_msg_address->kernel_config.host_assigned_id);
             uint32_t enables = launch_msg_address->kernel_config.enables;
-            // Trigger the NCRISC to start loading CBs and IRAM as soon as possible.
+            // Trigger the NCRISC to start loading CBs as soon as possible.
             if (enables &
                 (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
                 subordinate_sync->dm1 = RUN_SYNC_MSG_LOAD;
             }
-            // Copies from L1 to IRAM on chips where NCRISC has IRAM
             uint32_t kernel_config_base =
                 firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, PROCESSOR_INDEX);
             // Invalidate the i$ now the kernels have loaded and before running
@@ -442,10 +387,8 @@ int main() {
                 if (prev_noc_mode != noc_mode) {
                     noc_init(MEM_NOC_ATOMIC_RET_VAL_ADDR);
                 }
-#ifdef ARCH_BLACKHOLE
                 // Need to add this to allow adding barrier after setup_remote_cb_interfaces
                 noc_local_state_init(noc_index);
-#endif
                 cmd_buf = BRISC_AT_CMD_BUF;
             } else {
                 if (prev_noc_mode != noc_mode) {
