@@ -22,6 +22,8 @@ class Program:
   tile_size: int
   num_pages: int
   cores: list[tuple[int, int]] | None = None
+  num_sems: int = 0
+  cb_config: dict[int, tuple[int, int]] | None = None  # {cb_id: (num_pages, page_size)}
 
 @dataclass
 class TileGrid:

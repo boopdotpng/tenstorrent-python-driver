@@ -315,15 +315,32 @@ class SlowDevice(CommonDevice):
     end = mask.bit_length()
     arr = (LocalCBConfig * end)()
     addr = TensixL1.DATA_BUFFER_SPACE_BASE
-    for cb in program.cbs:
-      size = program.tile_size * program.num_pages
-      arr[cb] = LocalCBConfig(
-        addr_bytes=addr,
-        size_bytes=size,
-        num_pages=program.num_pages,
-        page_size_bytes=program.tile_size,
-      )
-      addr += size
+    shared_addr: dict[int, int] = {}  # cb_id -> addr for shared CBs
+    if program.cb_config:
+      for cb in program.cbs:
+        num_pages, page_size = program.cb_config[cb]
+        # Check if another CB already allocated at same (num_pages, page_size) with share intent
+        # CB_16 and CB_24 share address when both present
+        share_with = {16: 24, 24: 16}.get(cb)
+        if share_with is not None and share_with in shared_addr:
+          cb_addr = shared_addr[share_with]
+        else:
+          cb_addr = addr
+          size = page_size * num_pages
+          addr += size
+        shared_addr[cb] = cb_addr
+        arr[cb] = LocalCBConfig(
+          addr_bytes=cb_addr, size_bytes=page_size * num_pages,
+          num_pages=num_pages, page_size_bytes=page_size,
+        )
+    else:
+      for cb in program.cbs:
+        size = program.tile_size * program.num_pages
+        arr[cb] = LocalCBConfig(
+          addr_bytes=addr, size_bytes=size,
+          num_pages=program.num_pages, page_size_bytes=program.tile_size,
+        )
+        addr += size
     return mask, as_bytes(arr)
 
   def _pack_kernel_shared(self, program: Program, rta_sizes: tuple[int, int, int]):
@@ -331,10 +348,15 @@ class SlowDevice(CommonDevice):
 
     rta_offsets = [0, rta_sizes[0], rta_sizes[0] + rta_sizes[1]]
     rta_total = align16(rta_offsets[2] + rta_sizes[2])
-    crta_off = rta_total
+
+    # Semaphore space: num_sems * 16 bytes between per-core args and shared data
+    sem_size = program.num_sems * 16
+    sem_off = rta_total
+    shared_off_start = align16(rta_total + sem_size)
+    crta_off = shared_off_start
 
     local_cb_mask, local_cb_blob = self._build_local_cb_blob(program)
-    local_cb_off = rta_total
+    local_cb_off = shared_off_start
     kernel_off = align16(local_cb_off + len(local_cb_blob))
 
     kernels = {"brisc": program.writer, "ncrisc": program.reader}
@@ -363,6 +385,8 @@ class SlowDevice(CommonDevice):
     cfg.kernel_config_base[0] = TensixL1.KERNEL_CONFIG_BASE
     cfg.kernel_config_base[1] = TensixL1.KERNEL_CONFIG_BASE
     cfg.kernel_config_base[2] = TensixL1.KERNEL_CONFIG_BASE
+    for i in range(3):
+      cfg.sem_offset[i] = sem_off
     cfg.local_cb_offset = local_cb_off
     cfg.remote_cb_offset = local_cb_off + len(local_cb_blob)
     cfg.local_cb_mask = local_cb_mask
@@ -383,9 +407,13 @@ class SlowDevice(CommonDevice):
     return local_cb_off, bytes(shared), as_bytes(launch), rta_offsets
 
   @staticmethod
-  def _pack_rta(reader_args: list[int], writer_args: list[int], compute_args: list[int]) -> bytes:
+  def _pack_rta(reader_args: list[int], writer_args: list[int], compute_args: list[int],
+                num_sems: int = 0) -> bytes:
     pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
-    return pack(writer_args) + pack(reader_args) + pack(compute_args)
+    rta = pack(writer_args) + pack(reader_args) + pack(compute_args)
+    if num_sems > 0:
+      rta += b"\0" * (num_sems * 16)
+    return rta
 
   def _resolve_args(self, args: list[int] | ArgGen, core_idx: int, core_xy: tuple[int, int], num_cores: int) -> list[int]:
     return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
@@ -450,13 +478,14 @@ class SlowDevice(CommonDevice):
       ],
     )
 
+    ns = program.num_sems
     shared_rta = None
     if (
       isinstance(program.reader_rt_args, list)
       and isinstance(program.writer_rt_args, list)
       and isinstance(program.compute_rt_args, list)
     ):
-      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args)
+      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args, ns)
 
     # Unicast per-core runtime args
     for core_idx, (x, y) in enumerate(cores):
@@ -464,7 +493,7 @@ class SlowDevice(CommonDevice):
         reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
         writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
         compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
-        rta = self._pack_rta(reader_args, writer_args, compute_args)
+        rta = self._pack_rta(reader_args, writer_args, compute_args, ns)
       else:
         rta = shared_rta
       l1_cfg.start = l1_cfg.end = (x, y)
@@ -717,13 +746,14 @@ class FastDevice(SlowDevice):
       win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
 
     # Build per-core RTA payloads
+    ns = program.num_sems
     shared_rta = None
     if (
       isinstance(program.reader_rt_args, list)
       and isinstance(program.writer_rt_args, list)
       and isinstance(program.compute_rt_args, list)
     ):
-      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args)
+      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args, ns)
 
     if shared_rta is not None:
       rta_payloads = shared_rta  # uniform: single bytes, NO_STRIDE
@@ -733,6 +763,7 @@ class FastDevice(SlowDevice):
           self._resolve_args(program.reader_rt_args, i, cores[i], num_cores),
           self._resolve_args(program.writer_rt_args, i, cores[i], num_cores),
           self._resolve_args(program.compute_rt_args, i, cores[i], num_cores),
+          ns,
         ) for i in range(num_cores)
       ]
 
