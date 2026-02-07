@@ -70,11 +70,13 @@ _INCLUDE_PATHS = [
 _CFLAGS = (
   "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
   "-fno-use-cxa-atexit",
+  "-fno-jump-tables",  # default for non-CQ XIP kernels
   "-Wall", "-Werror", "-Wno-unknown-pragmas",
   "-Wno-deprecated-declarations", "-Wno-error=multistatement-macros",
   "-Wno-error=parentheses", "-Wno-error=unused-but-set-variable",
   "-Wno-unused-variable", "-Wno-unused-function",
 )
+_CQ_CFLAGS = tuple(f for f in _CFLAGS if f != "-fno-jump-tables")
 _LFLAGS = ("-Wl,-z,max-page-size=16", "-Wl,-z,common-page-size=16", "-nostartfiles")
 
 _DEVICE_DEFINES = [
@@ -180,7 +182,9 @@ class Compiler:
 
   def _compile_dataflow(self, src: str, target: str, noc_index: int,
                         extra_defines: list[str] | None = None,
-                        extra_includes: list[str] | None = None) -> CompiledKernel:
+                        extra_includes: list[str] | None = None,
+                        cflags: tuple[str, ...] = _CFLAGS,
+                        xip_relocate: bool = False) -> CompiledKernel:
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
       "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
@@ -190,8 +194,10 @@ class Compiler:
       *(extra_defines or []),
     ]
     extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
-    return self._build(src, target, defines, extra_objs, opt="-O2", trisc=False,
-                       extra_includes=extra_includes)
+    return self._build(
+      src, target, defines, extra_objs, opt="-O2", trisc=False,
+      extra_includes=extra_includes, cflags=cflags, xip_relocate=xip_relocate
+    )
 
   def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
     stage = ("unpack", "math", "pack")[trisc_id]
@@ -205,7 +211,8 @@ class Compiler:
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
   def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str],
-             opt: str, trisc: bool, extra_includes: list[str] | None = None) -> CompiledKernel:
+             opt: str, trisc: bool, extra_includes: list[str] | None = None,
+             cflags: tuple[str, ...] = _CFLAGS, xip_relocate: bool = False) -> CompiledKernel:
     build = Path(tempfile.mkdtemp(prefix=f"tt-{target}-"))
     try:
       # Get the compiled firmware ELF for this target (for --just-symbols)
@@ -220,15 +227,15 @@ class Compiler:
              ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
       fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
       includes = [*self._includes, *(f"-I{p}" for p in (extra_includes or []))]
-      _run(self._cc, [opt, *_CFLAGS, "-MMD", *mcpu, *includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
+      _run(self._cc, [opt, *cflags, "-MMD", *mcpu, *includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
 
       # Link
       ld = _DEPS / "toolchain" / "blackhole" / f"kernel_{target}.ld"
       objs = ["out.o", *extra_objs, str(_DEPS / "lib/blackhole/substitutes.o")]
-      _run(self._cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, f"-T{ld}",
+      _run(self._cc, [opt, *cflags, *_LFLAGS, *mcpu, f"-T{ld}",
                 "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw}", *objs, "-o", "out.elf"], build)
 
-      xip, text_size = pack_xip_elf(build / "out.elf")
+      xip, text_size = pack_xip_elf(build / "out.elf", xip_relocate=xip_relocate)
       return CompiledKernel(xip=xip, xip_text_bytes=text_size)
     finally:
       shutil.rmtree(build, ignore_errors=True)
@@ -493,11 +500,14 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
 
   return CompiledCQKernels(
     prefetch_brisc=compiler._compile_dataflow(prefetch_src, "brisc", noc_index=0,
-      extra_defines=_to_defs(prefetch_defs), extra_includes=cq_inc),
+      extra_defines=_to_defs(prefetch_defs), extra_includes=cq_inc,
+      cflags=_CQ_CFLAGS, xip_relocate=True),
     dispatch_brisc=compiler._compile_dataflow(dispatch_src, "brisc", noc_index=1,
-      extra_defines=_to_defs(dispatch_defs), extra_includes=cq_inc),
+      extra_defines=_to_defs(dispatch_defs), extra_includes=cq_inc,
+      cflags=_CQ_CFLAGS, xip_relocate=True),
     dispatch_s_ncrisc=compiler._compile_dataflow(dispatch_s_src, "ncrisc", noc_index=1,
-      extra_defines=_to_defs(dispatch_s_defs), extra_includes=cq_inc),
+      extra_defines=_to_defs(dispatch_s_defs), extra_includes=cq_inc,
+      cflags=_CQ_CFLAGS, xip_relocate=True),
   )
 
 DRAIN_KERNEL_SRC = r"""

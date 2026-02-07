@@ -180,9 +180,11 @@ def generate_jal_instruction(target_addr: int) -> int:
   imm_19_12 = target_addr & 0xFF000
   return imm_19_12 | imm_11 | imm_10_1 | opcode
 
-def pack_xip_elf(path: str | os.PathLike[str]) -> tuple[bytes, int]:
+def pack_xip_elf(path: str | os.PathLike[str], xip_relocate: bool = False) -> tuple[bytes, int]:
   with open(os.fspath(path), "rb") as f:
-    elf = _xipify_riscv32_elf(f.read())
+    elf = f.read()
+    if xip_relocate:
+      elf = _xipify_riscv32_elf(elf)
   segs = list(iter_pt_load(elf))
   if not segs: raise ValueError("no PT_LOAD segments")
   l1 = [s for s in segs if (s.memsz or s.data) and (0 <= s.paddr < TensixL1.SIZE)]
