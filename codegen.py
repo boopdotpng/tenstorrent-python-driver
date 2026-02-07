@@ -70,7 +70,6 @@ _INCLUDE_PATHS = [
 _CFLAGS = (
   "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
   "-fno-use-cxa-atexit",
-  "-fno-jump-tables",  # XIP kernels: jump tables land in .rodata at wrong addresses
   "-Wall", "-Werror", "-Wno-unknown-pragmas",
   "-Wno-deprecated-declarations", "-Wno-error=multistatement-macros",
   "-Wno-error=parentheses", "-Wno-error=unused-but-set-variable",
