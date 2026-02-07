@@ -119,7 +119,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
   includes = [f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
   common_defines = [
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
-    "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0", *_DEVICE_DEFINES,
+    "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
   ]
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
@@ -184,7 +184,7 @@ class Compiler:
                         extra_includes: list[str] | None = None) -> CompiledKernel:
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
-      "-DDISPATCH_MESSAGE_ADDR=0", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
+      "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
       f"-DCOMPILE_FOR_{target.upper()}",
       f"-DPROCESSOR_INDEX={0 if target == 'brisc' else 1}",
       f"-DNOC_INDEX={noc_index}", "-DNOC_MODE=0",
@@ -198,7 +198,7 @@ class Compiler:
     stage = ("unpack", "math", "pack")[trisc_id]
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
-      "-DDISPATCH_MESSAGE_ADDR=0", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
+      "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
       f"-DCOMPILE_FOR_TRISC={trisc_id}",
       f"-DPROCESSOR_INDEX={trisc_id + 2}",
       f"-DUCK_CHLKC_{stage.upper()}", f"-DNAMESPACE=chlkc_{stage}",
@@ -335,6 +335,8 @@ class CQConfig:
   completion_q_wr_ptr_addr: int = 0
   completion_q_rd_ptr_addr: int = 0
   dispatch_s_sync_sem_addr: int = 0
+  # PCIe host base address (NOC local offset of hugepage)
+  command_queue_base: int = 0
   # Worker grid for go-signal multicast
   worker_grid_start: tuple[int, int] = (0, 0)
   worker_grid_end: tuple[int, int] = (0, 0)
@@ -436,7 +438,7 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
     "MY_DISPATCH_CB_SEM_ID": 0, "UPSTREAM_DISPATCH_CB_SEM_ID": 0,
     "UPSTREAM_SYNC_SEM": 2,
     # Completion queue
-    "COMMAND_QUEUE_BASE_ADDR": 0,
+    "COMMAND_QUEUE_BASE_ADDR": cfg.command_queue_base,
     "COMPLETION_QUEUE_BASE_ADDR": cfg.completion_base,
     "COMPLETION_QUEUE_SIZE": cfg.completion_size,
     "HOST_COMPLETION_Q_WR_PTR": 2 * 64,  # HOST_COMPLETION_Q_WR_OFF
@@ -452,7 +454,7 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
     # Worker dispatch
     "PACKED_WRITE_MAX_UNICAST_SUB_CMDS": cfg.num_worker_cores,
     "DISPATCH_S_SYNC_SEM_BASE_ADDR": cfg.dispatch_s_sync_sem_addr,
-    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 64,
+    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 256,
     "MCAST_GO_SIGNAL_ADDR": go_msg_addr, "UNICAST_GO_SIGNAL_ADDR": go_msg_addr,
     "DISTRIBUTED_DISPATCHER": 0, "FIRST_STREAM_USED": 48,
     "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
@@ -475,7 +477,7 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
     "DISPATCH_S_SYNC_SEM_BASE_ADDR": cfg.dispatch_s_sync_sem_addr,
     "MCAST_GO_SIGNAL_ADDR": go_msg_addr, "UNICAST_GO_SIGNAL_ADDR": go_msg_addr,
     "DISTRIBUTED_DISPATCHER": 0, "FIRST_STREAM_USED": 48,
-    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 64,
+    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 256,
     "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
     "NUM_PHYSICAL_UNICAST_CORES": 0,
     "WORKER_MCAST_GRID": mcast_grid, "NUM_WORKER_CORES_TO_MCAST": cfg.num_worker_cores,

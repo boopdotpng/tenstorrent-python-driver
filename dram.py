@@ -1,10 +1,10 @@
-import os, mmap, time, fcntl, ctypes
+import os, mmap, fcntl, ctypes
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn, PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, tlog, USE_SLOW_DISPATCH
+from helpers import _IO, USE_SLOW_DISPATCH
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
@@ -184,10 +184,8 @@ class DramAllocator:
       page = view[off : off + buf.page_size]
       self.win.wc[addr : addr + len(page)] = page
 
-    t0 = time.perf_counter()
     touched = self._for_each_page(buf, len(data), TLBMode.POSTED, do_write)
     self.barrier(touched)
-    tlog("dram_write", time.perf_counter() - t0, len(data))
 
   def read(self, buf: DramBuffer) -> bytes:
     if self.sysmem is not None and buf.size <= self.sysmem.size:
@@ -224,10 +222,8 @@ class DramAllocator:
       reader_rt_args=reader_args, writer_rt_args=[], compute_rt_args=[],
       cbs=[0], tile_size=buf.page_size, num_pages=2, cores=cores,
     )
-    t0 = time.perf_counter()
-    self._run_fn(program, _log_timing=False)
+    self._run_fn(program, timing=False)
     result = bytes(sm.buf[:buf.size])
-    tlog("dram_read_fast", time.perf_counter() - t0, buf.size)
     if buf.dtype is not None:
       assert buf.shape is not None, "Shape is required when dtype is set"
       return untilize(result, buf.dtype.value, buf.shape)
@@ -241,9 +237,7 @@ class DramAllocator:
       n = min(buf.page_size, remaining)
       result[off : off + n] = self.win.wc[addr : addr + n]
 
-    t0 = time.perf_counter()
     self._for_each_page(buf, buf.size, TLBMode.RELAXED, do_read)
-    tlog("dram_read_slow", time.perf_counter() - t0, buf.size)
     if buf.dtype is not None:
       assert buf.shape is not None, "Shape is required when dtype is set"
       return untilize(bytes(result), buf.dtype.value, buf.shape)

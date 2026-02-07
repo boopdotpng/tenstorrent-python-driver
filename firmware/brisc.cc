@@ -476,15 +476,16 @@ int main() {
 
             // Notify dispatcher core that tensix has completed running kernels, if the launch_msg was populated
             if (launch_msg_address->kernel_config.mode == DISPATCH_MODE_DEV) {
-                // Set launch message to invalid, so that the next time this slot is encountered, kernels are only run
-                // if a valid launch message is sent.
                 launch_msg_address->kernel_config.enables = 0;
                 launch_msg_address->kernel_config.preload = 0;
                 uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[go_message_index]);
+                // DEBUG: write dispatch_addr to L1 debug area (0x100)
+                volatile uint32_t tt_l1_ptr* dbg = reinterpret_cast<volatile uint32_t tt_l1_ptr*>(0x100);
+                dbg[0] = 0xDEAD0001;
+                dbg[1] = static_cast<uint32_t>(dispatch_addr);
+                dbg[2] = static_cast<uint32_t>(dispatch_addr >> 32);
+                dbg[3] = noc_index;
                 DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
-                // Only executed if watcher is enabled. Ensures that we don't report stale data due to invalid launch
-                // messages in the ring buffer. Must be executed before the atomic increment, as after that the launch
-                // message is no longer owned by us.
                 CLEAR_PREVIOUS_LAUNCH_MESSAGE_ENTRY_FOR_WATCHER();
                 notify_dispatch_core_done(dispatch_addr, noc_index);
                 mailboxes->launch_msg_rd_ptr = (launch_msg_rd_ptr + 1) & (launch_msg_buffer_num_entries - 1);

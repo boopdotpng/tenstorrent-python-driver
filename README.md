@@ -2,7 +2,7 @@
 A full replacement of **tt-metal** and **tt-umd**, written in Python. 
 
 ## requirements 
-- **tt-kmd**
+- **tt-kmd** version 2.6.1-pre. As long as the ioctls haven't changed, any version will work. 
 - Firmware version 19.4.2. I don't really see a need to update past this, and in 19.5 they disable a bunch of your Tensix cores (on p150a). 
 
 ## instructions 

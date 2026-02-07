@@ -179,6 +179,7 @@ class DevMsgs:
   RUN_MSG_GO = 0x80
   RUN_MSG_RESET_READ_PTR_FROM_HOST = 0xE0
   RUN_MSG_DONE = 0x00
+  DISPATCH_MODE_DEV = 0
   DISPATCH_MODE_HOST = 1
   ProgrammableCoreType_COUNT = 3
   MaxProcessorsPerCoreType = 5
@@ -267,12 +268,19 @@ class CQPrefetchCmdId:
 
 class CQDispatchCmdId:
   WRITE_LINEAR = 1
+  WRITE_LINEAR_H_HOST = 3
   WRITE_PACKED = 5
   WRITE_PACKED_LARGE = 6
+  WAIT = 7
+  SEND_GO_SIGNAL = 14
+  SET_GO_SIGNAL_NOC_DATA = 17
 
 CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE = 0x02
 CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK = 0x01
 CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS = 35
+CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM = 0x08
+CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM = 0x10
+CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET = 0xFF
 
 class CQPrefetchRelayInlineCmd(S):
   _pack_ = 1
@@ -296,6 +304,14 @@ class CQDispatchWriteCmd(S):
     ("addr", u64),
     ("length", u64),
   ]
+
+class CQDispatchWriteHostCmd(S):
+  _pack_ = 1
+  _fields_ = [("is_event", u8), ("pad1", u16), ("pad2", u32), ("length", u64)]
+
+class CQDispatchWaitCmd(S):
+  _pack_ = 1
+  _fields_ = [("flags", u8), ("stream", u16), ("addr", u32), ("count", u32)]
 
 class CQDispatchCmdLargePayload(ctypes.Union):
   _pack_ = 1
@@ -321,11 +337,30 @@ class CQDispatchWritePackedLargeSubCmd(S):
   _pack_ = 1
   _fields_ = [("noc_xy_addr", u32), ("addr", u32), ("length_minus1", u16), ("num_mcast_dests", u8), ("flags", u8)]
 
+class CQDispatchGoSignalMcastCmd(S):
+  _pack_ = 1
+  _fields_ = [
+    ("go_signal", u32),
+    ("multicast_go_offset", u8),
+    ("num_unicast_txns", u8),
+    ("noc_data_start_index", u8),
+    ("wait_count", u32),
+    ("wait_stream", u32),
+  ]
+
+class CQDispatchSetGoSignalNocDataCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("num_words", u32)]
+
 class CQDispatchCmdPayload(ctypes.Union):
   _pack_ = 1
   _fields_ = [
+    ("write_linear_host", CQDispatchWriteHostCmd),
     ("write_packed", CQDispatchWritePackedCmd),
     ("write_packed_large", CQDispatchWritePackedLargeCmd),
+    ("wait", CQDispatchWaitCmd),
+    ("mcast", CQDispatchGoSignalMcastCmd),
+    ("set_go_signal_noc_data", CQDispatchSetGoSignalNocDataCmd),
     ("raw", u8 * 15),
   ]
 
