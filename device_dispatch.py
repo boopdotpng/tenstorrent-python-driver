@@ -898,7 +898,6 @@ class FastDevice(SlowDevice):
   def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else self.dispatchable_cores
     num_cores = len(cores)
-    use_cq_wait = os.environ.get("TT_FAST_CQ_WAIT", "1") != "0"
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -910,7 +909,6 @@ class FastDevice(SlowDevice):
     go.bits.master_x = self.dispatch_core[0]
     go.bits.master_y = self.dispatch_core[1]
     go.bits.signal = DevMsgs.RUN_MSG_GO
-    go_blob = as_bytes(go)
 
     first_r = self._resolve_args(program.reader_rt_args, 0, cores[0], num_cores)
     first_w = self._resolve_args(program.writer_rt_args, 0, cores[0], num_cores)
@@ -919,7 +917,7 @@ class FastDevice(SlowDevice):
     dispatch_mode = DevMsgs.DISPATCH_MODE_DEV  # always DEV for testing
     shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes, dispatch_mode=dispatch_mode)
 
-    # Reset GO_MSG via MMIO unicast (must be synchronous to prevent poll race with stale RUN_MSG_DONE)
+    # Reset GO_MSG via MMIO unicast before issuing new GO.
     # Can't use mcast here — dispatch cores share the mcast bounding box with worker cores
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     win = self.win
@@ -957,102 +955,74 @@ class FastDevice(SlowDevice):
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.KERNEL_CONFIG_BASE + shared_off, data=shared_img)
     self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.LAUNCH, data=launch_blob)
     t_dispatch_start = time.perf_counter()
-    if use_cq_wait:
-      # CQ wait path: dispatch sends GO + waits for worker completion + notifies host
-      noc_words = [(y << 6) | x for x, y in cores]
-      self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)  # clear stale count
-      self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
-      self._cq.enqueue_send_go_signal(
-        go_signal=go.all, wait_stream=48, wait_count=0,
-        num_unicast_txns=num_cores, noc_data_start_index=0)
-      self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
-      event_id = self._event_id; self._event_id += 1
-      self._cq.enqueue_host_event(event_id=event_id)
-    else:
-      self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.GO_MSG, data=go_blob)
+    # CQ wait path: dispatch sends GO + waits for worker completion + notifies host
+    noc_words = [(y << 6) | x for x, y in cores]
+    self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)  # clear stale count
+    self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
+    self._cq.enqueue_send_go_signal(
+      go_signal=go.all, wait_stream=48, wait_count=0,
+      num_unicast_txns=num_cores, noc_data_start_index=0)
+    self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
+    event_id = self._event_id; self._event_id += 1
+    self._cq.enqueue_host_event(event_id=event_id)
     t_compute_start = time.perf_counter()
 
-    if use_cq_wait:
-      # Poll completion queue event marker emitted after dispatch-side WAIT(stream==num_cores)
-      try:
-        self._cq.wait_host_event(event_id=event_id, timeout_s=10.0)
-      except TimeoutError:
-        # Debug: check worker GO_MSG state and launch mode
-        l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-        sample = cores[:3] + cores[-1:]
-        for x, y in sample:
-          l1_cfg.start = l1_cfg.end = (x, y)
-          win.configure(l1_cfg)
-          go_val = win.read32(TensixL1.GO_MSG)
-          # Read mode byte from launch msg kernel config (offset 42 in LaunchMsg)
-          mode_val = win.uc[TensixL1.LAUNCH + 42]
-          # Read debug area at 0x100
-          dbg = [win.read32(0x100 + i*4) for i in range(8)]
-          print(f"  core ({x},{y}): GO_MSG=0x{go_val:08x} signal=0x{(go_val>>24)&0xff:02x} mode={mode_val}")
-          if dbg[0] == 0xDEAD0001:
-            disp_lo, disp_hi, nidx, dma = dbg[1], dbg[2], dbg[3], dbg[4]
-            disp_addr = (disp_hi << 32) | disp_lo
-            done = "yes" if dbg[5] in (0xDEAD0002, 0xDEAD0003) else f"no (0x{dbg[5]:08x})"
-            hw_posted = dbg[6]
-            sw_posted = dbg[7]
-            print(f"    notify_done={done} dispatch_addr=0x{disp_addr:016x} noc_idx={nidx}")
-            print(f"    NOC_HW_POSTED_WR_SENT={hw_posted} SW_POSTED_WR_ISSUED={sw_posted}")
-          else:
-            print(f"    DEBUG: no DEV epilog marker (dbg[0]=0x{dbg[0]:08x})")
-        # Read stream 48 registers on dispatch core
-        dx, dy = self.dispatch_core
-        s48_base = 0xFFB70000  # NOC_OVERLAY_START + 48 * 0x1000
-        s48_avail_off = 297 * 4  # STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE
-        s48_update_off = 270 * 4  # STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE
-        tlb_base = s48_base & ~((1 << 21) - 1)  # 2MB-aligned
-        dcfg = TLBConfig(addr=tlb_base, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-        self._cq.dispatch_win.configure(dcfg)
-        avail = self._cq.dispatch_win.read32(s48_base - tlb_base + s48_avail_off)
-        update = self._cq.dispatch_win.read32(s48_base - tlb_base + s48_update_off)
-        print(f"  dispatch ({dx},{dy}): stream48 AVAILABLE=0x{avail:08x} ({avail}) UPDATE_REG=0x{update:08x}")
-        # Read L1 addr 0 on dispatch core (check if workers wrote there instead of stream reg)
-        dcfg_l1 = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-        self._cq.dispatch_win.configure(dcfg_l1)
-        l1_0 = self._cq.dispatch_win.read32(0)
-        l1_4 = self._cq.dispatch_win.read32(4)
-        print(f"  dispatch L1[0x0]=0x{l1_0:08x} L1[0x4]=0x{l1_4:08x}")
-        # Read prefetch RD ptr to check how far CQ got
-        pf_rd = self._cq.dispatch_win.read32(self._cq.dev.prefetch_q_rd_ptr_addr)
-        pf_pcie_rd = self._cq.dispatch_win.read32(self._cq.dev.prefetch_q_pcie_rd_ptr_addr)
-        cq_wr = self._cq.dispatch_win.read32(self._cq.dev.completion_q_wr_ptr_addr)
-        print(f"  dispatch prefetch_rd=0x{pf_rd:08x} pcie_rd=0x{pf_pcie_rd:08x} cq_wr=0x{cq_wr:08x}")
-        # Restore dispatch_win config
-        dcfg2 = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-        self._cq.dispatch_win.configure(dcfg2)
-        # Check prefetch queue entry consumption
-        for i in range(min(8, self._cq.dev.prefetch_q_size // 2)):
-          v = self._cq._read_prefetch_entry(i)
-          if v != 0: print(f"  prefetch_q[{i}] = 0x{v:04x} (not consumed)")
-        raise
-    else:
-      # Stable completion path: poll worker GO_MSG done.
+    # Poll completion queue event marker emitted after dispatch-side WAIT(stream==num_cores)
+    try:
+      self._cq.wait_host_event(event_id=event_id, timeout_s=10.0)
+    except TimeoutError:
+      # Debug: check worker GO_MSG state and launch mode
       l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-      for x, y in cores:
+      sample = cores[:3] + cores[-1:]
+      for x, y in sample:
         l1_cfg.start = l1_cfg.end = (x, y)
         win.configure(l1_cfg)
-        deadline = time.perf_counter() + 10.0
-        while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
-          if time.perf_counter() > deadline:
-            go_val = win.read32(TensixL1.GO_MSG)
-            mode_val = win.uc[TensixL1.LAUNCH + 42]
-            dbg = [win.read32(0x100 + i*4) for i in range(4)]
-            print(f"  TIMEOUT core ({x},{y}): GO=0x{go_val:08x} signal=0x{(go_val>>24)&0xff:02x} mode={mode_val}")
-            print(f"    dbg: {['0x{:08x}'.format(v) for v in dbg]}")
-            # Check dispatch core state
-            dx, dy = self.dispatch_core
-            dcfg = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-            win.configure(dcfg)
-            pf_rd = win.read32(self._cq.dev.prefetch_q_rd_ptr_addr)
-            print(f"  dispatch prefetch_rd=0x{pf_rd:08x}")
-            for i in range(min(8, self._cq.dev.prefetch_q_size // 2)):
-              v = self._cq._read_prefetch_entry(i)
-              if v != 0: print(f"  prefetch_q[{i}] = 0x{v:04x}")
-            raise TimeoutError(f"timeout waiting for core ({x}, {y})")
+        go_val = win.read32(TensixL1.GO_MSG)
+        # Read mode byte from launch msg kernel config (offset 42 in LaunchMsg)
+        mode_val = win.uc[TensixL1.LAUNCH + 42]
+        # Read debug area at 0x100
+        dbg = [win.read32(0x100 + i*4) for i in range(8)]
+        print(f"  core ({x},{y}): GO_MSG=0x{go_val:08x} signal=0x{(go_val>>24)&0xff:02x} mode={mode_val}")
+        if dbg[0] == 0xDEAD0001:
+          disp_lo, disp_hi, nidx, dma = dbg[1], dbg[2], dbg[3], dbg[4]
+          disp_addr = (disp_hi << 32) | disp_lo
+          done = "yes" if dbg[5] in (0xDEAD0002, 0xDEAD0003) else f"no (0x{dbg[5]:08x})"
+          hw_posted = dbg[6]
+          sw_posted = dbg[7]
+          print(f"    notify_done={done} dispatch_addr=0x{disp_addr:016x} noc_idx={nidx}")
+          print(f"    NOC_HW_POSTED_WR_SENT={hw_posted} SW_POSTED_WR_ISSUED={sw_posted}")
+        else:
+          print(f"    DEBUG: no DEV epilog marker (dbg[0]=0x{dbg[0]:08x})")
+      # Read stream 48 registers on dispatch core
+      dx, dy = self.dispatch_core
+      s48_base = 0xFFB70000  # NOC_OVERLAY_START + 48 * 0x1000
+      s48_avail_off = 297 * 4  # STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE
+      s48_update_off = 270 * 4  # STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE
+      tlb_base = s48_base & ~((1 << 21) - 1)  # 2MB-aligned
+      dcfg = TLBConfig(addr=tlb_base, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
+      self._cq.dispatch_win.configure(dcfg)
+      avail = self._cq.dispatch_win.read32(s48_base - tlb_base + s48_avail_off)
+      update = self._cq.dispatch_win.read32(s48_base - tlb_base + s48_update_off)
+      print(f"  dispatch ({dx},{dy}): stream48 AVAILABLE=0x{avail:08x} ({avail}) UPDATE_REG=0x{update:08x}")
+      # Read L1 addr 0 on dispatch core (check if workers wrote there instead of stream reg)
+      dcfg_l1 = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
+      self._cq.dispatch_win.configure(dcfg_l1)
+      l1_0 = self._cq.dispatch_win.read32(0)
+      l1_4 = self._cq.dispatch_win.read32(4)
+      print(f"  dispatch L1[0x0]=0x{l1_0:08x} L1[0x4]=0x{l1_4:08x}")
+      # Read prefetch RD ptr to check how far CQ got
+      pf_rd = self._cq.dispatch_win.read32(self._cq.dev.prefetch_q_rd_ptr_addr)
+      pf_pcie_rd = self._cq.dispatch_win.read32(self._cq.dev.prefetch_q_pcie_rd_ptr_addr)
+      cq_wr = self._cq.dispatch_win.read32(self._cq.dev.completion_q_wr_ptr_addr)
+      print(f"  dispatch prefetch_rd=0x{pf_rd:08x} pcie_rd=0x{pf_pcie_rd:08x} cq_wr=0x{cq_wr:08x}")
+      # Restore dispatch_win config
+      dcfg2 = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
+      self._cq.dispatch_win.configure(dcfg2)
+      # Check prefetch queue entry consumption
+      for i in range(min(8, self._cq.dev.prefetch_q_size // 2)):
+        v = self._cq._read_prefetch_entry(i)
+        if v != 0: print(f"  prefetch_q[{i}] = 0x{v:04x} (not consumed)")
+      raise
     t_end = time.perf_counter()
     dispatch = t_compute_start - t_dispatch_start
     compute = t_end - t_compute_start
