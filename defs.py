@@ -267,6 +267,12 @@ class CQPrefetchCmdId:
 
 class CQDispatchCmdId:
   WRITE_LINEAR = 1
+  WRITE_PACKED = 5
+  WRITE_PACKED_LARGE = 6
+
+CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE = 0x02
+CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK = 0x01
+CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS = 35
 
 class CQPrefetchRelayInlineCmd(S):
   _pack_ = 1
@@ -298,3 +304,31 @@ class CQDispatchCmdLargePayload(ctypes.Union):
 class CQDispatchCmdLarge(S):
   _pack_ = 1
   _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdLargePayload)]
+
+class CQDispatchWritePackedCmd(S):
+  _pack_ = 1
+  _fields_ = [("flags", u8), ("count", u16), ("write_offset_index", u16), ("size", u16), ("addr", u32)]
+
+class CQDispatchWritePackedUnicastSubCmd(S):
+  _pack_ = 1
+  _fields_ = [("noc_xy_addr", u32)]
+
+class CQDispatchWritePackedLargeCmd(S):
+  _pack_ = 1
+  _fields_ = [("type", u8), ("count", u16), ("alignment", u16), ("write_offset_index", u16)]
+
+class CQDispatchWritePackedLargeSubCmd(S):
+  _pack_ = 1
+  _fields_ = [("noc_xy_addr", u32), ("addr", u32), ("length_minus1", u16), ("num_mcast_dests", u8), ("flags", u8)]
+
+class CQDispatchCmdPayload(ctypes.Union):
+  _pack_ = 1
+  _fields_ = [
+    ("write_packed", CQDispatchWritePackedCmd),
+    ("write_packed_large", CQDispatchWritePackedLargeCmd),
+    ("raw", u8 * 15),
+  ]
+
+class CQDispatchCmd(S):
+  _pack_ = 1
+  _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdPayload)]

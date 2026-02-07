@@ -16,6 +16,11 @@ def _align_up(n: int, a: int) -> int:
 def _pack_noc_xy(x: int, y: int) -> int:
   return ((y << 6) | x) & 0xFFFF
 
+def _pack_noc_mcast_xy(x: int, y: int) -> int:
+  """Encode a 1x1 multicast rectangle (same start/end) for NOC dispatch operations.
+  BH format: [y_start:18][x_start:12][y_end:6][x_end:0], 6 bits each."""
+  return (y << 18) | (x << 12) | (y << 6) | x
+
 @dataclass(frozen=True)
 class _HostCQ:
   sysmem_size: int
@@ -171,6 +176,86 @@ class _FastCQ:
     self.sysmem[base : base + len(record)] = record
     self.issue_wr = wr + len(record)
     self._write_prefetch_q_entry(len(record) >> 4)
+
+  def enqueue_write_packed(self, *, cores: list[tuple[int, int]], addr: int, data: bytes | list[bytes]):
+    count = len(cores)
+    uniform = isinstance(data, bytes)
+    payload_size = len(data) if uniform else len(data[0])
+
+    # Build dispatch cmd (16 bytes)
+    dispatch = CQDispatchCmd()
+    dispatch.cmd_id = CQDispatchCmdId.WRITE_PACKED
+    dispatch.payload.write_packed.flags = CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE if uniform else 0
+    dispatch.payload.write_packed.count = count
+    dispatch.payload.write_packed.write_offset_index = 0
+    dispatch.payload.write_packed.size = payload_size
+    dispatch.payload.write_packed.addr = addr
+
+    # Build sub-cmd array (count × 4 bytes), padded to L1_ALIGNMENT
+    sub_cmds = b"".join(
+      as_bytes(CQDispatchWritePackedUnicastSubCmd(noc_xy_addr=_pack_noc_xy(x, y)))
+      for x, y in cores
+    )
+    sub_cmds_padded = sub_cmds.ljust(_align_up(len(sub_cmds), FastDispatch.L1_ALIGNMENT), b"\0")
+
+    # Build data section
+    if uniform:
+      data_section = bytes(data).ljust(_align_up(payload_size, FastDispatch.L1_ALIGNMENT), b"\0")
+    else:
+      stride = _align_up(payload_size, FastDispatch.L1_ALIGNMENT)
+      data_section = b"".join(bytes(d).ljust(stride, b"\0") for d in data)
+
+    inner = as_bytes(dispatch) + sub_cmds_padded + data_section
+
+    # Wrap in prefetch relay inline cmd
+    prefetch = CQPrefetchCmd()
+    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
+    prefetch.payload.relay_inline.dispatcher_type = 0
+    prefetch.payload.relay_inline.pad = 0
+    prefetch.payload.relay_inline.length = len(inner)
+    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(inner), FastDispatch.PCIE_ALIGNMENT)
+    prefetch.payload.relay_inline.stride = stride
+    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(inner))
+    self._issue_write(as_bytes(prefetch) + inner + pad)
+
+  def enqueue_write_packed_large(self, *, dests: list[tuple[int, int]], addr: int, data: bytes):
+    """Packed large write: sends identical data to mcast destinations.
+    dests: list of (noc_xy_mcast, num_mcast_dests) — each entry is one sub-cmd."""
+    alignment = FastDispatch.L1_ALIGNMENT
+    data_padded = bytes(data).ljust(_align_up(len(data), alignment), b"\0")
+    max_batch = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS
+
+    for batch_start in range(0, len(dests), max_batch):
+      batch = dests[batch_start : batch_start + max_batch]
+      count = len(batch)
+
+      dispatch = CQDispatchCmd()
+      dispatch.cmd_id = CQDispatchCmdId.WRITE_PACKED_LARGE
+      dispatch.payload.write_packed_large.type = 2  # PROGRAM_BINARIES
+      dispatch.payload.write_packed_large.count = count
+      dispatch.payload.write_packed_large.alignment = alignment
+      dispatch.payload.write_packed_large.write_offset_index = 0
+
+      sub_cmds = b"".join(
+        as_bytes(CQDispatchWritePackedLargeSubCmd(
+          noc_xy_addr=noc_xy, addr=addr, length_minus1=len(data) - 1,
+          num_mcast_dests=n_dests,
+          flags=CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK,
+        )) for noc_xy, n_dests in batch
+      )
+      sub_cmds_padded = sub_cmds.ljust(_align_up(len(sub_cmds), alignment), b"\0")
+      data_section = data_padded * count
+
+      inner = as_bytes(dispatch) + sub_cmds_padded + data_section
+      prefetch = CQPrefetchCmd()
+      prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
+      prefetch.payload.relay_inline.dispatcher_type = 0
+      prefetch.payload.relay_inline.pad = 0
+      prefetch.payload.relay_inline.length = len(inner)
+      stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(inner), FastDispatch.PCIE_ALIGNMENT)
+      prefetch.payload.relay_inline.stride = stride
+      pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(inner))
+      self._issue_write(as_bytes(prefetch) + inner + pad)
 
   def enqueue_write_linear(self, *, tile: tuple[int, int], addr: int, data: bytes):
     x, y = tile
@@ -587,11 +672,25 @@ class FastDevice(SlowDevice):
       go = GoMsg(); go.bits.signal = DevMsgs.RUN_MSG_GO
       win.write(TensixL1.GO_MSG, as_bytes(go), use_uc=True, restore=False)
 
+  def _mcast_dests(self, cores: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Compute NOC mcast destinations for packed_large, avoiding dispatch cores.
+    Returns list of (noc_xy_mcast, num_dests) tuples. NOC 1 encoding (start=max, end=min)."""
+    dispatch_col = self.prefetch_core[0]
+    dispatch_set = {self.prefetch_core, self.dispatch_core}
+    west = [(x, y) for x, y in cores if x < 8]
+    east_safe = [(x, y) for x, y in cores if x >= 10 and x != dispatch_col]
+    col_cores = sorted([(x, y) for x, y in cores if x == dispatch_col and (x, y) not in dispatch_set])
+    dests = []
+    for group in (west, east_safe, col_cores):
+      if group:
+        xs = [x for x, _ in group]
+        ys = [y for _, y in group]
+        noc_xy = (max(ys) << 18) | (max(xs) << 12) | (min(ys) << 6) | min(xs)
+        dests.append((noc_xy, len(group)))
+    return dests
+
   def run(self, program: Program, *, _log_timing: bool = True) -> tuple[float, float]:
-    if program.cores is not None:
-      cores = program.cores
-    else:
-      cores = self.dispatchable_cores
+    cores = program.cores if program.cores is not None else self.dispatchable_cores
     num_cores = len(cores)
 
     reset = GoMsg()
@@ -607,7 +706,8 @@ class FastDevice(SlowDevice):
     rta_sizes = (len(first_w) * 4, len(first_r) * 4, len(first_c) * 4)
     shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes)
 
-    # Reset GO_MSG via MMIO (must be synchronous to prevent poll race with stale RUN_MSG_DONE)
+    # Reset GO_MSG via MMIO unicast (must be synchronous to prevent poll race with stale RUN_MSG_DONE)
+    # Can't use mcast here — dispatch cores share the mcast bounding box with worker cores
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     win = self.win
     for x, y in cores:
@@ -616,7 +716,7 @@ class FastDevice(SlowDevice):
       win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
       win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
 
-    # Setup via CQ (avoids slow MMIO unicast for kernel config + binaries)
+    # Build per-core RTA payloads
     shared_rta = None
     if (
       isinstance(program.reader_rt_args, list)
@@ -625,25 +725,28 @@ class FastDevice(SlowDevice):
     ):
       shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args)
 
-    for core_idx, (x, y) in enumerate(cores):
-      if shared_rta is None:
-        reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
-        writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
-        compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
-        rta = self._pack_rta(reader_args, writer_args, compute_args)
-      else:
-        rta = shared_rta
-      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.KERNEL_CONFIG_BASE, data=rta)
-      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.KERNEL_CONFIG_BASE + shared_off, data=shared_img)
-      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.LAUNCH, data=launch_blob)
+    if shared_rta is not None:
+      rta_payloads = shared_rta  # uniform: single bytes, NO_STRIDE
+    else:
+      rta_payloads = [
+        self._pack_rta(
+          self._resolve_args(program.reader_rt_args, i, cores[i], num_cores),
+          self._resolve_args(program.writer_rt_args, i, cores[i], num_cores),
+          self._resolve_args(program.compute_rt_args, i, cores[i], num_cores),
+        ) for i in range(num_cores)
+      ]
 
-    # Dispatch GO via CQ
+    # Dispatch via CQ packed writes (RTA + launch + GO as packed, shared_img as packed_large)
+    mcast_dests = self._mcast_dests(cores)
+    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.KERNEL_CONFIG_BASE, data=rta_payloads)
+    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.KERNEL_CONFIG_BASE + shared_off, data=shared_img)
+    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.LAUNCH, data=launch_blob)
     t_dispatch_start = time.perf_counter()
-    for x, y in cores:
-      self._cq.enqueue_write_linear(tile=(x, y), addr=TensixL1.GO_MSG, data=go_blob)
+    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.GO_MSG, data=go_blob)
     t_compute_start = time.perf_counter()
 
     # Poll for completion
+    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     for x, y in cores:
       l1_cfg.start = l1_cfg.end = (x, y)
       win.configure(l1_cfg)
