@@ -724,9 +724,9 @@ class FastDevice(SlowDevice):
     self,
     device: int = 0,
     *,
-    sysmem_size: int = 16 * 1024 * 1024,
-    issue_size: int = 8 * 1024 * 1024,
-    completion_size: int = 4 * 1024 * 1024,
+    sysmem_size: int = 128 * 1024 * 1024,
+    issue_size: int = 64 * 1024 * 1024,
+    completion_size: int = 32 * 1024 * 1024,
   ):
     super().__init__(device=device)
     self.prefetch_core, self.dispatch_core = getattr(self, "_dispatch_core_pair", self._select_dispatch_core_pair())
@@ -916,15 +916,7 @@ class FastDevice(SlowDevice):
     dispatch_mode = DevMsgs.DISPATCH_MODE_DEV  # always DEV for testing
     shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes, dispatch_mode=dispatch_mode)
 
-    # Reset GO_MSG via MMIO unicast before issuing new GO.
-    # Can't use mcast here — dispatch cores share the mcast bounding box with worker cores
-    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-    win = self.win
-    for x, y in cores:
-      l1_cfg.start = l1_cfg.end = (x, y)
-      win.configure(l1_cfg)
-      win.write(TensixL1.GO_MSG, reset_blob, use_uc=True, restore=False)
-      win.write(TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little"), use_uc=True, restore=False)
+    go_msg_index_zero = (0).to_bytes(4, "little")
 
     # Build per-core RTA payloads
     ns = program.num_sems
@@ -950,6 +942,8 @@ class FastDevice(SlowDevice):
 
     # Dispatch via CQ packed writes (RTA + launch + GO as packed, shared_img as packed_large)
     mcast_dests = self._mcast_dests(cores)
+    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
+    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=go_msg_index_zero)
     self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.KERNEL_CONFIG_BASE, data=rta_payloads)
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.KERNEL_CONFIG_BASE + shared_off, data=shared_img)
     self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.LAUNCH, data=launch_blob)
@@ -970,6 +964,7 @@ class FastDevice(SlowDevice):
     try:
       self._cq.wait_host_event(event_id=event_id, timeout_s=10.0)
     except TimeoutError:
+      win = self.win
       # Debug: check worker GO_MSG state and launch mode
       l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
       sample = cores[:3] + cores[-1:]
