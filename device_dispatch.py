@@ -1,12 +1,11 @@
-import ctypes, fcntl, mmap, os, struct, time
+import ctypes, fcntl, mmap, struct, time
 from dataclasses import dataclass
-from pathlib import Path
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import _IO, align_down
 from codegen import CQConfig, compile_cq_kernels
 from dram import DramAllocator
-from device_runtime import CommonDevice, Program, TileGrid, ArgGen
+from device_runtime import CommonDevice, Program, ArgGen
 
 PAGE_SIZE = 4096
 
@@ -984,7 +983,7 @@ class FastDevice(SlowDevice):
         dbg = [win.read32(0x100 + i*4) for i in range(8)]
         print(f"  core ({x},{y}): GO_MSG=0x{go_val:08x} signal=0x{(go_val>>24)&0xff:02x} mode={mode_val}")
         if dbg[0] == 0xDEAD0001:
-          disp_lo, disp_hi, nidx, dma = dbg[1], dbg[2], dbg[3], dbg[4]
+          disp_lo, disp_hi, nidx = dbg[1], dbg[2], dbg[3]
           disp_addr = (disp_hi << 32) | disp_lo
           done = "yes" if dbg[5] in (0xDEAD0002, 0xDEAD0003) else f"no (0x{dbg[5]:08x})"
           hw_posted = dbg[6]

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
-from codegen import Compiler, DataFormat
+from codegen import Compiler
 from device import Device, Program
 from dram import DType
 

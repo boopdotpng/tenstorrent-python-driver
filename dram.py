@@ -73,7 +73,7 @@ def untilize(data: bytes, bpe: int, shape: tuple[int, ...]) -> bytes:
 class Sysmem:
   PCIE_NOC_XY = (24 << 6) | 19
 
-  def __init__(self, fd: int, size: int = 16 * 1024 * 1024):
+  def __init__(self, fd: int, size: int = 1024 * 1024 * 1024):
     self.fd = fd
     page_size = os.sysconf("SC_PAGE_SIZE")
     self.size = (size + page_size - 1) & ~(page_size - 1)
@@ -178,6 +178,45 @@ class DramAllocator:
     if buf.dtype is not None:
       assert buf.shape is not None, "Shape is required when dtype is set"
       data = tilize(data, buf.dtype.value, buf.shape)
+    if self.sysmem is not None and len(data) <= self.sysmem.size:
+      self._write_fast(buf, data)
+    else:
+      self._write_slow(buf, data)
+
+  def _write_fast(self, buf: DramBuffer, data: bytes):
+    from codegen import get_fill_kernel
+    assert self.sysmem is not None and self._run_fn is not None
+    sm = self.sysmem
+    sm.buf[:len(data)] = data
+    fill = get_fill_kernel()
+    n_tiles = (len(data) + buf.page_size - 1) // buf.page_size
+    sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
+
+    from device_runtime import Program, TileGrid
+    dev = getattr(self._run_fn, "__self__", None)
+    if dev is not None and hasattr(dev, "dispatchable_cores"):
+      all_cores = list(dev.dispatchable_cores)
+    else:
+      all_cores = list(TileGrid.TENSIX)
+    num_cores = len(all_cores)
+    tiles_per_core = (n_tiles + num_cores - 1) // num_cores
+    active_cores = min(num_cores, n_tiles)
+    cores = all_cores[:active_cores]
+
+    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+      start = core_idx * tiles_per_core
+      count = min(tiles_per_core, n_tiles - start)
+      if start >= n_tiles: count = 0
+      return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size]
+
+    program = Program(
+      reader=fill, writer=None, compute=None,
+      reader_rt_args=reader_args, writer_rt_args=[], compute_rt_args=[],
+      cbs=[0], tile_size=buf.page_size, num_pages=2, cores=cores,
+    )
+    self._run_fn(program, timing=False)
+
+  def _write_slow(self, buf: DramBuffer, data: bytes):
     view = memoryview(data)
 
     def do_write(addr: int, off: int):
