@@ -20,6 +20,6 @@ flock /tmp/tt-device.lock tt-smi -r
 ```
 This blocks until the lock is free — no polling or sleep needed.
 
-**Workspace setup:** `tt-metal-deps/` is gitignored and won't exist in new jj workspaces. After creating a workspace, symlink it from the main repo checkout into the new workspace.
+**Workspace setup:** `tt-metal-deps/` is gitignored and won't exist in new jj workspaces. After creating each new workspace, re-download `tt-metal-deps/` in that workspace instead of symlinking it from another checkout.
 
 When you write kernels, refer to tt-metal for syntax, and note that our kernels will always use every available core (minus 2 if using fast dispatch), and we will write compute kernels exclusively in SFPI/SFPU/FPU ops, not high level tt-llk functions.
