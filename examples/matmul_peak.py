@@ -311,25 +311,34 @@ K_COMPUTE = f"""
 namespace NAMESPACE {{
 void MAIN {{
   constexpr uint32_t in0_block_w = {IN0_BLOCK_W};
+
   constexpr uint32_t in0_num_subblocks = {IN0_NUM_SUBBLOCKS};
   constexpr uint32_t in0_block_num_tiles = {IN0_BLOCK_NUM_TILES};
   constexpr uint32_t in0_subblock_num_tiles = {IN0_SUBBLOCK_NUM_TILES};
+
   constexpr uint32_t in1_num_subblocks = {IN1_NUM_SUBBLOCKS};
   constexpr uint32_t in1_block_num_tiles = {IN1_BLOCK_NUM_TILES};
   constexpr uint32_t in1_per_core_w = {IN1_PER_CORE_W};
+
   constexpr uint32_t num_blocks = {NUM_BLOCKS};
+
   constexpr uint32_t out_subblock_h = {OUT_SUBBLOCK_H};
   constexpr uint32_t out_subblock_w = {OUT_SUBBLOCK_W};
   constexpr uint32_t out_subblock_num_tiles = {OUT_SUBBLOCK_NUM_TILES};
 
-  mm_init(tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_16);
+  constexpr uint32_t transpose = 0;
+
+  // Program UNPACK+MATH for block matmul.
+  mm_block_init(
+    tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_16,
+    transpose, out_subblock_w, out_subblock_h, in0_block_w);
 
   bool spill = num_blocks > 1;
   bool enable_reload = false;
   uint32_t out_num_tiles_to_wait = out_subblock_num_tiles;
 
   for (uint32_t block = 0; block < num_blocks; block++) {{
-    bool last_out = block == (num_blocks - 1);
+    const bool last_out = (block == (num_blocks - 1));
 
     cb_wait_front(tt::CBIndex::c_0, in0_block_num_tiles);
     cb_wait_front(tt::CBIndex::c_1, in1_block_num_tiles);
@@ -343,32 +352,36 @@ void MAIN {{
         if (enable_reload) {{
           copy_tile_to_dst_init_short(tt::CBIndex::c_24);
           cb_wait_front(tt::CBIndex::c_24, out_subblock_num_tiles);
-          for (uint32_t i = 0; i < out_subblock_num_tiles; i++)
+          #pragma GCC unroll 0
+          for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             copy_tile(tt::CBIndex::c_24, i, i);
+          }}
           cb_pop_front(tt::CBIndex::c_24, out_subblock_num_tiles);
-          mm_init_short(tt::CBIndex::c_0, tt::CBIndex::c_1);
+
+          // copy_tile_* changes unpack/math state; re-init matmul-block state.
+          mm_block_init_short(
+            tt::CBIndex::c_0, tt::CBIndex::c_1,
+            transpose, out_subblock_w, out_subblock_h, in0_block_w);
         }}
 
-        int dst_index = 0;
-        int in0_index_h_offset = 0;
-        for (uint32_t h = 0; h < out_subblock_h; h++) {{
-          for (uint32_t w = 0; w < out_subblock_w; w++) {{
-            int in1_index_inner_dim_offset = 0;
-            for (uint32_t inner = 0; inner < in0_block_w; inner++) {{
-              int in0_idx = in0_index_subblock_offset + in0_index_h_offset + inner;
-              int in1_idx = in1_index_subblock_offset + in1_index_inner_dim_offset + w;
-              matmul_tiles(tt::CBIndex::c_0, tt::CBIndex::c_1, in0_idx, in1_idx, dst_index);
-              in1_index_inner_dim_offset += in1_per_core_w;
-            }}
-            dst_index++;
-          }}
-          in0_index_h_offset += in0_block_w;
+        #pragma GCC unroll 0
+        for (uint32_t inner = 0; inner < in0_block_w; inner++) {{
+          const uint32_t in0_tile_index = (uint32_t)(in0_index_subblock_offset + (int)inner);
+          const uint32_t in1_tile_index = (uint32_t)(in1_index_subblock_offset + (int)(inner * in1_per_core_w));
+
+          matmul_block(
+            tt::CBIndex::c_0, tt::CBIndex::c_1,
+            in0_tile_index, in1_tile_index,
+            0 /* idst base */, transpose,
+            out_subblock_w, out_subblock_h, in0_block_w);
         }}
 
         if (last_out) {{
           cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
-          for (uint32_t i = 0; i < out_subblock_num_tiles; i++)
+          #pragma GCC unroll 0
+          for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             pack_tile(i, tt::CBIndex::c_16);
+          }}
           cb_push_back(tt::CBIndex::c_16, out_subblock_num_tiles);
         }} else {{
           if (block == 0) {{
@@ -376,8 +389,10 @@ void MAIN {{
             out_num_tiles_to_wait += out_subblock_num_tiles;
           }}
           cb_reserve_back(tt::CBIndex::c_24, out_subblock_num_tiles);
-          for (uint32_t i = 0; i < out_subblock_num_tiles; i++)
+          #pragma GCC unroll 0
+          for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             pack_tile(i, tt::CBIndex::c_24);
+          }}
           cb_push_back(tt::CBIndex::c_24, out_subblock_num_tiles);
         }}
 
@@ -388,11 +403,12 @@ void MAIN {{
     }}
 
     if (spill) enable_reload = true;
+
     cb_pop_front(tt::CBIndex::c_0, in0_block_num_tiles);
     cb_pop_front(tt::CBIndex::c_1, in1_block_num_tiles);
   }}
 }}
-}}  // namespace NAMESPACE
+}} // namespace NAMESPACE
 """
 
 
