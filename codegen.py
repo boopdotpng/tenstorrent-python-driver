@@ -169,15 +169,18 @@ class Compiler:
     # Ensure firmware is compiled (needed for --just-symbols linking)
     self._fw = compile_firmware()
 
-  def compile(self, reader: str, writer: str, compute: str) -> CompiledKernels:
-    return CompiledKernels(
-      reader=self._compile_dataflow(reader, "ncrisc", noc_index=0),
-      writer=self._compile_dataflow(writer, "brisc", noc_index=1),
-      compute=(
-        self._compile_trisc(compute, 0),
-        self._compile_trisc(compute, 1),
-        self._compile_trisc(compute, 2),
-      ),
+  def compile_dataflow(self, src: str, *, processor: str, noc_index: int | None = None) -> CompiledKernel:
+    if processor not in ("brisc", "ncrisc"):
+      raise ValueError(f"processor must be 'brisc' or 'ncrisc', got: {processor}")
+    if noc_index is None:
+      noc_index = 1 if processor == "brisc" else 0
+    return self._compile_dataflow(src, processor, noc_index=noc_index)
+
+  def compile_compute(self, src: str) -> tuple[CompiledKernel, CompiledKernel, CompiledKernel]:
+    return (
+      self._compile_trisc(src, 0),
+      self._compile_trisc(src, 1),
+      self._compile_trisc(src, 2),
     )
 
   def _compile_dataflow(self, src: str, target: str, noc_index: int,

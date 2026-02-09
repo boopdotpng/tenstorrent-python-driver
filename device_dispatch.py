@@ -5,7 +5,7 @@ from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import _IO, align_down
 from codegen import CQConfig, compile_cq_kernels
 from dram import DramAllocator
-from device_runtime import CommonDevice, Program, ArgGen
+from device_runtime import CommonDevice, Program, DataflowLaunch, CoreSet, CoreRange, ArgGen
 
 PAGE_SIZE = 4096
 
@@ -14,11 +14,6 @@ def _align_up(n: int, a: int) -> int:
 
 def _pack_noc_xy(x: int, y: int) -> int:
   return ((y << 6) | x) & 0xFFFF
-
-def _pack_noc_mcast_xy(x: int, y: int) -> int:
-  """Encode a 1x1 multicast rectangle (same start/end) for NOC dispatch operations.
-  BH format: [y_start:18][x_start:12][y_end:6][x_end:0], 6 bits each."""
-  return (y << 18) | (x << 12) | (y << 6) | x
 
 @dataclass(frozen=True)
 class _HostCQ:
@@ -513,7 +508,16 @@ class SlowDevice(CommonDevice):
         addr += size
     return mask, as_bytes(arr)
 
-  def _pack_kernel_shared(self, program: Program, rta_sizes: tuple[int, int, int], dispatch_mode: int = DevMsgs.DISPATCH_MODE_HOST):
+  def _pack_kernel_shared(
+    self,
+    program: Program,
+    *,
+    reader,
+    writer,
+    rta_sizes: tuple[int, int, int],
+    dispatch_mode: int = DevMsgs.DISPATCH_MODE_HOST,
+    sem_off: int | None = None,
+  ):
     align16 = lambda n: (n + 15) & ~15
 
     rta_offsets = [0, rta_sizes[0], rta_sizes[0] + rta_sizes[1]]
@@ -521,15 +525,16 @@ class SlowDevice(CommonDevice):
 
     # Semaphore space: num_sems * 16 bytes between per-core args and shared data
     sem_size = program.num_sems * 16
-    sem_off = rta_total
-    shared_off_start = align16(rta_total + sem_size)
+    if sem_off is None:
+      sem_off = rta_total
+    shared_off_start = align16(sem_off + sem_size)
     crta_off = shared_off_start
 
     local_cb_mask, local_cb_blob = self._build_local_cb_blob(program)
     local_cb_off = shared_off_start
     kernel_off = align16(local_cb_off + len(local_cb_blob))
 
-    kernels = {"brisc": program.writer, "ncrisc": program.reader}
+    kernels = {"brisc": writer, "ncrisc": reader}
     if program.compute:
       for i, k in enumerate(program.compute):
         kernels[f"trisc{i}"] = k
@@ -578,10 +583,12 @@ class SlowDevice(CommonDevice):
 
   @staticmethod
   def _pack_rta(reader_args: list[int], writer_args: list[int], compute_args: list[int],
-                num_sems: int = 0) -> bytes:
+                num_sems: int = 0, sem_off: int | None = None) -> bytes:
     pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
     rta = pack(writer_args) + pack(reader_args) + pack(compute_args)
     if num_sems > 0:
+      if sem_off is not None and sem_off > len(rta):
+        rta = rta.ljust(sem_off, b"\0")
       rta += b"\0" * (num_sems * 16)
     return rta
 
@@ -589,16 +596,66 @@ class SlowDevice(CommonDevice):
     return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
 
   @staticmethod
-  def _mcast_rects(cores: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
-    west = [(x, y) for x, y in cores if x < 8]
-    east = [(x, y) for x, y in cores if x >= 10]
-    rects = []
-    for group in (west, east):
-      if group:
-        xs = [x for x, _ in group]
-        ys = [y for _, y in group]
-        rects.append((min(xs), max(xs), min(ys), max(ys)))
-    return rects
+  def _resolve_core_spec(spec: CoreSet | CoreRange | list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if isinstance(spec, CoreSet):
+      return spec.cores()
+    if isinstance(spec, CoreRange):
+      return spec.cores()
+    return list(spec)
+
+  def _core_launches(self, program: Program, cores: list[tuple[int, int]]) -> dict[tuple[int, int], tuple[DataflowLaunch, int, int]]:
+    core_set = set(cores)
+    assigned: dict[tuple[int, int], tuple[DataflowLaunch, int, int]] = {}
+    for launch in program.dataflow:
+      role_cores = [c for c in self._resolve_core_spec(launch.cores) if c in core_set]
+      role_n = len(role_cores)
+      for role_i, core in enumerate(role_cores):
+        if core in assigned:
+          raise ValueError(f"core {core} appears in multiple dataflow launches")
+        assigned[core] = (launch, role_i, role_n)
+    missing = [c for c in cores if c not in assigned]
+    if missing:
+      raise ValueError(f"every program core must have a dataflow launch; missing {len(missing)} cores")
+    return assigned
+
+  def _build_rta(
+    self,
+    program: Program,
+    launch: DataflowLaunch,
+    core_idx: int,
+    core_xy: tuple[int, int],
+    num_cores: int,
+    role_idx: int,
+    role_cores: int,
+    sem_off: int | None = None,
+  ) -> tuple[tuple[int, int, int], bytes]:
+    reader_args = self._resolve_args(launch.reader_rt_args, role_idx, core_xy, role_cores)
+    writer_args = self._resolve_args(launch.writer_rt_args, role_idx, core_xy, role_cores)
+    compute_args = self._resolve_args(program.compute_rt_args, core_idx, core_xy, num_cores)
+    rta_sizes = (len(writer_args) * 4, len(reader_args) * 4, len(compute_args) * 4)
+    rta = self._pack_rta(reader_args, writer_args, compute_args, program.num_sems, sem_off=sem_off)
+    return rta_sizes, rta
+
+  def _uniform_sem_off(self, program: Program, cores: list[tuple[int, int]],
+                       launch_by_core: dict) -> int:
+    """Compute a uniform sem_offset across all launches so semaphore L1 addresses match."""
+    align16 = lambda n: (n + 15) & ~15
+    max_rta_total = 0
+    seen = set()
+    for core in cores:
+      launch, role_idx, role_n = launch_by_core[core]
+      lid = id(launch)
+      if lid in seen:
+        continue
+      seen.add(lid)
+      rta_sizes, _ = self._build_rta(program, launch, 0, core, len(cores), role_idx, role_n)
+      rta_total = align16(sum(rta_sizes))
+      max_rta_total = max(max_rta_total, rta_total)
+    return max_rta_total
+
+  @staticmethod
+  def _core_rects(cores: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
+    return [(r.start[0], r.end[0], r.start[1], r.end[1]) for r in CoreSet.from_cores(cores).ranges]
 
   @staticmethod
   def _mcast_write_rects(
@@ -613,70 +670,76 @@ class SlowDevice(CommonDevice):
       for addr, data in writes:
         win.write(addr, data, use_uc=True, restore=False)
 
+  @staticmethod
+  def _rect_to_noc_mcast(rect: tuple[int, int, int, int]) -> tuple[int, int]:
+    x0, x1, y0, y1 = rect
+    noc_xy = (y1 << 18) | (x1 << 12) | (y0 << 6) | x0
+    num_dests = (x1 - x0 + 1) * (y1 - y0 + 1)
+    return noc_xy, num_dests
+
   def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else self.dispatchable_cores
+    if not cores:
+      raise ValueError("program has no cores")
     num_cores = len(cores)
+    launch_by_core = self._core_launches(program, cores)
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
-    reset_blob = as_bytes(reset)
+    reset_blob = as_bytes(reset) + (0).to_bytes(4, "little")
     go = GoMsg()
     go.bits.signal = DevMsgs.RUN_MSG_GO
     go_blob = as_bytes(go)
 
-    # Compute rta sizes from core 0 to determine shared layout
-    first_r = self._resolve_args(program.reader_rt_args, 0, cores[0], num_cores)
-    first_w = self._resolve_args(program.writer_rt_args, 0, cores[0], num_cores)
-    first_c = self._resolve_args(program.compute_rt_args, 0, cores[0], num_cores)
-    rta_sizes = (len(first_w) * 4, len(first_r) * 4, len(first_c) * 4)
-    shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes)
-
     mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
     l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-    rects = self._mcast_rects(cores)
     win = self.win
-    # Mcast shared data: reset GO_MSG, GO_MSG_INDEX, CB config + kernel binaries, LAUNCH
-    self._mcast_write_rects(
-      win,
-      mcast_cfg,
-      rects,
-      [
-        (TensixL1.GO_MSG, reset_blob),
-        (TensixL1.GO_MSG_INDEX, (0).to_bytes(4, "little")),
-        (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img),
-        (TensixL1.LAUNCH, launch_blob),
-      ],
-    )
+    all_rects = self._core_rects(cores)
+    self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, reset_blob)])
 
-    ns = program.num_sems
-    shared_rta = None
-    if (
-      isinstance(program.reader_rt_args, list)
-      and isinstance(program.writer_rt_args, list)
-      and isinstance(program.compute_rt_args, list)
-    ):
-      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args, ns)
+    sem_off = self._uniform_sem_off(program, cores, launch_by_core) if program.num_sems > 0 else None
+    rta_by_core: dict[tuple[int, int], bytes] = {}
+    shared_by_core: dict[tuple[int, int], tuple[int, bytes]] = {}
+    launch_by_core_blob: dict[tuple[int, int], bytes] = {}
+    shared_cache: dict[tuple[object, object, int, int, int, int], tuple[int, bytes, bytes]] = {}
+    for core_idx, core in enumerate(cores):
+      launch, role_idx, role_n = launch_by_core[core]
+      rta_sizes, rta = self._build_rta(program, launch, core_idx, core, num_cores, role_idx, role_n, sem_off=sem_off)
+      key = (launch.reader, launch.writer, rta_sizes[0], rta_sizes[1], rta_sizes[2], DevMsgs.DISPATCH_MODE_HOST)
+      if key not in shared_cache:
+        shared_cache[key] = self._pack_kernel_shared(
+          program,
+          reader=launch.reader,
+          writer=launch.writer,
+          rta_sizes=rta_sizes,
+          dispatch_mode=DevMsgs.DISPATCH_MODE_HOST,
+          sem_off=sem_off,
+        )[:3]
+      shared_off, shared_img, launch_blob = shared_cache[key]
+      rta_by_core[core] = rta
+      shared_by_core[core] = (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img)
+      launch_by_core_blob[core] = launch_blob
 
-    # Unicast per-core runtime args
-    for core_idx, (x, y) in enumerate(cores):
-      if shared_rta is None:
-        reader_args = self._resolve_args(program.reader_rt_args, core_idx, (x, y), num_cores)
-        writer_args = self._resolve_args(program.writer_rt_args, core_idx, (x, y), num_cores)
-        compute_args = self._resolve_args(program.compute_rt_args, core_idx, (x, y), num_cores)
-        rta = self._pack_rta(reader_args, writer_args, compute_args, ns)
-      else:
-        rta = shared_rta
-      l1_cfg.start = l1_cfg.end = (x, y)
-      win.configure(l1_cfg)
-      win.write(TensixL1.KERNEL_CONFIG_BASE, rta, use_uc=True, restore=False)
+    def grouped_writes(payload_by_core: dict[tuple[int, int], bytes], addr: int):
+      groups: dict[bytes, list[tuple[int, int]]] = {}
+      for core, payload in payload_by_core.items():
+        groups.setdefault(payload, []).append(core)
+      for payload, group_cores in groups.items():
+        self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
 
-    # Dispatch: multicast GO_MSG to all cores
+    grouped_writes(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
+    grouped_writes(launch_by_core_blob, TensixL1.LAUNCH)
+
+    shared_groups: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
+    for core, payload in shared_by_core.items():
+      shared_groups.setdefault(payload, []).append(core)
+    for (addr, payload), group_cores in shared_groups.items():
+      self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
+
     t_dispatch_start = time.perf_counter()
-    self._mcast_write_rects(win, mcast_cfg, rects, [(TensixL1.GO_MSG, go_blob)])
+    self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, go_blob)])
     t_compute_start = time.perf_counter()
 
-    # Wait for all cores to complete (unicast poll)
-    l1_cfg.mcast = False
     for x, y in cores:
       l1_cfg.start = l1_cfg.end = (x, y)
       win.configure(l1_cfg)
@@ -877,26 +940,15 @@ class FastDevice(SlowDevice):
 
     time.sleep(0.3)
 
-  def _mcast_dests(self, cores: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Compute NOC mcast destinations for packed_large, avoiding dispatch cores.
-    Returns list of (noc_xy_mcast, num_dests) tuples. NOC 1 encoding (start=max, end=min)."""
-    dispatch_col = self.prefetch_core[0]
-    dispatch_set = {self.prefetch_core, self.dispatch_core}
-    west = [(x, y) for x, y in cores if x < 8]
-    east_safe = [(x, y) for x, y in cores if x >= 10 and x != dispatch_col]
-    col_cores = sorted([(x, y) for x, y in cores if x == dispatch_col and (x, y) not in dispatch_set])
-    dests = []
-    for group in (west, east_safe, col_cores):
-      if group:
-        xs = [x for x, _ in group]
-        ys = [y for _, y in group]
-        noc_xy = (max(ys) << 18) | (max(xs) << 12) | (min(ys) << 6) | min(xs)
-        dests.append((noc_xy, len(group)))
-    return dests
+  def _packed_large_dests(self, cores: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    return [self._rect_to_noc_mcast(rect) for rect in self._core_rects(cores)]
 
   def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else self.dispatchable_cores
+    if not cores:
+      raise ValueError("program has no cores")
     num_cores = len(cores)
+    launch_by_core = self._core_launches(program, cores)
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -909,44 +961,52 @@ class FastDevice(SlowDevice):
     go.bits.master_y = self.dispatch_core[1]
     go.bits.signal = DevMsgs.RUN_MSG_GO
 
-    first_r = self._resolve_args(program.reader_rt_args, 0, cores[0], num_cores)
-    first_w = self._resolve_args(program.writer_rt_args, 0, cores[0], num_cores)
-    first_c = self._resolve_args(program.compute_rt_args, 0, cores[0], num_cores)
-    rta_sizes = (len(first_w) * 4, len(first_r) * 4, len(first_c) * 4)
     dispatch_mode = DevMsgs.DISPATCH_MODE_DEV  # always DEV for testing
-    shared_off, shared_img, launch_blob, _ = self._pack_kernel_shared(program, rta_sizes, dispatch_mode=dispatch_mode)
-
     go_msg_index_zero = (0).to_bytes(4, "little")
-
-    # Build per-core RTA payloads
-    ns = program.num_sems
-    shared_rta = None
-    if (
-      isinstance(program.reader_rt_args, list)
-      and isinstance(program.writer_rt_args, list)
-      and isinstance(program.compute_rt_args, list)
-    ):
-      shared_rta = self._pack_rta(program.reader_rt_args, program.writer_rt_args, program.compute_rt_args, ns)
-
-    if shared_rta is not None:
-      rta_payloads = shared_rta  # uniform: single bytes, NO_STRIDE
-    else:
-      rta_payloads = [
-        self._pack_rta(
-          self._resolve_args(program.reader_rt_args, i, cores[i], num_cores),
-          self._resolve_args(program.writer_rt_args, i, cores[i], num_cores),
-          self._resolve_args(program.compute_rt_args, i, cores[i], num_cores),
-          ns,
-        ) for i in range(num_cores)
-      ]
-
-    # Dispatch via CQ packed writes (RTA + launch + GO as packed, shared_img as packed_large)
-    mcast_dests = self._mcast_dests(cores)
+    mcast_dests = self._packed_large_dests(cores)
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=go_msg_index_zero)
-    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.KERNEL_CONFIG_BASE, data=rta_payloads)
-    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.KERNEL_CONFIG_BASE + shared_off, data=shared_img)
-    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.LAUNCH, data=launch_blob)
+
+    sem_off = self._uniform_sem_off(program, cores, launch_by_core) if program.num_sems > 0 else None
+    rta_by_core: dict[tuple[int, int], bytes] = {}
+    shared_by_core: dict[tuple[int, int], tuple[int, bytes]] = {}
+    launch_by_core_blob: dict[tuple[int, int], bytes] = {}
+    shared_cache: dict[tuple[object, object, int, int, int, int], tuple[int, bytes, bytes]] = {}
+    for core_idx, core in enumerate(cores):
+      launch, role_idx, role_n = launch_by_core[core]
+      rta_sizes, rta = self._build_rta(program, launch, core_idx, core, num_cores, role_idx, role_n, sem_off=sem_off)
+      key = (launch.reader, launch.writer, rta_sizes[0], rta_sizes[1], rta_sizes[2], dispatch_mode)
+      if key not in shared_cache:
+        shared_cache[key] = self._pack_kernel_shared(
+          program,
+          reader=launch.reader,
+          writer=launch.writer,
+          rta_sizes=rta_sizes,
+          dispatch_mode=dispatch_mode,
+          sem_off=sem_off,
+        )[:3]
+      shared_off, shared_img, launch_blob = shared_cache[key]
+      rta_by_core[core] = rta
+      shared_by_core[core] = (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img)
+      launch_by_core_blob[core] = launch_blob
+
+    def write_packed_by_size(payload_by_core: dict[tuple[int, int], bytes], addr: int):
+      by_size: dict[int, list[tuple[tuple[int, int], bytes]]] = {}
+      for core, payload in payload_by_core.items():
+        by_size.setdefault(len(payload), []).append((core, payload))
+      for entries in by_size.values():
+        group_cores = [core for core, _ in entries]
+        group_payloads = [payload for _, payload in entries]
+        self._cq.enqueue_write_packed(cores=group_cores, addr=addr, data=group_payloads)
+
+    write_packed_by_size(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
+    write_packed_by_size(launch_by_core_blob, TensixL1.LAUNCH)
+    shared_groups: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
+    for core, payload in shared_by_core.items():
+      shared_groups.setdefault(payload, []).append(core)
+    for (addr, payload), group_cores in shared_groups.items():
+      self._cq.enqueue_write_packed_large(dests=self._packed_large_dests(group_cores), addr=addr, data=payload)
+
     t_dispatch_start = time.perf_counter()
     # CQ wait path: dispatch sends GO + waits for worker completion + notifies host
     noc_words = [(y << 6) | x for x, y in cores]

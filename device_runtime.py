@@ -11,12 +11,61 @@ from helpers import align_down, generate_jal_instruction
 ArgGen = Callable[[int, tuple[int, int], int], list[int]]
 
 @dataclass
-class Program:
-  reader: CompiledKernel | None
-  writer: CompiledKernel | None
-  compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel] | None
+class CoreRange:
+  start: tuple[int, int]
+  end: tuple[int, int]
+
+  def __post_init__(self):
+    x0, y0 = self.start
+    x1, y1 = self.end
+    self.start = (min(x0, x1), min(y0, y1))
+    self.end = (max(x0, x1), max(y0, y1))
+
+  def cores(self) -> list[tuple[int, int]]:
+    x0, y0 = self.start
+    x1, y1 = self.end
+    return [(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)]
+
+@dataclass
+class CoreSet:
+  ranges: list[CoreRange]
+
+  @staticmethod
+  def from_cores(cores: list[tuple[int, int]]) -> "CoreSet":
+    remaining = set(cores)
+    ranges: list[CoreRange] = []
+    while remaining:
+      x0, y0 = min(remaining, key=lambda xy: (xy[1], xy[0]))
+      x1 = x0
+      while (x1 + 1, y0) in remaining:
+        x1 += 1
+      y1 = y0
+      while all((x, y1 + 1) in remaining for x in range(x0, x1 + 1)):
+        y1 += 1
+      for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+          remaining.remove((x, y))
+      ranges.append(CoreRange((x0, y0), (x1, y1)))
+    return CoreSet(ranges=ranges)
+
+  def cores(self) -> list[tuple[int, int]]:
+    out: set[tuple[int, int]] = set()
+    for r in self.ranges:
+      out.update(r.cores())
+    return sorted(out, key=lambda xy: (xy[1], xy[0]))
+
+@dataclass
+class DataflowLaunch:
+  cores: CoreSet | CoreRange | list[tuple[int, int]]
   reader_rt_args: list[int] | ArgGen
   writer_rt_args: list[int] | ArgGen
+  reader: CompiledKernel | None = None
+  writer: CompiledKernel | None = None
+
+@dataclass
+class Program:
+  dataflow: list[DataflowLaunch]
+  compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel] | None
   compute_rt_args: list[int] | ArgGen
   cbs: list[int]
   tile_size: int

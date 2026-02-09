@@ -1,4 +1,4 @@
-from device_runtime import Program, TileGrid, ArgGen
+from device_runtime import Program, DataflowLaunch, CoreSet, CoreRange, TileGrid, ArgGen
 from device_dispatch import SlowDevice, FastDevice
 from helpers import USE_SLOW_DISPATCH
 
@@ -20,4 +20,6 @@ class Device:
   def close(self):
     self._impl.close()
 
-__all__ = ["ArgGen", "Program", "TileGrid", "SlowDevice", "FastDevice", "Device"]
+__all__ = [
+  "ArgGen", "Program", "DataflowLaunch", "CoreSet", "CoreRange", "TileGrid", "SlowDevice", "FastDevice", "Device"
+]

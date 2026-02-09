@@ -192,7 +192,7 @@ class DramAllocator:
     n_tiles = (len(data) + buf.page_size - 1) // buf.page_size
     sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
 
-    from device_runtime import Program, TileGrid
+    from device_runtime import Program, DataflowLaunch, TileGrid
     dev = getattr(self._run_fn, "__self__", None)
     if dev is not None and hasattr(dev, "dispatchable_cores"):
       all_cores = list(dev.dispatchable_cores)
@@ -210,9 +210,13 @@ class DramAllocator:
       return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size]
 
     program = Program(
-      reader=fill, writer=None, compute=None,
-      reader_rt_args=reader_args, writer_rt_args=[], compute_rt_args=[],
-      cbs=[0], tile_size=buf.page_size, num_pages=2, cores=cores,
+      dataflow=[DataflowLaunch(cores=cores, reader=fill, reader_rt_args=reader_args, writer_rt_args=[])],
+      compute=None,
+      compute_rt_args=[],
+      cbs=[0],
+      tile_size=buf.page_size,
+      num_pages=2,
+      cores=cores,
     )
     self._run_fn(program, timing=False)
 
@@ -239,7 +243,7 @@ class DramAllocator:
     n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
     sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
 
-    from device_runtime import Program, TileGrid
+    from device_runtime import Program, DataflowLaunch, TileGrid
     dev = getattr(self._run_fn, "__self__", None)
     if dev is not None and hasattr(dev, "dispatchable_cores"):
       all_cores = list(dev.dispatchable_cores)
@@ -257,9 +261,13 @@ class DramAllocator:
       return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size]
 
     program = Program(
-      reader=drain, writer=None, compute=None,
-      reader_rt_args=reader_args, writer_rt_args=[], compute_rt_args=[],
-      cbs=[0], tile_size=buf.page_size, num_pages=2, cores=cores,
+      dataflow=[DataflowLaunch(cores=cores, reader=drain, reader_rt_args=reader_args, writer_rt_args=[])],
+      compute=None,
+      compute_rt_args=[],
+      cbs=[0],
+      tile_size=buf.page_size,
+      num_pages=2,
+      cores=cores,
     )
     self._run_fn(program, timing=False)
     result = bytes(sm.buf[:buf.size])

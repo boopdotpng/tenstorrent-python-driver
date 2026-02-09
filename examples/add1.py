@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
 from codegen import Compiler
-from device import Device, Program
+from device import Device, Program, DataflowLaunch, CoreSet
 from dram import DType
 
 K_READER = r"""
@@ -100,7 +100,10 @@ def _make_bf16_buffer(n_tiles: int, *, seed: int = 0) -> bytes:
   return bytes(out)
 
 def main():
-  kernels = Compiler().compile(K_READER, K_WRITER, K_COMPUTE)
+  compiler = Compiler()
+  reader = compiler.compile_dataflow(K_READER, processor="ncrisc")
+  writer = compiler.compile_dataflow(K_WRITER, processor="brisc")
+  compute = compiler.compile_compute(K_COMPUTE)
   device = Device()
   try:
     num_cores = len(device.dispatchable_cores)
@@ -135,11 +138,14 @@ def main():
       return [count]
 
     program = Program(
-      reader=kernels.reader,
-      writer=kernels.writer,
-      compute=kernels.compute,
-      reader_rt_args=reader_args,
-      writer_rt_args=writer_args,
+      dataflow=[DataflowLaunch(
+        cores=CoreSet.from_cores(device.dispatchable_cores),
+        reader=reader,
+        writer=writer,
+        reader_rt_args=reader_args,
+        writer_rt_args=writer_args,
+      )],
+      compute=compute,
       compute_rt_args=compute_args,
       cbs=[0, 16],
       tile_size=tile_size_bytes,
