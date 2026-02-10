@@ -8,8 +8,10 @@ Roles follow TTNN-style partitioning with per-role kernels on disjoint core sets
 from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import time
+import numpy as np
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
 from device import Device, Program, DataflowLaunch, CoreSet
+from dram import DType
 
 # Matrix dimensions tuned for 10x11 core grid
 M, K, N = 5120, 4096, 5632
@@ -35,13 +37,14 @@ CB0_PAGES = 2 * IN0_BLOCK_NUM_TILES
 CB1_PAGES = 2 * IN1_BLOCK_NUM_TILES
 CB16_PAGES = PER_CORE_M * PER_CORE_N
 CB24_PAGES = CB16_PAGES
+OUT_BLOCK_NUM_TILES = PER_CORE_M * PER_CORE_N
 
 IN0_SEND_SEM, IN0_RECV_SEM = 0, 1
 IN1_SEND_SEM, IN1_RECV_SEM = 2, 3
 NUM_SEMS = 4
 
-WARMUP_ITERS = 2
-TIMED_ITERS = 5
+WARMUP_ITERS = 3
+TIMED_ITERS = 1
 
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
 K_READER_SENDER = f"""
@@ -372,6 +375,7 @@ void MAIN {{
   constexpr uint32_t out_subblock_h = {OUT_SUBBLOCK_H};
   constexpr uint32_t out_subblock_w = {OUT_SUBBLOCK_W};
   constexpr uint32_t out_subblock_num_tiles = {OUT_SUBBLOCK_NUM_TILES};
+  constexpr uint32_t out_block_num_tiles = {OUT_BLOCK_NUM_TILES};
 
   constexpr uint32_t transpose = 0;
 
@@ -379,7 +383,6 @@ void MAIN {{
     tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_16,
     transpose, out_subblock_w, out_subblock_h, in0_block_w);
 
-  bool spill = num_blocks > 1;
   bool enable_reload = false;
   uint32_t out_num_tiles_to_wait = out_subblock_num_tiles;
 
@@ -393,7 +396,7 @@ void MAIN {{
     for (uint32_t in0_sb = 0; in0_sb < in0_num_subblocks; in0_sb++) {{
       int in1_index_subblock_offset = 0;
       for (uint32_t in1_sb = 0; in1_sb < in1_num_subblocks; in1_sb++) {{
-        acquire_dst();
+        tile_regs_acquire();
 
         if (enable_reload) {{
           copy_tile_to_dst_init_short(tt::CBIndex::c_24);
@@ -419,13 +422,16 @@ void MAIN {{
             in0_tile_index, in1_tile_index,
             0, transpose, out_subblock_w, out_subblock_h, in0_block_w);
         }}
-
+        tile_regs_commit();
         if (last_out) {{
           cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
+          tile_regs_wait();
+          PACK((llk_pack_reconfig_l1_acc(0)));
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             pack_tile(i, tt::CBIndex::c_16);
           }}
+          tile_regs_release();
           cb_push_back(tt::CBIndex::c_16, out_subblock_num_tiles);
         }} else {{
           if (block == 0) {{
@@ -433,20 +439,30 @@ void MAIN {{
             out_num_tiles_to_wait += out_subblock_num_tiles;
           }}
           cb_reserve_back(tt::CBIndex::c_24, out_subblock_num_tiles);
+          tile_regs_wait();
+          if (block == 0) {{
+            PACK((llk_pack_reconfig_l1_acc(0)));
+          }} else if (block == 1) {{
+            PACK((llk_pack_reconfig_l1_acc(1)));
+          }}
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             pack_tile(i, tt::CBIndex::c_24);
           }}
+          tile_regs_release();
           cb_push_back(tt::CBIndex::c_24, out_subblock_num_tiles);
         }}
 
-        release_dst();
         in1_index_subblock_offset += out_subblock_w;
       }}
       in0_index_subblock_offset += in0_subblock_num_tiles;
     }}
 
-    if (spill) enable_reload = true;
+    if (block < num_blocks - 2) {{
+      cb_wait_front(tt::CBIndex::c_24, out_block_num_tiles);
+      cb_pop_front(tt::CBIndex::c_24, out_block_num_tiles);
+    }}
+    if (block == num_blocks - 2) enable_reload = true;
 
     cb_pop_front(tt::CBIndex::c_0, in0_block_num_tiles);
     cb_pop_front(tt::CBIndex::c_1, in1_block_num_tiles);
@@ -477,9 +493,35 @@ def _mcast_rect_args(x_list: list[int], y: int):
     return (0, 0, 0, 0, 0)
   return (min(x_list), y, max(x_list), y, len(x_list))
 
+def _f16_to_bf16_bytes(x: np.ndarray) -> bytes:
+  # Convert f16 values to f32 first, then truncate mantissa to bf16 encoding.
+  u32 = np.ascontiguousarray(x, dtype=np.float16).astype(np.float32).view(np.uint32)
+  return (u32 >> 16).astype(np.uint16).tobytes()
+
+def _bf16_bytes_to_f32(data: bytes, shape: tuple[int, ...]) -> np.ndarray:
+  u16 = np.frombuffer(data, dtype=np.uint16)
+  u32 = (u16.astype(np.uint32) << 16)
+  return u32.view(np.float32).reshape(shape)
+
+def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes):
+  c_ref = a @ b
+  c_got = _bf16_bytes_to_f32(c_bytes, (M, N))
+  ref_flat = c_ref.reshape(-1)
+  got_flat = c_got.reshape(-1)
+  finite_mask = np.isfinite(got_flat)
+  if not np.all(finite_mask):
+    bad = int(got_flat.size - np.count_nonzero(finite_mask))
+    raise SystemExit(f"Validation failed: output has {bad} non-finite values")
+  pcc = float(np.corrcoef(ref_flat, got_flat)[0, 1])
+  rel_l2 = float(np.linalg.norm(got_flat - ref_flat) / (np.linalg.norm(ref_flat) + 1e-12))
+  max_abs = float(np.max(np.abs(got_flat - ref_flat)))
+  print(f"Validation: PCC={pcc:.6f}, rel_l2={rel_l2:.6f}, max_abs={max_abs:.6f}")
+  if pcc < 0.995 or rel_l2 > 0.08:
+    raise SystemExit(f"Validation failed: PCC={pcc:.6f}, rel_l2={rel_l2:.6f}")
+
 
 def main():
-  print(f"Matmul Peak (4-role split): C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] (bf16, LoFi)")
+  print(f"Matmul Peak (4-role split): C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] (bf16, HiFi2)")
   print(f"  Mt={Mt} Kt={Kt} Nt={Nt} grid={NUM_ROWS}x{NUM_COLS}")
   print(f"  per_core_M={PER_CORE_M} per_core_N={PER_CORE_N} in0_block_w={IN0_BLOCK_W} num_blocks={NUM_BLOCKS}")
   print(f"  subblock: {OUT_SUBBLOCK_H}h x {OUT_SUBBLOCK_W}w = {OUT_SUBBLOCK_NUM_TILES} tiles")
@@ -487,7 +529,7 @@ def main():
   cfg = CkernelConfig(
     input_format=DataFormat.Float16_b,
     output_format=DataFormat.Float16_b,
-    math_fidelity=MathFidelity.LoFi,
+    math_fidelity=MathFidelity.HiFi2,
   )
   compiler = Compiler(cfg)
   reader_sender = compiler.compile_dataflow(K_READER_SENDER, processor="ncrisc")
@@ -510,9 +552,24 @@ def main():
     west_cols = [x for x in cols if x < 8]
     east_cols = [x for x in cols if x >= 10]
 
-    a_buf = device.dram.alloc(TILE_BYTES * Mt * Kt, name="A", page_size=TILE_BYTES)
-    b_buf = device.dram.alloc(TILE_BYTES * Kt * Nt, name="B", page_size=TILE_BYTES)
-    c_buf = device.dram.alloc(TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES)
+    rng_a = np.random.default_rng(42)
+    rng_b = np.random.default_rng(123)
+    a_src = rng_a.uniform(-0.5, 0.5, size=(M, K)).astype(np.float16)
+    b_src = rng_b.uniform(-0.5, 0.5, size=(K, N)).astype(np.float16)
+    a_bytes = _f16_to_bf16_bytes(a_src)
+    b_bytes = _f16_to_bf16_bytes(b_src)
+    a_ref = _bf16_bytes_to_f32(a_bytes, (M, K))
+    b_ref = _bf16_bytes_to_f32(b_bytes, (K, N))
+
+    a_buf = device.dram.alloc_write(
+      a_bytes, name="A", page_size=TILE_BYTES, dtype=DType.bfloat16, shape=(M, K)
+    )
+    b_buf = device.dram.alloc_write(
+      b_bytes, name="B", page_size=TILE_BYTES, dtype=DType.bfloat16, shape=(K, N)
+    )
+    c_buf = device.dram.alloc(
+      TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES, dtype=DType.bfloat16, shape=(M, N)
+    )
 
     core_to_rc = {grid[r][c]: (r, c) for r in range(NUM_ROWS) for c in range(NUM_COLS)}
     top_left = [grid[0][0]]
@@ -629,12 +686,14 @@ def main():
     tflops_wall = flops / elapsed_wall / 1e12
     tflops_total = flops / elapsed_total / 1e12
     tflops_compute = flops / elapsed_compute / 1e12
-    print(f"\nAvg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
+    print(f"\nAvg latency (compute): {elapsed_compute * 1e3:.3f} ms")
+    print(f"Throughput (compute):  {tflops_compute:.2f} TFLOPS (HiFi2 bf16, {NUM_ROWS * NUM_COLS} cores)")
+    print(f"Avg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
     print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS")
-    print(f"\nAvg latency (total):   {elapsed_total * 1e3:.3f} ms")
-    print(f"Throughput (total):    {tflops_total:.2f} TFLOPS (LoFi bf16, {NUM_ROWS * NUM_COLS} cores)")
-    print(f"Avg latency (compute): {elapsed_compute * 1e3:.3f} ms")
-    print(f"Throughput (compute):  {tflops_compute:.2f} TFLOPS")
+    print(f"Avg latency (total):   {elapsed_total * 1e3:.3f} ms")
+    print(f"Throughput (total):    {tflops_total:.2f} TFLOPS")
+    c_rm = device.dram.read(c_buf)
+    _validate_matmul(a_ref, b_ref, c_rm)
 
   finally:
     device.close()
