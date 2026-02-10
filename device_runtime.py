@@ -102,6 +102,7 @@ class CommonDevice:
       os.close(self.fd)
       raise SystemExit(f"unsupported blackhole device {self.arch}; p100a only for now")
     self._assert_arc_booted()
+    self._set_power_state_busy()
     self.harvested_dram = self.get_harvested_dram_bank()
     self.tiles = TileGrid(self.harvested_dram)
     self.worker_cores = [core for core in TileGrid.TENSIX if self._core_exists(core)]
@@ -313,6 +314,12 @@ class CommonDevice:
       raise RuntimeError(f"ARC not booted (SCRATCH_RAM_2=0x{status:08x}, expected (status&0x7)==0x5)")
 
   def get_harvested_dram_bank(self) -> int:
+    gddr_enabled = self._read_arc_telem_tag(Arc.TAG_GDDR_ENABLED, Arc.DEFAULT_GDDR_ENABLED)
+    dram_off = [bank for bank in range(Dram.BANK_COUNT) if ((gddr_enabled >> bank) & 1) == 0]
+    assert len(dram_off) == 1, f"expected 1 harvested dram bank, got {dram_off}"
+    return dram_off[0]
+
+  def _read_arc_telem_tag(self, tag: int, default: int) -> int:
     tlb_config = TLBConfig(addr=Arc.NOC_BASE, start=TileGrid.ARC, end=TileGrid.ARC, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, tlb_config) as arc:
       telem_struct_addr = arc.read32(Arc.SCRATCH_RAM_13)
@@ -329,14 +336,24 @@ class CommonDevice:
         tag_offset = arc.read32(tags_base + i * 4)
         tag_to_offset[tag_offset & 0xFFFF] = (tag_offset >> 16) & 0xFFFF
 
-      def read_tag(tag: int, default: int) -> int:
-        off = tag_to_offset.get(tag)
-        return default if off is None else arc.read32(data_base + off * 4)
+      off = tag_to_offset.get(tag)
+      return default if off is None else arc.read32(data_base + off * 4)
 
-      gddr_enabled = read_tag(Arc.TAG_GDDR_ENABLED, Arc.DEFAULT_GDDR_ENABLED)
-    dram_off = [bank for bank in range(Dram.BANK_COUNT) if ((gddr_enabled >> bank) & 1) == 0]
-    assert len(dram_off) == 1, f"expected 1 harvested dram bank, got {dram_off}"
-    return dram_off[0]
+  def _set_power_state_busy(self, timeout_s: float = 2.0):
+    self.arc_msg(Arc.MSG_AICLK_GO_BUSY, 0, 0, timeout_ms=1000)
+    deadline = time.monotonic() + timeout_s
+    aiclk = self._read_arc_telem_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK)
+    while time.monotonic() < deadline and aiclk <= Arc.DEFAULT_AICLK:
+      time.sleep(0.01)
+      aiclk = self._read_arc_telem_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK)
+    if aiclk <= Arc.DEFAULT_AICLK:
+      raise RuntimeError(f"AICLK failed to enter busy state (last={aiclk} MHz)")
+
+  def _set_power_state_idle(self):
+    try:
+      self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
+    except Exception:
+      pass
 
   def _close(self):
     if hasattr(self, "dram"): self.dram.close()
@@ -391,4 +408,6 @@ class CommonDevice:
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
 
   def close(self):
+    if hasattr(self, "fd"):
+      self._set_power_state_idle()
     self._close()

@@ -75,7 +75,11 @@ class Arc:
   SCRATCH_RAM_2 = RESET_UNIT_OFFSET + 0x408
   SCRATCH_RAM_11 = RESET_UNIT_OFFSET + 0x42C
   SCRATCH_RAM_13 = RESET_UNIT_OFFSET + 0x434
+  MSG_AICLK_GO_BUSY = 0x52
+  MSG_AICLK_GO_LONG_IDLE = 0x54
+  TAG_AICLK = 14
   TAG_GDDR_ENABLED = 36
+  DEFAULT_AICLK = 800
   DEFAULT_GDDR_ENABLED = 0xFF
 
 # -- DRAM banks ----------------------------------------------------------------

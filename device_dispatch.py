@@ -823,6 +823,7 @@ class FastDevice(SlowDevice):
     )
     self._event_id = 1
     self._program_cache: dict[int, _CachedRun] = {}
+    self._go_signal_noc_words: tuple[int, ...] | None = None
     self._start_dispatch_cores()
     time.sleep(0.3)  # give dispatch firmware time to init
 
@@ -962,11 +963,19 @@ class FastDevice(SlowDevice):
   def _packed_large_dests(self, cores: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return [self._rect_to_noc_mcast(rect) for rect in self._core_rects(cores)]
 
+  def _ensure_go_signal_noc_data(self, cores: list[tuple[int, int]]):
+    noc_words = tuple((y << 6) | x for x, y in cores)
+    if self._go_signal_noc_words == noc_words:
+      return
+    self._cq.enqueue_set_go_signal_noc_data(noc_words=list(noc_words))
+    self._go_signal_noc_words = noc_words
+
   def _build_cq_stream(self, program: Program) -> _CachedRun:
     """Build cold (full upload) and hot (minimal repeat) CQ streams."""
     cores = program.cores if program.cores is not None else self.dispatchable_cores
     num_cores = len(cores)
     launch_by_core = self._core_launches(program, cores)
+    self._ensure_go_signal_noc_data(cores)
 
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -1019,9 +1028,7 @@ class FastDevice(SlowDevice):
     for (addr, payload), group_cores in shared_groups.items():
       self._cq.enqueue_write_packed_large(dests=self._packed_large_dests(group_cores), addr=addr, data=payload)
 
-    noc_words = [(y << 6) | x for x, y in cores]
     self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)
-    self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
     self._cq.enqueue_send_go_signal(
       go_signal=go.all, wait_stream=48, wait_count=0,
       num_unicast_txns=num_cores, noc_data_start_index=0)
@@ -1034,8 +1041,6 @@ class FastDevice(SlowDevice):
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=(0).to_bytes(4, "little"))
     write_packed_by_size(launch_by_core_blob, TensixL1.LAUNCH)
-    self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)
-    self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
     self._cq.enqueue_send_go_signal(
       go_signal=go.all, wait_stream=48, wait_count=0,
       num_unicast_txns=num_cores, noc_data_start_index=0)

@@ -30,6 +30,8 @@ class MathFidelity(Enum):
 class CkernelConfig:
   input_format: DataFormat = DataFormat.Float16_b
   output_format: DataFormat = DataFormat.Float16_b
+  # Optional per-CB format overrides, e.g. ((24, DataFormat.Float32),)
+  cb_data_formats: tuple[tuple[int, DataFormat], ...] = ()
   math_fidelity: MathFidelity = MathFidelity.HiFi4
   # use faster approximations for SFPU ops (exp, log, sqrt, etc)
   approx: bool = False
@@ -100,8 +102,11 @@ def _ensure_cache_dirs():
 def _hash_bytes(data: bytes) -> str:
   return hashlib.sha256(data).hexdigest()
 
-def _source_target_cache_key(source: str, target: str) -> str:
-  return _hash_bytes(f"{target}\0{source}".encode())
+def _source_target_cache_key(source: str, target: str, *, meta: dict[str, object] | None = None) -> str:
+  if not meta:
+    return _hash_bytes(f"{target}\0{source}".encode())
+  meta_items = tuple((k, meta[k]) for k in sorted(meta))
+  return _hash_bytes(repr((target, source, meta_items)).encode())
 
 def _atomic_copy(src: Path, dst: Path):
   dst.parent.mkdir(parents=True, exist_ok=True)
@@ -241,7 +246,26 @@ class Compiler:
              opt: str, trisc: bool, extra_includes: list[str] | None = None,
              cflags: tuple[str, ...] = _CFLAGS, xip_relocate: bool = False) -> CompiledKernel:
     _ensure_cache_dirs()
-    key = _source_target_cache_key(kern, target)
+    key = _source_target_cache_key(
+      kern,
+      target,
+      meta={
+        "defines": tuple(defines),
+        "extra_objs": tuple(extra_objs),
+        "opt": opt,
+        "trisc": trisc,
+        "extra_includes": tuple(extra_includes or []),
+        "cflags": tuple(cflags),
+        "xip_relocate": xip_relocate,
+        "ckernel_input_format": self._ckernel.input_format.value,
+        "ckernel_output_format": self._ckernel.output_format.value,
+        "ckernel_cb_data_formats": tuple((cb, fmt.value) for cb, fmt in self._ckernel.cb_data_formats),
+        "ckernel_math_fidelity": self._ckernel.math_fidelity.value,
+        "ckernel_approx": self._ckernel.approx,
+        "ckernel_dst_accum_mode": self._ckernel.dst_accum_mode,
+        "ckernel_dst_full_sync": self._ckernel.dst_full_sync,
+      },
+    )
     cached_elf = _KERNEL_CACHE_DIR / f"{target}-{key[:16]}.elf"
     if cached_elf.is_file():
       xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
@@ -310,6 +334,10 @@ class Compiler:
     cfg = self._ckernel
     in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
     formats = [in_fmt] * 16 + [out_fmt] * 16
+    for cb_id, fmt in cfg.cb_data_formats:
+      if not (0 <= cb_id < 32):
+        raise ValueError(f"cb_data_formats has invalid cb_id {cb_id}; expected 0..31")
+      formats[cb_id] = fmt.value
     tile_sizes = [_tile_size(f) for f in formats]
 
     def arr(vals): return ", ".join(str(v) for v in vals)
