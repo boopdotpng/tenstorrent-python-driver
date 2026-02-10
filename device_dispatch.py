@@ -58,6 +58,15 @@ class Program:
   shared_by_core: dict[tuple[int, int], tuple[int, bytes]]
   launch_by_core_blob: dict[tuple[int, int], bytes]
 
+@dataclass(frozen=True)
+class _FastPreparedMeta:
+  image_tag: int
+  mcast_dests: list[tuple[int, int]]
+  noc_words: list[int]
+  rta_groups: list[tuple[list[tuple[int, int]], list[bytes]]]
+  launch_groups: list[tuple[list[tuple[int, int]], list[bytes]]]
+  shared_groups: list[tuple[list[tuple[int, int]], int, bytes]]
+
 def _device_cq_layout(*, prefetch_q_entries: int) -> _DeviceCQ:
   l1_base = FastDispatch.BH_TENSIX_DEFAULT_UNRESERVED
   prefetch_q_rd_ptr_addr = l1_base + FastDispatch.BH_PREFETCH_Q_RD_PTR_OFF
@@ -491,6 +500,8 @@ class SlowDevice(CommonDevice):
     self._prepared_run_cache_limit = 16
     self._prepared_program_cache: dict[tuple[int, tuple[tuple[int, int], ...], int], Program] = {}
     self._prepared_program_cache_limit = 16
+    self._last_dispatch_s: float = 0.0
+    self._pending_sync_cores: tuple[tuple[int, int], ...] | None = None
 
   @staticmethod
   def _tile_ready(win: TLBWindow) -> bool:
@@ -783,8 +794,8 @@ class SlowDevice(CommonDevice):
     num_dests = (x1 - x0 + 1) * (y1 - y0 + 1)
     return noc_xy, num_dests
 
-  def replay(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
-    prepared = program
+  def enqueue(self, program: Program | RuntimeProgram):
+    prepared = self.prepare(program) if isinstance(program, RuntimeProgram) else program
     cores = list(prepared.cores)
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -793,27 +804,14 @@ class SlowDevice(CommonDevice):
     go.bits.signal = DevMsgs.RUN_MSG_GO
     go_blob = as_bytes(go)
 
-    profile = RUN_PROFILE or timing
-    profile_parts: list[tuple[str, float]] = []
     mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
-    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     win = self.win
     all_rects = prepared.all_rects
-    t_profile = time.perf_counter()
     self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, reset_blob)])
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("reset", t_now - t_profile))
-      t_profile = t_now
 
     rta_by_core = prepared.rta_by_core
     shared_by_core = prepared.shared_by_core
     launch_by_core_blob = prepared.launch_by_core_blob
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("build", 0.0))
-      profile_parts.append(("lookup", t_now - t_profile))
-      t_profile = t_now
 
     def grouped_writes(payload_by_core: dict[tuple[int, int], bytes], addr: int):
       groups: dict[bytes, list[tuple[int, int]]] = {}
@@ -823,53 +821,53 @@ class SlowDevice(CommonDevice):
         self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
 
     grouped_writes(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("upload_rta", t_now - t_profile))
-      t_profile = t_now
     grouped_writes(launch_by_core_blob, TensixL1.LAUNCH)
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("upload_launch", t_now - t_profile))
-      t_profile = t_now
 
     shared_groups: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
     for core, payload in shared_by_core.items():
       shared_groups.setdefault(payload, []).append(core)
     for (addr, payload), group_cores in shared_groups.items():
       self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("upload_shared", t_now - t_profile))
-      t_profile = t_now
 
     t_dispatch_start = time.perf_counter()
     self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, go_blob)])
-    t_compute_start = time.perf_counter()
-    if profile:
-      profile_parts.append(("go", t_compute_start - t_dispatch_start))
+    dispatch = time.perf_counter() - t_dispatch_start
+    self._last_dispatch_s = dispatch
+    self._pending_sync_cores = tuple(cores)
 
-    for x, y in cores:
+  def sync(self, *, timing: bool = False) -> float:
+    if self._pending_sync_cores is None:
+      return 0.0
+    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+    t0 = time.perf_counter()
+    for x, y in self._pending_sync_cores:
       l1_cfg.start = l1_cfg.end = (x, y)
-      win.configure(l1_cfg)
+      self.win.configure(l1_cfg)
       deadline = time.perf_counter() + 10.0
-      while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
+      while self.win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
         if time.perf_counter() > deadline:
           raise TimeoutError(f"timeout waiting for core ({x}, {y})")
-
-    t_end = time.perf_counter()
-    if profile:
-      profile_parts.append(("wait", t_end - t_compute_start))
-    dispatch = t_compute_start - t_dispatch_start
-    compute = t_end - t_compute_start
+    compute = time.perf_counter() - t0
+    dispatch = self._last_dispatch_s
+    self._pending_sync_cores = None
     if timing:
       print(f"compute: {compute * 1e3:.3f} ms")
-    if profile:
-      _print_run_profile("slow", profile_parts, total=dispatch + compute, dispatch=dispatch, compute=compute)
-    return dispatch + compute, dispatch
+    if RUN_PROFILE:
+      _print_run_profile("slow", [("dispatch", dispatch), ("wait", compute)],
+                         total=dispatch + compute, dispatch=dispatch, compute=compute)
+    return compute
 
-  def run(self, program: RuntimeProgram, *, timing: bool = False) -> tuple[float, float]:
-    return self.replay(self.prepare(program), timing=timing)
+  def replay(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
+    self.enqueue(program)
+    compute = self.sync(timing=timing)
+    return self._last_dispatch_s + compute, self._last_dispatch_s
+
+  def run(self, program: RuntimeProgram, *, timing: bool = False, wait: bool = True) -> tuple[float, float]:
+    self.enqueue(self.prepare(program))
+    if not wait:
+      return self._last_dispatch_s, self._last_dispatch_s
+    compute = self.sync(timing=timing)
+    return self._last_dispatch_s + compute, self._last_dispatch_s
 
 class FastDevice(SlowDevice):
   DISPATCH_STREAM_INDEX = 48
@@ -920,6 +918,10 @@ class FastDevice(SlowDevice):
       prefetch_q_entries=FastDispatch.PREFETCH_Q_ENTRIES_WORKER_DEFAULT,
     )
     self._event_id = 1
+    self._pending_event_id: int | None = None
+    self._prepared_fast_meta: dict[int, _FastPreparedMeta] = {}
+    self._prepared_fast_meta_limit = 32
+    self._resident_image_tag_by_core: dict[tuple[int, int], int] = {}
     self._start_dispatch_cores()
     time.sleep(0.3)  # give dispatch firmware time to init
 
@@ -927,6 +929,44 @@ class FastDevice(SlowDevice):
     if hasattr(self, "_cq"):
       self._cq.close()
     super().close()
+
+  def _prepare_fast_meta(self, prepared: Program) -> _FastPreparedMeta:
+    key = id(prepared)
+    if (meta := self._prepared_fast_meta.get(key)) is not None:
+      return meta
+
+    def group_writes_by_size(payload_by_core: dict[tuple[int, int], bytes]) -> list[tuple[list[tuple[int, int]], list[bytes]]]:
+      by_size: dict[int, list[tuple[tuple[int, int], bytes]]] = {}
+      for core, payload in payload_by_core.items():
+        by_size.setdefault(len(payload), []).append((core, payload))
+      return [([core for core, _ in entries], [payload for _, payload in entries]) for entries in by_size.values()]
+
+    shared_by_addr_payload: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
+    for core, payload in prepared.shared_by_core.items():
+      shared_by_addr_payload.setdefault(payload, []).append(core)
+    shared_groups = [(self._packed_large_dests(group_cores), addr, payload) for (addr, payload), group_cores in shared_by_addr_payload.items()]
+    meta = _FastPreparedMeta(
+      image_tag=key,
+      mcast_dests=self._packed_large_dests(list(prepared.cores)),
+      noc_words=[(y << 6) | x for x, y in prepared.cores],
+      rta_groups=group_writes_by_size(prepared.rta_by_core),
+      launch_groups=group_writes_by_size(prepared.launch_by_core_blob),
+      shared_groups=shared_groups,
+    )
+    if len(self._prepared_fast_meta) >= self._prepared_fast_meta_limit:
+      self._prepared_fast_meta.pop(next(iter(self._prepared_fast_meta)))
+    self._prepared_fast_meta[key] = meta
+    return meta
+
+  def _is_resident(self, prepared: Program, image_tag: int) -> bool:
+    for core in prepared.cores:
+      if self._resident_image_tag_by_core.get(core) != image_tag:
+        return False
+    return True
+
+  def _mark_resident(self, prepared: Program, image_tag: int):
+    for core in prepared.cores:
+      self._resident_image_tag_by_core[core] = image_tag
 
   def _wait_core_done(self, core: tuple[int, int], timeout_s: float = 2.0):
     """Wait for a core's firmware init to complete (GO_MSG signal = RUN_MSG_DONE)."""
@@ -1062,11 +1102,11 @@ class FastDevice(SlowDevice):
   def prepare(self, program: RuntimeProgram) -> Program:
     return self._prepare_program(program, dispatch_mode=DevMsgs.DISPATCH_MODE_DEV)
 
-  def replay(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
-    prepared = program
+  def enqueue(self, program: Program | RuntimeProgram):
+    prepared = self.prepare(program) if isinstance(program, RuntimeProgram) else program
     cores = list(prepared.cores)
     num_cores = prepared.num_cores
-
+    meta = self._prepare_fast_meta(prepared)
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
     reset_blob = as_bytes(reset)
@@ -1078,75 +1118,39 @@ class FastDevice(SlowDevice):
     go.bits.master_y = self.dispatch_core[1]
     go.bits.signal = DevMsgs.RUN_MSG_GO
 
-    profile = RUN_PROFILE or timing
-    profile_parts: list[tuple[str, float]] = []
-    dispatch_mode = DevMsgs.DISPATCH_MODE_DEV  # always DEV for testing
     go_msg_index_zero = (0).to_bytes(4, "little")
-    mcast_dests = self._packed_large_dests(cores)
-    t_profile = time.perf_counter()
-    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
-    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=go_msg_index_zero)
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("reset", t_now - t_profile))
-      t_profile = t_now
-
-    rta_by_core = prepared.rta_by_core
-    shared_by_core = prepared.shared_by_core
-    launch_by_core_blob = prepared.launch_by_core_blob
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("build", 0.0))
-      profile_parts.append(("lookup", t_now - t_profile))
-      t_profile = t_now
-
-    def write_packed_by_size(payload_by_core: dict[tuple[int, int], bytes], addr: int):
-      by_size: dict[int, list[tuple[tuple[int, int], bytes]]] = {}
-      for core, payload in payload_by_core.items():
-        by_size.setdefault(len(payload), []).append((core, payload))
-      for entries in by_size.values():
-        group_cores = [core for core, _ in entries]
-        group_payloads = [payload for _, payload in entries]
-        self._cq.enqueue_write_packed(cores=group_cores, addr=addr, data=group_payloads)
-
-    write_packed_by_size(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("upload_rta", t_now - t_profile))
-      t_profile = t_now
-    write_packed_by_size(launch_by_core_blob, TensixL1.LAUNCH)
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("upload_launch", t_now - t_profile))
-      t_profile = t_now
-    shared_groups: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
-    for core, payload in shared_by_core.items():
-      shared_groups.setdefault(payload, []).append(core)
-    for (addr, payload), group_cores in shared_groups.items():
-      self._cq.enqueue_write_packed_large(dests=self._packed_large_dests(group_cores), addr=addr, data=payload)
-    if profile:
-      t_now = time.perf_counter()
-      profile_parts.append(("upload_shared", t_now - t_profile))
-      t_profile = t_now
-
+    self._cq.enqueue_write_packed_large(dests=meta.mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
+    self._cq.enqueue_write_packed_large(dests=meta.mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=go_msg_index_zero)
+    for group_cores, group_payloads in meta.rta_groups:
+      self._cq.enqueue_write_packed(cores=group_cores, addr=TensixL1.KERNEL_CONFIG_BASE, data=group_payloads)
+    for group_cores, group_payloads in meta.launch_groups:
+      self._cq.enqueue_write_packed(cores=group_cores, addr=TensixL1.LAUNCH, data=group_payloads)
+    for dests, addr, payload in meta.shared_groups:
+      self._cq.enqueue_write_packed_large(dests=dests, addr=addr, data=payload)
     t_dispatch_start = time.perf_counter()
     # CQ wait path: dispatch sends GO + waits for worker completion + notifies host
-    noc_words = [(y << 6) | x for x, y in cores]
     self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)  # clear stale count
-    self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
+    self._cq.enqueue_set_go_signal_noc_data(noc_words=meta.noc_words)
     self._cq.enqueue_send_go_signal(
       go_signal=go.all, wait_stream=48, wait_count=0,
       num_unicast_txns=num_cores, noc_data_start_index=0)
     self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
     event_id = self._event_id; self._event_id += 1
     self._cq.enqueue_host_event(event_id=event_id)
-    t_compute_start = time.perf_counter()
-    if profile:
-      profile_parts.append(("go_wait_enqueue", t_compute_start - t_dispatch_start))
+    dispatch = time.perf_counter() - t_dispatch_start
+    self._last_dispatch_s = dispatch
+    self._pending_event_id = event_id
+    self._pending_sync_cores = tuple(cores)
+
+  def sync(self, *, timing: bool = False) -> float:
+    if self._pending_event_id is None:
+      return 0.0
 
     # Poll completion queue event marker emitted after dispatch-side WAIT(stream==num_cores)
+    t0 = time.perf_counter()
+    cores = list(self._pending_sync_cores or ())
     try:
-      self._cq.wait_host_event(event_id=event_id, timeout_s=10.0)
+      self._cq.wait_host_event(event_id=self._pending_event_id, timeout_s=10.0)
     except TimeoutError:
       win = self.win
       # Debug: check worker GO_MSG state and launch mode
@@ -1201,13 +1205,25 @@ class FastDevice(SlowDevice):
         v = self._cq._read_prefetch_entry(i)
         if v != 0: print(f"  prefetch_q[{i}] = 0x{v:04x} (not consumed)")
       raise
-    t_end = time.perf_counter()
-    if profile:
-      profile_parts.append(("wait_event", t_end - t_compute_start))
-    dispatch = t_compute_start - t_dispatch_start
-    compute = t_end - t_compute_start
+    compute = time.perf_counter() - t0
+    dispatch = self._last_dispatch_s
+    self._pending_event_id = None
+    self._pending_sync_cores = None
     if timing:
       print(f"compute: {compute * 1e3:.3f} ms")
-    if profile:
-      _print_run_profile("fast", profile_parts, total=dispatch + compute, dispatch=dispatch, compute=compute)
-    return dispatch + compute, dispatch
+    if RUN_PROFILE:
+      _print_run_profile("fast", [("dispatch", dispatch), ("wait_event", compute)],
+                         total=dispatch + compute, dispatch=dispatch, compute=compute)
+    return compute
+
+  def replay(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
+    self.enqueue(program)
+    compute = self.sync(timing=timing)
+    return self._last_dispatch_s + compute, self._last_dispatch_s
+
+  def run(self, program: RuntimeProgram, *, timing: bool = False, wait: bool = True) -> tuple[float, float]:
+    self.enqueue(self.prepare(program))
+    if not wait:
+      return self._last_dispatch_s, self._last_dispatch_s
+    compute = self.sync(timing=timing)
+    return self._last_dispatch_s + compute, self._last_dispatch_s
