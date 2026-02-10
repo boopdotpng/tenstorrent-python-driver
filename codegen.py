@@ -2,12 +2,15 @@ from helpers import pack_xip_elf, load_pt_load, PTLoad
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-import shutil, subprocess, tempfile
+import hashlib, shutil, subprocess, tempfile
 
 # Local bundled dependencies (headers, libs, linker scripts, firmware sources)
 _DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
 _REPO = Path(__file__).resolve().parent
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
+_CACHE = _REPO / ".metal-cache"
+_FW_CACHE_DIR = _CACHE / "firmware"
+_KERNEL_CACHE_DIR = _CACHE / "kernels"
 
 class DataFormat(Enum):
   Float32, Float16, Bfp8, Bfp4, Tf32, Float16_b, Bfp8_b, Bfp4_b = 0, 1, 2, 3, 4, 5, 6, 7
@@ -90,6 +93,22 @@ def _run(exe: Path, args: list[str], cwd: Path):
   if r.returncode != 0:
     raise RuntimeError(f"{exe.name} failed:\n{r.stderr.decode()}")
 
+def _ensure_cache_dirs():
+  _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  _KERNEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _hash_bytes(data: bytes) -> str:
+  return hashlib.sha256(data).hexdigest()
+
+def _source_target_cache_key(source: str, target: str) -> str:
+  return _hash_bytes(f"{target}\0{source}".encode())
+
+def _atomic_copy(src: Path, dst: Path):
+  dst.parent.mkdir(parents=True, exist_ok=True)
+  tmp = dst.with_suffix(dst.suffix + f".tmp.{next(tempfile._get_candidate_names())}")
+  shutil.copy2(src, tmp)
+  tmp.replace(dst)
+
 # === Firmware compiler ===
 
 # Firmware build targets: (source, target_name, defines, mcpu_flags, opt, extra_objs)
@@ -112,6 +131,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
   """Compile all 5 slow-dispatch firmware ELFs from source. Cached after first call."""
   global _fw_cache
   if _fw_cache is not None: return _fw_cache
+  _ensure_cache_dirs()
 
   cc = _SFPI / "riscv-tt-elf-g++"
   assert cc.is_file(), f"missing compiler: {cc}"
@@ -126,26 +146,30 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
   ld_dir = _DEPS / "toolchain" / "blackhole"
   fw_src_dir = _REPO / "firmware"
 
-  cache_dir = Path(tempfile.mkdtemp(prefix="tt-fw-"))
   result: dict[str, CompiledFirmware] = {}
 
   for src_name, target, target_defs, mcpu, opt, extra in _FW_TARGETS:
-    obj = cache_dir / f"{target}.o"
-    elf = cache_dir / f"{target}.elf"
     ld = ld_dir / f"firmware_{target}.ld"
     assert ld.is_file(), f"missing linker script: {ld}"
+    src = fw_src_dir / src_name
+    cache_target = f"{target}_firmware"
+    key = _source_target_cache_key(src.read_text(), cache_target)
+    elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
+    if not elf.is_file():
+      cache_dir = Path(tempfile.mkdtemp(prefix="tt-fw-"))
+      obj = cache_dir / f"{target}.o"
+      out = cache_dir / f"{target}.elf"
+      try:
+        _run(cc, [opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
+                  *common_defines, *target_defs, *includes,
+                  "-c", "-o", str(obj), str(src)], cache_dir)
 
-    # Compile
-    _run(cc, [opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
-              *common_defines, *target_defs, *includes,
-              "-c", "-o", str(obj), str(fw_src_dir / src_name)], cache_dir)
-
-    # Link: tmu-crt0.o + firmware.o + [noc.o] + substitutes.o
-    link_objs = [str(lib / "tmu-crt0.o"), str(obj)]
-    link_objs += [str(lib / o) for o in extra]
-    link_objs.append(str(lib / "substitutes.o"))
-    _run(cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
-              f"-T{ld}", *link_objs, "-o", str(elf)], cache_dir)
+        link_args = [str(lib / "tmu-crt0.o"), str(obj), *(str(lib / o) for o in extra), str(lib / "substitutes.o")]
+        _run(cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
+                  f"-T{ld}", *link_args, "-o", str(out)], cache_dir)
+        _atomic_copy(out, elf)
+      finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     segs = load_pt_load(elf)
     # Text base comes from the first PT_LOAD segment (placed by the linker script)
@@ -216,6 +240,13 @@ class Compiler:
   def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str],
              opt: str, trisc: bool, extra_includes: list[str] | None = None,
              cflags: tuple[str, ...] = _CFLAGS, xip_relocate: bool = False) -> CompiledKernel:
+    _ensure_cache_dirs()
+    key = _source_target_cache_key(kern, target)
+    cached_elf = _KERNEL_CACHE_DIR / f"{target}-{key[:16]}.elf"
+    if cached_elf.is_file():
+      xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
+      return CompiledKernel(xip=xip, xip_text_bytes=text_size)
+
     build = Path(tempfile.mkdtemp(prefix=f"tt-{target}-"))
     try:
       # Get the compiled firmware ELF for this target (for --just-symbols)
@@ -237,8 +268,9 @@ class Compiler:
       objs = ["out.o", *extra_objs, str(_DEPS / "lib/blackhole/substitutes.o")]
       _run(self._cc, [opt, *cflags, *_LFLAGS, *mcpu, f"-T{ld}",
                 "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw}", *objs, "-o", "out.elf"], build)
+      _atomic_copy(build / "out.elf", cached_elf)
 
-      xip, text_size = pack_xip_elf(build / "out.elf", xip_relocate=xip_relocate)
+      xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
       return CompiledKernel(xip=xip, xip_text_bytes=text_size)
     finally:
       shutil.rmtree(build, ignore_errors=True)
