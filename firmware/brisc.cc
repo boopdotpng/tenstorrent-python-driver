@@ -25,7 +25,6 @@
 #include "internal/circular_buffer_init.h"
 #include "api/dataflow/dataflow_api.h"
 #include "dev_mem_map.h"
-#include "noc_overlay_parameters.h"
 
 #include "internal/debug/watcher_common.h"
 #include "api/debug/waypoint.h"
@@ -166,13 +165,10 @@ void set_deassert_addresses() {
 }
 
 void device_setup() {
-    instrn_buf[0] = core.instrn_buf_base(0);
-    instrn_buf[1] = core.instrn_buf_base(1);
-    instrn_buf[2] = core.instrn_buf_base(2);
-
-    pc_buf[0] = core.pc_buf_base(0);
-    pc_buf[1] = core.pc_buf_base(1);
-    pc_buf[2] = core.pc_buf_base(2);
+    for (uint32_t i = 0; i < 3; ++i) {
+        instrn_buf[i] = core.instrn_buf_base(i);
+        pc_buf[i] = core.pc_buf_base(i);
+    }
 
     volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
 

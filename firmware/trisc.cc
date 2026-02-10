@@ -87,13 +87,9 @@ constexpr bool cb_init_write = false;
 using namespace ckernel;
 
 void init_sync_registers() {
-    volatile tt_reg_ptr uint* tiles_received_ptr;
-    volatile tt_reg_ptr uint* tiles_acked_ptr;
     for (uint32_t operand = 0; operand < NUM_CIRCULAR_BUFFERS; operand++) {
-        tiles_received_ptr = get_cb_tiles_received_ptr(operand);
-        tiles_received_ptr[0] = 0;
-        tiles_acked_ptr = get_cb_tiles_acked_ptr(operand);
-        tiles_acked_ptr[0] = 0;
+        get_cb_tiles_received_ptr(operand)[0] = 0;
+        get_cb_tiles_acked_ptr(operand)[0] = 0;
     }
 }
 

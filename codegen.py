@@ -429,20 +429,6 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
   gx1, gy1 = cfg.worker_grid_end
   mcast_grid = (noc_xy(gx0, gy0) << 16) | noc_xy(gx1, gy1)
 
-  # Shared fabric defines (unused in HD mode, but consumed unconditionally as constexpr)
-  fabric_zeros = {
-    "FABRIC_HEADER_RB_BASE": 0, "FABRIC_HEADER_RB_ENTRIES": 0,
-    "MY_FABRIC_SYNC_STATUS_ADDR": 0, "FABRIC_MUX_X": 0, "FABRIC_MUX_Y": 0,
-    "FABRIC_MUX_NUM_BUFFERS_PER_CHANNEL": 1, "FABRIC_MUX_CHANNEL_BUFFER_SIZE_BYTES": 1,
-    "FABRIC_MUX_CHANNEL_BASE_ADDRESS": 0, "FABRIC_MUX_CONNECTION_INFO_ADDRESS": 0,
-    "FABRIC_MUX_CONNECTION_HANDSHAKE_ADDRESS": 0, "FABRIC_MUX_FLOW_CONTROL_ADDRESS": 0,
-    "FABRIC_MUX_BUFFER_INDEX_ADDRESS": 0, "FABRIC_MUX_STATUS_ADDRESS": 0,
-    "FABRIC_MUX_TERMINATION_SIGNAL_ADDRESS": 0, "WORKER_CREDITS_STREAM_ID": 0,
-    "FABRIC_WORKER_FLOW_CONTROL_SEM": 0, "FABRIC_WORKER_TEARDOWN_SEM": 0,
-    "FABRIC_WORKER_BUFFER_INDEX_SEM": 0, "NUM_HOPS": 0, "EW_DIM": 0,
-    "TO_MESH_ID": 0, "FABRIC_2D": 0,
-  }
-
   # Semaphore IDs: prefetch sem 0 = downstream credits, sem 1 = dispatch_s credits, sem 2 = sync
   # Dispatch sem 0 = upstream CB pages available
   prefetch_defs = {
@@ -478,9 +464,6 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
     "DISPATCH_S_CB_LOG_PAGE_SIZE": cfg.dispatch_s_cb_log_page_size,
     # Ringbuffer (used by exec_buf, set to 0 for basic usage)
     "RINGBUFFER_SIZE": 0,
-    # Runtime arg offsets
-    "OFFSETOF_MY_DEV_ID": 0, "OFFSETOF_TO_DEV_ID": 1, "OFFSETOF_ROUTER_DIRECTION": 2,
-    **fabric_zeros,
   }
 
   dispatch_defs = {
@@ -520,9 +503,6 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
     "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
     "NUM_PHYSICAL_UNICAST_CORES": 0,
     "WORKER_MCAST_GRID": mcast_grid, "NUM_WORKER_CORES_TO_MCAST": cfg.num_worker_cores,
-    # Runtime arg offsets
-    "OFFSETOF_MY_DEV_ID": 0, "OFFSETOF_TO_DEV_ID": 1, "OFFSETOF_ROUTER_DIRECTION": 2,
-    **fabric_zeros,
   }
 
   dispatch_s_defs = {
