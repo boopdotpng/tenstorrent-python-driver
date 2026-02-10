@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Callable
 from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn, PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO
+from helpers import _IO, align_up
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
@@ -19,9 +19,6 @@ class DType(Enum):
   uint16 = 2
   int8 = 1
   uint8 = 1
-
-def _align(x: int, a: int = DRAM_ALIGNMENT) -> int:
-  return (x + a - 1) & ~(a - 1)
 
 def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
   n_tiles = len(data) // (TILE_ELEMS * bpe)
@@ -226,13 +223,13 @@ class DramAllocator:
   ) -> DramBuffer:
     num_banks = len(self.bank_tiles)
     page_size = min(
-      self.max_page_size, page_size or _align((size + num_banks - 1) // num_banks)
+      self.max_page_size, page_size or align_up((size + num_banks - 1) // num_banks, DRAM_ALIGNMENT)
     )
-    page_size = _align(page_size)
+    page_size = align_up(page_size, DRAM_ALIGNMENT)
     addr = self.next
     pages = (size + page_size - 1) // page_size
     pages_per_bank = (pages + num_banks - 1) // num_banks
-    self.next = _align(self.next + pages_per_bank * page_size)
+    self.next = align_up(self.next + pages_per_bank * page_size, DRAM_ALIGNMENT)
     return DramBuffer(name=name, addr=addr, size=size, page_size=page_size, dtype=dtype, shape=shape)
 
   def alloc_write(
@@ -280,41 +277,31 @@ class DramAllocator:
     else:
       self._write_slow(buf, data)
 
-  def _write_fast(self, buf: DramBuffer, data: bytes):
+  def _run_transfer_kernel(self, buf: DramBuffer, kernel, size: int, extra_args: list[int] = []):
     assert self.sysmem is not None and self._run_fn is not None
-    sm = self.sysmem
-    sm.buf[:len(data)] = data
-    fill = _get_fill_kernel()
-    n_tiles = (len(data) + buf.page_size - 1) // buf.page_size
-    sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
-
     from device_runtime import Program, DataflowLaunch, TileGrid
+    n_tiles = (size + buf.page_size - 1) // buf.page_size
+    sysmem_offset = self.sysmem.noc_addr & ((1 << 36) - 1)
     dev = getattr(self._run_fn, "__self__", None)
-    if dev is not None and hasattr(dev, "dispatchable_cores"):
-      all_cores = list(dev.dispatchable_cores)
-    else:
-      all_cores = list(TileGrid.TENSIX)
-    num_cores = len(all_cores)
-    tiles_per_core = (n_tiles + num_cores - 1) // num_cores
-    active_cores = min(num_cores, n_tiles)
-    cores = all_cores[:active_cores]
+    all_cores = list(dev.dispatchable_cores) if dev and hasattr(dev, "dispatchable_cores") else list(TileGrid.TENSIX)
+    tiles_per_core = (n_tiles + len(all_cores) - 1) // len(all_cores)
+    cores = all_cores[:min(len(all_cores), n_tiles)]
+    base_args = [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset]
 
     def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
       start = core_idx * tiles_per_core
-      count = min(tiles_per_core, n_tiles - start)
-      if start >= n_tiles: count = 0
-      return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size]
+      count = min(tiles_per_core, n_tiles - start) if start < n_tiles else 0
+      return base_args + [start, count, buf.page_size] + extra_args
 
-    program = Program(
-      dataflow=[DataflowLaunch(cores=cores, reader=fill, reader_rt_args=reader_args, writer_rt_args=[])],
-      compute=None,
-      compute_rt_args=[],
-      cbs=[0],
-      tile_size=buf.page_size,
-      num_pages=2,
-      cores=cores,
-    )
-    self._run_fn(program, timing=False, wait=False)
+    self._run_fn(Program(
+      dataflow=[DataflowLaunch(cores=cores, reader=kernel, reader_rt_args=reader_args, writer_rt_args=[])],
+      compute=None, compute_rt_args=[], cbs=[0],
+      tile_size=buf.page_size, num_pages=2, cores=cores,
+    ), timing=False, wait=False)
+
+  def _write_fast(self, buf: DramBuffer, data: bytes):
+    self.sysmem.buf[:len(data)] = data
+    self._run_transfer_kernel(buf, _get_fill_kernel(), len(data))
 
   def _write_slow(self, buf: DramBuffer, data: bytes):
     # Slow TLB writes bypass CQ ordering; drain any queued device work first.
@@ -357,7 +344,7 @@ class DramAllocator:
         assert self.sysmem is not None
         n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
         span = n_tiles * buf.page_size
-        off = _align(next_off, buf.page_size)
+        off = align_up(next_off, buf.page_size)
         if off + span <= self.sysmem.size:
           self._enqueue_read_fast(buf, sysmem_local_offset=off)
           self._inflight_fast_reads.append((buf, off))
@@ -379,39 +366,7 @@ class DramAllocator:
     self._ready_reads.setdefault(id(buf), []).append(data)
 
   def _enqueue_read_fast(self, buf: DramBuffer, *, sysmem_local_offset: int):
-    assert self.sysmem is not None and self._run_fn is not None
-    sm = self.sysmem
-    drain = _get_drain_kernel()
-    n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
-    sysmem_offset = sm.noc_addr & ((1 << 36) - 1)
-
-    from device_runtime import Program, DataflowLaunch, TileGrid
-    dev = getattr(self._run_fn, "__self__", None)
-    if dev is not None and hasattr(dev, "dispatchable_cores"):
-      all_cores = list(dev.dispatchable_cores)
-    else:
-      all_cores = list(TileGrid.TENSIX)
-    num_cores = len(all_cores)
-    tiles_per_core = (n_tiles + num_cores - 1) // num_cores
-    active_cores = min(num_cores, n_tiles)
-    cores = all_cores[:active_cores]
-
-    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
-      start = core_idx * tiles_per_core
-      count = min(tiles_per_core, n_tiles - start)
-      if start >= n_tiles: count = 0
-      return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size, sysmem_local_offset]
-
-    program = Program(
-      dataflow=[DataflowLaunch(cores=cores, reader=drain, reader_rt_args=reader_args, writer_rt_args=[])],
-      compute=None,
-      compute_rt_args=[],
-      cbs=[0],
-      tile_size=buf.page_size,
-      num_pages=2,
-      cores=cores,
-    )
-    self._run_fn(program, timing=False, wait=False)
+    self._run_transfer_kernel(buf, _get_drain_kernel(), buf.size, extra_args=[sysmem_local_offset])
 
   def _read_fast_result(self, buf: DramBuffer, off: int) -> bytes:
     assert self.sysmem is not None

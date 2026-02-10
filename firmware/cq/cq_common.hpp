@@ -7,11 +7,13 @@
 #include "core_config.h"
 #include "internal/risc_attribs.h"
 #include "api/dataflow/dataflow_api.h"
-#include "cq_helpers.hpp"
 
 #include "internal/debug/sanitize.h"
 #include "api/debug/assert.h"
 #include <limits>
+
+// P100A build does not use idle-erisc early-exit/heartbeat hooks.
+#define CQ_HEARTBEAT_NOOP(...) do { } while (0)
 
 // The command queue read interface controls reads from the issue region, host owns the issue region write interface
 // Commands and data to send to device are pushed into the issue region
@@ -56,8 +58,6 @@ uint32_t wrap_gt(uint32_t a, uint32_t b) {
     int32_t diff = a - b;
     return diff > 0;
 }
-
-constexpr bool use_fabric(uint64_t fabric_router_xy) { return fabric_router_xy != 0; }
 
 template <
     enum CQNocFlags flags,
@@ -149,7 +149,7 @@ FORCE_INLINE void cq_noc_async_write_init_state(
     WAYPOINT("CNIW");
     uint32_t heartbeat = 0;
     while (!noc_cmd_buf_ready(noc, cmd_buf)) {
-        IDLE_ERISC_HEARTBEAT_AND_RETURN(heartbeat);
+        CQ_HEARTBEAT_NOOP(heartbeat);
     }
     WAYPOINT("CNID");
 
@@ -170,7 +170,7 @@ FORCE_INLINE void cq_noc_async_wwrite_init_state(
     WAYPOINT("CNIW");
     uint32_t heartbeat = 0;
     while (!noc_cmd_buf_ready(noc, cmd_buf)) {
-        IDLE_ERISC_HEARTBEAT_AND_RETURN(heartbeat);
+        CQ_HEARTBEAT_NOOP(heartbeat);
     }
     WAYPOINT("CNID");
 
@@ -249,7 +249,7 @@ public:
         uint32_t heartbeat = 0;
         do {
             invalidate_l1_cache();
-            IDLE_ERISC_HEARTBEAT_AND_RETURN(heartbeat);
+            CQ_HEARTBEAT_NOOP(heartbeat);
         } while (wrap_gt(n, additional_count + *sem_addr));
         WAYPOINT("DAPD");
         additional_count -= n;
@@ -379,7 +379,7 @@ protected:
             uint32_t heartbeat = 0;
             do {
                 invalidate_l1_cache();
-                IDLE_ERISC_HEARTBEAT_AND_RETURN(heartbeat, 0);
+                CQ_HEARTBEAT_NOOP(heartbeat, 0);
             } while ((upstream_count_ = *sem_addr) == local_count_);
             WAYPOINT("UAPD");
         }
