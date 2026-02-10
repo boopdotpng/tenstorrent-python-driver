@@ -67,6 +67,13 @@ class _FastPreparedMeta:
   launch_groups: list[tuple[list[tuple[int, int]], list[bytes]]]
   shared_groups: list[tuple[list[tuple[int, int]], int, bytes]]
 
+@dataclass(frozen=True)
+class _SlowPreparedMeta:
+  all_rects: list[tuple[int, int, int, int]]
+  rta_writes: list[tuple[list[tuple[int, int, int, int]], int, bytes]]
+  launch_writes: list[tuple[list[tuple[int, int, int, int]], int, bytes]]
+  shared_writes: list[tuple[list[tuple[int, int, int, int]], int, bytes]]
+
 def _device_cq_layout(*, prefetch_q_entries: int) -> _DeviceCQ:
   l1_base = FastDispatch.BH_TENSIX_DEFAULT_UNRESERVED
   prefetch_q_rd_ptr_addr = l1_base + FastDispatch.BH_PREFETCH_Q_RD_PTR_OFF
@@ -500,6 +507,8 @@ class SlowDevice(CommonDevice):
     self._prepared_run_cache_limit = 16
     self._prepared_program_cache: dict[tuple[int, tuple[tuple[int, int], ...], int], Program] = {}
     self._prepared_program_cache_limit = 16
+    self._prepared_slow_meta: dict[int, _SlowPreparedMeta] = {}
+    self._prepared_slow_meta_limit = 32
     self._last_dispatch_s: float = 0.0
     self._pending_sync_cores: tuple[tuple[int, int], ...] | None = None
 
@@ -794,8 +803,36 @@ class SlowDevice(CommonDevice):
     num_dests = (x1 - x0 + 1) * (y1 - y0 + 1)
     return noc_xy, num_dests
 
+  def _prepare_slow_meta(self, prepared: Program) -> _SlowPreparedMeta:
+    key = id(prepared)
+    if (meta := self._prepared_slow_meta.get(key)) is not None:
+      return meta
+
+    def grouped_rect_writes(payload_by_core: dict[tuple[int, int], bytes], addr: int):
+      groups: dict[bytes, list[tuple[int, int]]] = {}
+      for core, payload in payload_by_core.items():
+        groups.setdefault(payload, []).append(core)
+      return [(self._core_rects(group_cores), addr, payload) for payload, group_cores in groups.items()]
+
+    shared_groups: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
+    for core, payload in prepared.shared_by_core.items():
+      shared_groups.setdefault(payload, []).append(core)
+    shared_writes = [(self._core_rects(group_cores), addr, payload) for (addr, payload), group_cores in shared_groups.items()]
+
+    meta = _SlowPreparedMeta(
+      all_rects=prepared.all_rects,
+      rta_writes=grouped_rect_writes(prepared.rta_by_core, TensixL1.KERNEL_CONFIG_BASE),
+      launch_writes=grouped_rect_writes(prepared.launch_by_core_blob, TensixL1.LAUNCH),
+      shared_writes=shared_writes,
+    )
+    if len(self._prepared_slow_meta) >= self._prepared_slow_meta_limit:
+      self._prepared_slow_meta.pop(next(iter(self._prepared_slow_meta)))
+    self._prepared_slow_meta[key] = meta
+    return meta
+
   def enqueue(self, program: Program | RuntimeProgram):
     prepared = self.prepare(program) if isinstance(program, RuntimeProgram) else program
+    meta = self._prepare_slow_meta(prepared)
     cores = list(prepared.cores)
     reset = GoMsg()
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
@@ -806,31 +843,16 @@ class SlowDevice(CommonDevice):
 
     mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
     win = self.win
-    all_rects = prepared.all_rects
-    self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, reset_blob)])
-
-    rta_by_core = prepared.rta_by_core
-    shared_by_core = prepared.shared_by_core
-    launch_by_core_blob = prepared.launch_by_core_blob
-
-    def grouped_writes(payload_by_core: dict[tuple[int, int], bytes], addr: int):
-      groups: dict[bytes, list[tuple[int, int]]] = {}
-      for core, payload in payload_by_core.items():
-        groups.setdefault(payload, []).append(core)
-      for payload, group_cores in groups.items():
-        self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
-
-    grouped_writes(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
-    grouped_writes(launch_by_core_blob, TensixL1.LAUNCH)
-
-    shared_groups: dict[tuple[int, bytes], list[tuple[int, int]]] = {}
-    for core, payload in shared_by_core.items():
-      shared_groups.setdefault(payload, []).append(core)
-    for (addr, payload), group_cores in shared_groups.items():
-      self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
+    self._mcast_write_rects(win, mcast_cfg, meta.all_rects, [(TensixL1.GO_MSG, reset_blob)])
+    for rects, addr, payload in meta.rta_writes:
+      self._mcast_write_rects(win, mcast_cfg, rects, [(addr, payload)])
+    for rects, addr, payload in meta.launch_writes:
+      self._mcast_write_rects(win, mcast_cfg, rects, [(addr, payload)])
+    for rects, addr, payload in meta.shared_writes:
+      self._mcast_write_rects(win, mcast_cfg, rects, [(addr, payload)])
 
     t_dispatch_start = time.perf_counter()
-    self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, go_blob)])
+    self._mcast_write_rects(win, mcast_cfg, meta.all_rects, [(TensixL1.GO_MSG, go_blob)])
     dispatch = time.perf_counter() - t_dispatch_start
     self._last_dispatch_s = dispatch
     self._pending_sync_cores = tuple(cores)
