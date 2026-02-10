@@ -13,7 +13,7 @@ Currently, I have add1 and a very naive, slow matmul working.
 
 ## dispatch mode
 - Fast dispatch is selected by default.
-- Set `TT_SLOW_DISPATCH=1` to force slow dispatch.
+- Set `TT_USB=1` to force slow dispatch.
 - Fast DRAM read path is only enabled in fast-dispatch mode.
 
 ### fast-dispatch firmware

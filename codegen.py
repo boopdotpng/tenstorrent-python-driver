@@ -1,59 +1,53 @@
-from helpers import pack_xip_elf, load_pt_load, PTLoad, noc_xy
+from helpers import pack_xip_elf, load_pt_load, PTLoad
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import hashlib, shutil, subprocess, tempfile
 
-# Local bundled dependencies (headers, libs, linker scripts, firmware sources)
 _DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
 _REPO = Path(__file__).resolve().parent
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
 _CACHE = _REPO / ".metal-cache"
 _FW_CACHE_DIR = _CACHE / "firmware"
 _KERNEL_CACHE_DIR = _CACHE / "kernels"
+_CKERNEL_DEFAULTS = _REPO / "firmware" / "ckernel_defaults"
+
+Strs = list[str]
+LinkArgs = Strs | Callable[[Path], Strs]
+PrepareFn = Callable[[Path], None] | None
 
 class DataFormat(Enum):
-  Float32, Float16, Bfp8, Bfp4, Tf32, Float16_b, Bfp8_b, Bfp4_b = 0, 1, 2, 3, 4, 5, 6, 7
-  Int32, UInt16, Lf8, Bfp2, Int8, Bfp2_b, UInt32, Fp8_e4m3, UInt8 = 8, 9, 10, 11, 14, 15, 24, 0x1A, 30
-  Invalid = 0xFF
-
-  @property
-  def cname(self) -> str: return self.name  # C++ DataFormat::* enum name
+  Float32 = 0
+  Float16 = 1
+  Float16_b = 5
+  Int32 = 8
+  UInt16 = 9
+  Int8 = 14
+  UInt32 = 24
+  Fp8_e4m3 = 0x1A
+  UInt8 = 30
 
 class MathFidelity(Enum):
-  LoFi = 0   # Lowest precision, fastest
-  HiFi2 = 2  # Medium precision
-  HiFi3 = 3  # Higher precision
-  HiFi4 = 4  # Full precision, slowest
+  LoFi = 0; HiFi2 = 2; HiFi3 = 3; HiFi4 = 4
 
 @dataclass(frozen=True)
 class CkernelConfig:
   input_format: DataFormat = DataFormat.Float16_b
   output_format: DataFormat = DataFormat.Float16_b
-  # Optional per-CB format overrides, e.g. ((24, DataFormat.Float32),)
   cb_data_formats: tuple[tuple[int, DataFormat], ...] = ()
   math_fidelity: MathFidelity = MathFidelity.HiFi4
-  # use faster approximations for SFPU ops (exp, log, sqrt, etc)
   approx: bool = False
-  # keep dest register in FP32 for accumulation (e.g. FP16 matmul with FP32 accum)
   dst_accum_mode: bool = False
   # full sync between math/pack stages (vs double-buffered SyncHalf)
   dst_full_sync: bool = False
 
 @dataclass(frozen=True)
 class CompiledKernel:
-  xip: bytes
-  xip_text_bytes: int
-
-@dataclass(frozen=True)
-class CompiledKernels:
-  reader: CompiledKernel
-  writer: CompiledKernel
-  compute: tuple[CompiledKernel, CompiledKernel, CompiledKernel]
+  xip: bytes; xip_text_bytes: int
 
 @dataclass(frozen=True)
 class CompiledFirmware:
-  """A compiled firmware ELF ready for upload to a Tensix core."""
   elf_path: Path             # path to the ELF on disk (in cache dir)
   segments: list[PTLoad]     # PT_LOAD segments for upload
   text_base: int             # where .text starts in L1
@@ -75,13 +69,11 @@ _INCLUDE_PATHS = [
 _CFLAGS = (
   "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
   "-fno-use-cxa-atexit",
-  "-fno-jump-tables",  # default for non-CQ XIP kernels
   "-Wall", "-Werror", "-Wno-unknown-pragmas",
   "-Wno-deprecated-declarations", "-Wno-error=multistatement-macros",
   "-Wno-error=parentheses", "-Wno-error=unused-but-set-variable",
   "-Wno-unused-variable", "-Wno-unused-function",
 )
-_CQ_CFLAGS = tuple(f for f in _CFLAGS if f != "-fno-jump-tables")
 _LFLAGS = ("-Wl,-z,max-page-size=16", "-Wl,-z,common-page-size=16", "-nostartfiles")
 
 _DEVICE_DEFINES = [
@@ -90,33 +82,53 @@ _DEVICE_DEFINES = [
   "-DPCIE_NOC_X=19", "-DPCIE_NOC_Y=24",
 ]
 
+_CQ_SRC_DIR = _REPO / "firmware" / "cq"
+_CQ_INC = [str(_CQ_SRC_DIR)]
+_CQ_PREFETCH_SRC = (_CQ_SRC_DIR / "cq_prefetch.cpp").read_text()
+_CQ_DISPATCH_SRC = (_CQ_SRC_DIR / "cq_dispatch.cpp").read_text()
+_CQ_DISPATCH_S_SRC = (_CQ_SRC_DIR / "cq_dispatch_subordinate.cpp").read_text()
+
+def _hash_default_ckernel_headers() -> str:
+  h = hashlib.sha256()
+  for name in (
+    "chlkc_unpack_data_format.h",
+    "chlkc_pack_data_format.h",
+    "chlkc_unpack_tile_dims.h",
+    "chlkc_pack_tile_dims.h",
+    "chlkc_dst_accum_mode.h",
+    "chlkc_dst_sync_mode.h",
+    "chlkc_math_fidelity.h",
+    "chlkc_math_approx_mode.h",
+  ):
+    h.update((_CKERNEL_DEFAULTS / name).read_bytes())
+  return h.hexdigest()
+
+_CKERNEL_DEFAULTS_HASH = _hash_default_ckernel_headers()
+
 def _run(exe: Path, args: list[str], cwd: Path):
   r = subprocess.run([str(exe), *args], cwd=cwd, capture_output=True)
   if r.returncode != 0:
     raise RuntimeError(f"{exe.name} failed:\n{r.stderr.decode()}")
 
-def _ensure_cache_dirs():
-  _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-  _KERNEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
+                             prepare: PrepareFn = None):
+  if cache_elf.is_file():
+    return
+  build = Path(tempfile.mkdtemp(prefix=tmp_prefix))
+  try:
+    if prepare is not None:
+      prepare(build)
+    _run(cc, [*compile_args, "-c", "-o", "out.o", str(src)], build)
+    args = link_args(build) if callable(link_args) else link_args
+    _run(cc, [*args, "-o", "out.elf"], build)
+    shutil.copy2(build / "out.elf", cache_elf)
+  finally:
+    shutil.rmtree(build, ignore_errors=True)
 
-def _hash_bytes(data: bytes) -> str:
-  return hashlib.sha256(data).hexdigest()
+def _source_target_cache_key(source: str, target: str, meta: dict[str, object] | None = None) -> str:
+  payload = f"{target}\0{source}".encode() if not meta else repr((target, source, tuple(sorted(meta.items())))).encode()
+  return hashlib.sha256(payload).hexdigest()
 
-def _source_target_cache_key(source: str, target: str, *, meta: dict[str, object] | None = None) -> str:
-  if not meta:
-    return _hash_bytes(f"{target}\0{source}".encode())
-  meta_items = tuple((k, meta[k]) for k in sorted(meta))
-  return _hash_bytes(repr((target, source, meta_items)).encode())
-
-def _atomic_copy(src: Path, dst: Path):
-  dst.parent.mkdir(parents=True, exist_ok=True)
-  tmp = dst.with_suffix(dst.suffix + f".tmp.{next(tempfile._get_candidate_names())}")
-  shutil.copy2(src, tmp)
-  tmp.replace(dst)
-
-# === Firmware compiler ===
-
-# Firmware build targets: (source, target_name, defines, mcpu_flags, opt, extra_objs)
 _FW_TARGETS = [
   ("brisc.cc", "brisc", ["-DCOMPILE_FOR_BRISC", "-DPROCESSOR_INDEX=0", "-DNOC_INDEX=1", "-DNOC_MODE=0"],
    ["-mcpu=tt-bh", "-fno-tree-loop-distribute-patterns"], "-Os", ["noc.o"]),
@@ -133,10 +145,9 @@ _FW_TARGETS = [
 _fw_cache: dict[str, CompiledFirmware] | None = None
 
 def compile_firmware() -> dict[str, CompiledFirmware]:
-  """Compile all 5 slow-dispatch firmware ELFs from source. Cached after first call."""
   global _fw_cache
   if _fw_cache is not None: return _fw_cache
-  _ensure_cache_dirs()
+  _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
   cc = _SFPI / "riscv-tt-elf-g++"
   assert cc.is_file(), f"missing compiler: {cc}"
@@ -160,31 +171,27 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     cache_target = f"{target}_firmware"
     key = _source_target_cache_key(src.read_text(), cache_target)
     elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
-    if not elf.is_file():
-      cache_dir = Path(tempfile.mkdtemp(prefix="tt-fw-"))
-      obj = cache_dir / f"{target}.o"
-      out = cache_dir / f"{target}.elf"
-      try:
-        _run(cc, [opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
-                  *common_defines, *target_defs, *includes,
-                  "-c", "-o", str(obj), str(src)], cache_dir)
-
-        link_args = [str(lib / "tmu-crt0.o"), str(obj), *(str(lib / o) for o in extra), str(lib / "substitutes.o")]
-        _run(cc, [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
-                  f"-T{ld}", *link_args, "-o", str(out)], cache_dir)
-        _atomic_copy(out, elf)
-      finally:
-        shutil.rmtree(cache_dir, ignore_errors=True)
+    compile_args = [
+      opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
+      *common_defines, *target_defs, *includes,
+    ]
+    link_objs = [str(lib / "tmu-crt0.o"), "out.o", *(str(lib / o) for o in extra), str(lib / "substitutes.o")]
+    fw_link_args = [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay", f"-T{ld}", *link_objs]
+    _compile_and_link_cached(
+      cc=cc,
+      src=src,
+      cache_elf=elf,
+      compile_args=compile_args,
+      link_args=fw_link_args,
+      tmp_prefix=f"tt-fw-{target}-",
+    )
 
     segs = load_pt_load(elf)
-    # Text base comes from the first PT_LOAD segment (placed by the linker script)
     text_base = segs[0].paddr
     result[target] = CompiledFirmware(elf_path=elf, segments=segs, text_base=text_base)
 
   _fw_cache = result
   return result
-
-# === Kernel compiler ===
 
 class Compiler:
   def __init__(self, ckernel: CkernelConfig = CkernelConfig()):
@@ -193,12 +200,11 @@ class Compiler:
     self._nm = _SFPI / "riscv-tt-elf-nm"
     self._ckernel = ckernel
     inc = _DEPS / "include"
-    self._includes = ["-I.", f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
+    self._includes = ["-I.", f"-I{_CKERNEL_DEFAULTS}", f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
     assert self._cc.is_file(), f"missing compiler: {self._cc}\nDownload toolchain to {_DEPS / 'sfpi-toolchain'}"
-    # Ensure firmware is compiled (needed for --just-symbols linking)
     self._fw = compile_firmware()
 
-  def compile_dataflow(self, src: str, *, processor: str, noc_index: int | None = None) -> CompiledKernel:
+  def compile_dataflow(self, src: str, processor: str, noc_index: int | None = None) -> CompiledKernel:
     if processor not in ("brisc", "ncrisc"):
       raise ValueError(f"processor must be 'brisc' or 'ncrisc', got: {processor}")
     if noc_index is None:
@@ -212,10 +218,8 @@ class Compiler:
       self._compile_trisc(src, 2),
     )
 
-  def _compile_dataflow(self, src: str, target: str, noc_index: int,
-                        extra_defines: list[str] | None = None,
-                        extra_includes: list[str] | None = None,
-                        cflags: tuple[str, ...] = _CFLAGS,
+  def _compile_dataflow(self, src: str, target: str, noc_index: int, extra_defines: Strs | None = None,
+                        extra_includes: Strs | None = None,
                         xip_relocate: bool = False) -> CompiledKernel:
     defines = [
       "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
@@ -228,7 +232,7 @@ class Compiler:
     extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
     return self._build(
       src, target, defines, extra_objs, opt="-O2", trisc=False,
-      extra_includes=extra_includes, cflags=cflags, xip_relocate=xip_relocate
+      extra_includes=extra_includes, xip_relocate=xip_relocate
     )
 
   def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
@@ -242,10 +246,9 @@ class Compiler:
     ]
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
-  def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str],
-             opt: str, trisc: bool, extra_includes: list[str] | None = None,
-             cflags: tuple[str, ...] = _CFLAGS, xip_relocate: bool = False) -> CompiledKernel:
-    _ensure_cache_dirs()
+  def _build(self, kern: str, target: str, defines: Strs, extra_objs: Strs, opt: str, trisc: bool, extra_includes: Strs | None = None,
+             xip_relocate: bool = False) -> CompiledKernel:
+    _KERNEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = _source_target_cache_key(
       kern,
       target,
@@ -255,7 +258,6 @@ class Compiler:
         "opt": opt,
         "trisc": trisc,
         "extra_includes": tuple(extra_includes or []),
-        "cflags": tuple(cflags),
         "xip_relocate": xip_relocate,
         "ckernel_input_format": self._ckernel.input_format.value,
         "ckernel_output_format": self._ckernel.output_format.value,
@@ -264,46 +266,53 @@ class Compiler:
         "ckernel_approx": self._ckernel.approx,
         "ckernel_dst_accum_mode": self._ckernel.dst_accum_mode,
         "ckernel_dst_full_sync": self._ckernel.dst_full_sync,
+        "ckernel_defaults_hash": _CKERNEL_DEFAULTS_HASH,
       },
     )
     cached_elf = _KERNEL_CACHE_DIR / f"{target}-{key[:16]}.elf"
     if cached_elf.is_file():
       xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
       return CompiledKernel(xip=xip, xip_text_bytes=text_size)
+    mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
+           ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
+    fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
+    includes = [*self._includes, *(f"-I{p}" for p in (extra_includes or []))]
+    compile_args = [opt, *_CFLAGS, "-MMD", *mcpu, *includes, *defines]
 
-    build = Path(tempfile.mkdtemp(prefix=f"tt-{target}-"))
-    try:
-      # Get the compiled firmware ELF for this target (for --just-symbols)
-      fw_elf = self._fw[target].elf_path
-      fw = self._weaken_fw_symbols(build, fw_elf)
+    fw_link_elf: Path | None = None
+    def _prepare(build: Path):
+      nonlocal fw_link_elf
+      fw_link_elf = self._weaken_fw_symbols(build, self._fw[target].elf_path)
       (build / "kernel_includes.hpp").write_text(kern)
       self._write_ckernel_headers(build)
-      if trisc: self._write_trisc_stubs(build)
+      if trisc:
+        self._write_trisc_stubs(build)
 
-      # Compile
-      mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
-             ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
-      fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
-      includes = [*self._includes, *(f"-I{p}" for p in (extra_includes or []))]
-      _run(self._cc, [opt, *cflags, "-MMD", *mcpu, *includes, "-c", "-o", "out.o", str(fw_src), *defines], build)
-
-      # Link
+    def _kernel_link_args(_: Path) -> Strs:
+      assert fw_link_elf is not None
       ld = _DEPS / "toolchain" / "blackhole" / f"kernel_{target}.ld"
       objs = ["out.o", *extra_objs, str(_DEPS / "lib/blackhole/substitutes.o")]
-      _run(self._cc, [opt, *cflags, *_LFLAGS, *mcpu, f"-T{ld}",
-                "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw}", *objs, "-o", "out.elf"], build)
-      _atomic_copy(build / "out.elf", cached_elf)
+      return [
+        opt, *_CFLAGS, *_LFLAGS, *mcpu, f"-T{ld}",
+        "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw_link_elf}", *objs,
+      ]
 
-      xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
-      return CompiledKernel(xip=xip, xip_text_bytes=text_size)
-    finally:
-      shutil.rmtree(build, ignore_errors=True)
+    _compile_and_link_cached(
+      cc=self._cc,
+      src=fw_src,
+      cache_elf=cached_elf,
+      compile_args=compile_args,
+      link_args=_kernel_link_args,
+      tmp_prefix=f"tt-{target}-",
+      prepare=_prepare,
+    )
+    xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
+    return CompiledKernel(xip=xip, xip_text_bytes=text_size)
 
   def _weaken_fw_symbols(self, build: Path, fw: Path) -> Path:
     out = build / "fw.elf"
     out.write_bytes(fw.read_bytes())
 
-    # Parse symbols
     result = subprocess.run([str(self._nm), "-a", str(out)], cwd=build, check=True, capture_output=True, text=True)
     localize, weaken = [], []
     for line in result.stdout.splitlines():
@@ -318,7 +327,6 @@ class Compiler:
       else:
         localize.append(name)
 
-    # Apply
     (build / "localize.txt").write_text("\n".join(sorted(set(localize))))
     (build / "weaken.txt").write_text("\n".join(sorted(set(weaken))))
     _run(self._objcopy, ["--localize-symbols=localize.txt", "--weaken-symbols=weaken.txt", str(out)], build)
@@ -332,223 +340,75 @@ class Compiler:
 
   def _write_ckernel_headers(self, build: Path):
     cfg = self._ckernel
-    in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
-    formats = [in_fmt] * 16 + [out_fmt] * 16
-    for cb_id, fmt in cfg.cb_data_formats:
-      if not (0 <= cb_id < 32):
-        raise ValueError(f"cb_data_formats has invalid cb_id {cb_id}; expected 0..31")
-      formats[cb_id] = fmt.value
-    tile_sizes = [_tile_size(f) for f in formats]
+    if cfg.input_format != DataFormat.Float16_b or cfg.output_format != DataFormat.Float16_b or cfg.cb_data_formats:
+      in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
+      formats = [in_fmt] * 16 + [out_fmt] * 16
+      for cb_id, fmt in cfg.cb_data_formats:
+        if not (0 <= cb_id < 32):
+          raise ValueError(f"cb_data_formats has invalid cb_id {cb_id}; expected 0..31")
+        formats[cb_id] = fmt.value
+      tile_sizes = [_tile_size(f) for f in formats]
+      arr = lambda vals: ", ".join(str(v) for v in vals)
+      arr32 = lambda v: arr([v] * 32)
+      (build / "chlkc_unpack_data_format.h").write_text(
+        f"#pragma once\nconstexpr std::int32_t unpack_src_format[32] = {{{arr(formats)}}};\n"
+        f"constexpr std::int32_t unpack_dst_format[32] = {{{arr(formats)}}};\n")
+      (build / "chlkc_pack_data_format.h").write_text(
+        f"#pragma once\nconstexpr unsigned char pack_src_format[32] = {{{arr(formats)}}};\n"
+        f"constexpr unsigned char pack_dst_format[32] = {{{arr(formats)}}};\n")
+      dims = lambda prefix: (
+        f"constexpr uint8_t {prefix}_tile_num_faces[32] = {{{arr32(4)}}};\n"
+        f"constexpr uint8_t {prefix}_partial_face[32] = {{{arr32(0)}}};\n"
+        f"constexpr uint8_t {prefix}_tile_face_r_dim[32] = {{{arr32(16)}}};\n"
+        f"constexpr uint8_t {prefix}_narrow_tile[32] = {{{arr32(0)}}};\n"
+        f"constexpr uint8_t {prefix}_tile_r_dim[32] = {{{arr32(32)}}};\n"
+        f"constexpr uint8_t {prefix}_tile_c_dim[32] = {{{arr32(32)}}};\n"
+        f"constexpr uint16_t {prefix}_tile_size[32] = {{{arr(tile_sizes)}}};\n"
+      )
+      (build / "chlkc_unpack_tile_dims.h").write_text("#pragma once\n" + dims("unpack"))
+      (build / "chlkc_pack_tile_dims.h").write_text("#pragma once\n" + dims("pack"))
+    if cfg.dst_accum_mode:
+      (build / "chlkc_dst_accum_mode.h").write_text("constexpr bool DST_ACCUM_MODE = true;\n")
+    if cfg.dst_full_sync:
+      (build / "chlkc_dst_sync_mode.h").write_text("#define DST_SYNC_MODE DstSync::SyncFull\n")
+    if cfg.math_fidelity != MathFidelity.HiFi4:
+      (build / "chlkc_math_fidelity.h").write_text(f"constexpr std::int32_t MATH_FIDELITY = {cfg.math_fidelity.value};\n")
+    if cfg.approx:
+      (build / "chlkc_math_approx_mode.h").write_text("constexpr bool APPROX = true;\n")
 
-    def arr(vals): return ", ".join(str(v) for v in vals)
-    def arr32(v): return arr([v] * 32)
-
-    # Data formats
-    (build / "chlkc_unpack_data_format.h").write_text(
-      f"#pragma once\nconstexpr std::int32_t unpack_src_format[32] = {{{arr(formats)}}};\n"
-      f"constexpr std::int32_t unpack_dst_format[32] = {{{arr(formats)}}};\n")
-    (build / "chlkc_pack_data_format.h").write_text(
-      f"#pragma once\nconstexpr unsigned char pack_src_format[32] = {{{arr(formats)}}};\n"
-      f"constexpr unsigned char pack_dst_format[32] = {{{arr(formats)}}};\n")
-
-    # Tile dimensions (fixed 32x32 tiles, 4 faces of 16x16)
-    def tile_dims(prefix: str) -> str:
-      return (f"constexpr uint8_t {prefix}_tile_num_faces[32] = {{{arr32(4)}}};\n"
-              f"constexpr uint8_t {prefix}_partial_face[32] = {{{arr32(0)}}};\n"
-              f"constexpr uint8_t {prefix}_tile_face_r_dim[32] = {{{arr32(16)}}};\n"
-              f"constexpr uint8_t {prefix}_narrow_tile[32] = {{{arr32(0)}}};\n"
-              f"constexpr uint8_t {prefix}_tile_r_dim[32] = {{{arr32(32)}}};\n"
-              f"constexpr uint8_t {prefix}_tile_c_dim[32] = {{{arr32(32)}}};\n"
-              f"constexpr uint16_t {prefix}_tile_size[32] = {{{arr(tile_sizes)}}};\n")
-    (build / "chlkc_unpack_tile_dims.h").write_text("#pragma once\n" + tile_dims("unpack"))
-    (build / "chlkc_pack_tile_dims.h").write_text("#pragma once\n" + tile_dims("pack"))
-
-    # Math settings
-    (build / "chlkc_dst_accum_mode.h").write_text(f"constexpr bool DST_ACCUM_MODE = {str(cfg.dst_accum_mode).lower()};\n")
-    (build / "chlkc_dst_sync_mode.h").write_text(f"#define DST_SYNC_MODE DstSync::{'SyncFull' if cfg.dst_full_sync else 'SyncHalf'}\n")
-    (build / "chlkc_math_fidelity.h").write_text(f"constexpr std::int32_t MATH_FIDELITY = {cfg.math_fidelity.value};\n")
-    (build / "chlkc_math_approx_mode.h").write_text(f"constexpr bool APPROX = {str(cfg.approx).lower()};\n")
-
-# === CQ (command queue) kernel compiler ===
-
-@dataclass(frozen=True)
-class CQConfig:
-  """Runtime parameters needed to compile CQ kernels. All addresses are L1 or NOC."""
-  # Core coordinates (NOC physical)
-  prefetch_xy: tuple[int, int]
-  dispatch_xy: tuple[int, int]
-  # PCIe hugepage layout
-  pcie_base: int          # offset into hugepage where issue queue starts
-  pcie_size: int          # size of issue queue region
-  completion_base: int    # NOC address of completion queue region
-  completion_size: int    # size of completion queue region
-  # Device L1 layout (on prefetch core)
-  prefetch_q_base: int
-  prefetch_q_size: int
-  prefetch_q_rd_ptr_addr: int
-  prefetch_q_pcie_rd_ptr_addr: int
-  cmddat_q_base: int
-  cmddat_q_size: int
-  scratch_db_base: int
-  scratch_db_size: int
-  # Dispatch circular buffer (on dispatch core)
-  dispatch_cb_base: int
-  dispatch_cb_pages: int
-  dispatch_cb_log_page_size: int = 12  # 4KB pages
-  dispatch_cb_blocks: int = 4
-  # Dispatch subordinate buffer (on dispatch core)
-  dispatch_s_buffer_base: int = 0
-  dispatch_s_buffer_size: int = 32 * 1024
-  dispatch_s_cb_log_page_size: int = 8  # 256B pages
-  # Completion queue device pointers (on dispatch core)
-  completion_q_wr_ptr_addr: int = 0
-  completion_q_rd_ptr_addr: int = 0
-  dispatch_s_sync_sem_addr: int = 0
-  # PCIe host base address (NOC local offset of hugepage)
-  command_queue_base: int = 0
-  # Worker grid for go-signal multicast
-  worker_grid_start: tuple[int, int] = (0, 0)
-  worker_grid_end: tuple[int, int] = (0, 0)
-  num_worker_cores: int = 0
 
 @dataclass(frozen=True)
 class CompiledCQKernels:
-  prefetch_brisc: CompiledKernel     # cq_prefetch on prefetch core BRISC
-  dispatch_brisc: CompiledKernel     # cq_dispatch on dispatch core BRISC
-  dispatch_s_ncrisc: CompiledKernel  # cq_dispatch_subordinate on dispatch core NCRISC
+  prefetch_brisc: CompiledKernel
+  dispatch_brisc: CompiledKernel
+  dispatch_s_ncrisc: CompiledKernel
 
-def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
-  """Compile the 3 CQ kernels (prefetch, dispatch, dispatch_subordinate) with baked-in config."""
+def compile_cq_kernels() -> CompiledCQKernels:
   compiler = Compiler()
-  px, py = cfg.prefetch_xy
-  dx, dy = cfg.dispatch_xy
-  go_msg_addr = 0x370  # TensixL1.GO_MSG (MAILBOX_BASE + 0x310)
-
-  # NOC multicast grid for worker go signals
-  gx0, gy0 = cfg.worker_grid_start
-  gx1, gy1 = cfg.worker_grid_end
-  mcast_grid = (noc_xy(gx0, gy0) << 16) | noc_xy(gx1, gy1)
-
-  # Semaphore IDs: prefetch sem 0 = downstream credits, sem 1 = dispatch_s credits, sem 2 = sync
-  # Dispatch sem 0 = upstream CB pages available
-  prefetch_defs = {
-    "IS_H_VARIANT": 1, "IS_D_VARIANT": 1, "DISPATCH_KERNEL": 1, "FD_CORE_TYPE": 0,
-    "MY_NOC_X": px, "MY_NOC_Y": py,
-    "UPSTREAM_NOC_X": px, "UPSTREAM_NOC_Y": py,  # HD: no upstream, point to self
-    "DOWNSTREAM_NOC_X": dx, "DOWNSTREAM_NOC_Y": dy,
-    "DOWNSTREAM_SUBORDINATE_NOC_X": dx, "DOWNSTREAM_SUBORDINATE_NOC_Y": dy,
-    "UPSTREAM_NOC_INDEX": 0,
-    # Prefetch -> Dispatch CB flow control
-    "DOWNSTREAM_CB_BASE": cfg.dispatch_cb_base,
-    "DOWNSTREAM_CB_LOG_PAGE_SIZE": cfg.dispatch_cb_log_page_size,
-    "DOWNSTREAM_CB_PAGES": cfg.dispatch_cb_pages,
-    "MY_DOWNSTREAM_CB_SEM_ID": 0,
-    "DOWNSTREAM_CB_SEM_ID": 0,
-    # PCIe
-    "PCIE_BASE": cfg.pcie_base, "PCIE_SIZE": cfg.pcie_size,
-    # Prefetch queue
-    "PREFETCH_Q_BASE": cfg.prefetch_q_base, "PREFETCH_Q_SIZE": cfg.prefetch_q_size,
-    "PREFETCH_Q_RD_PTR_ADDR": cfg.prefetch_q_rd_ptr_addr,
-    "PREFETCH_Q_PCIE_RD_PTR_ADDR": cfg.prefetch_q_pcie_rd_ptr_addr,
-    # Command/data queue
-    "CMDDAT_Q_BASE": cfg.cmddat_q_base, "CMDDAT_Q_SIZE": cfg.cmddat_q_size,
-    "SCRATCH_DB_BASE": cfg.scratch_db_base, "SCRATCH_DB_SIZE": cfg.scratch_db_size,
-    "DOWNSTREAM_SYNC_SEM_ID": 2,
-    # D-variant prefetch_d buffer (unused in HD, but constexpr needs values)
-    "CMDDAT_Q_PAGES": cfg.cmddat_q_size >> 12, "MY_UPSTREAM_CB_SEM_ID": 3,
-    "UPSTREAM_CB_SEM_ID": 3, "CMDDAT_Q_LOG_PAGE_SIZE": 12, "CMDDAT_Q_BLOCKS": 4,
-    # Dispatch subordinate buffer
-    "DISPATCH_S_BUFFER_BASE": cfg.dispatch_s_buffer_base,
-    "MY_DISPATCH_S_CB_SEM_ID": 1, "DOWNSTREAM_DISPATCH_S_CB_SEM_ID": 0,
-    "DISPATCH_S_BUFFER_SIZE": cfg.dispatch_s_buffer_size,
-    "DISPATCH_S_CB_LOG_PAGE_SIZE": cfg.dispatch_s_cb_log_page_size,
-    # Ringbuffer (used by exec_buf, set to 0 for basic usage)
-    "RINGBUFFER_SIZE": 0,
-  }
-
-  dispatch_defs = {
-    "IS_H_VARIANT": 1, "IS_D_VARIANT": 1, "DISPATCH_KERNEL": 1, "FD_CORE_TYPE": 0,
-    "MY_NOC_X": dx, "MY_NOC_Y": dy,
-    "UPSTREAM_NOC_X": px, "UPSTREAM_NOC_Y": py,
-    "DOWNSTREAM_NOC_X": dx, "DOWNSTREAM_NOC_Y": dy,  # HD: no downstream dispatch_h
-    "DOWNSTREAM_SUBORDINATE_NOC_X": dx, "DOWNSTREAM_SUBORDINATE_NOC_Y": dy,
-    "UPSTREAM_NOC_INDEX": 0,
-    # Dispatch CB
-    "DISPATCH_CB_BASE": cfg.dispatch_cb_base,
-    "DISPATCH_CB_LOG_PAGE_SIZE": cfg.dispatch_cb_log_page_size,
-    "DISPATCH_CB_PAGES": cfg.dispatch_cb_pages,
-    "DISPATCH_CB_BLOCKS": cfg.dispatch_cb_blocks,
-    "MY_DISPATCH_CB_SEM_ID": 0, "UPSTREAM_DISPATCH_CB_SEM_ID": 0,
-    "UPSTREAM_SYNC_SEM": 2,
-    # Completion queue
-    "COMMAND_QUEUE_BASE_ADDR": cfg.command_queue_base,
-    "COMPLETION_QUEUE_BASE_ADDR": cfg.completion_base,
-    "COMPLETION_QUEUE_SIZE": cfg.completion_size,
-    "HOST_COMPLETION_Q_WR_PTR": 2 * 64,  # HOST_COMPLETION_Q_WR_OFF
-    "DEV_COMPLETION_Q_WR_PTR": cfg.completion_q_wr_ptr_addr,
-    "DEV_COMPLETION_Q_RD_PTR": cfg.completion_q_rd_ptr_addr,
-    # Downstream (unused in HD, but constexpr needs values)
-    "DOWNSTREAM_CB_BASE": 0, "DOWNSTREAM_CB_SIZE": 0,
-    "MY_DOWNSTREAM_CB_SEM_ID": 1, "DOWNSTREAM_CB_SEM_ID": 1,
-    # Split dispatch (disabled)
-    "SPLIT_DISPATCH_PAGE_PREAMBLE_SIZE": 0, "SPLIT_PREFETCH": 0,
-    "PREFETCH_H_NOC_XY": 0, "PREFETCH_H_LOCAL_DOWNSTREAM_SEM_ADDR": 0,
-    "PREFETCH_H_MAX_CREDITS": 0,
-    # Worker dispatch
-    "PACKED_WRITE_MAX_UNICAST_SUB_CMDS": cfg.num_worker_cores,
-    "DISPATCH_S_SYNC_SEM_BASE_ADDR": cfg.dispatch_s_sync_sem_addr,
-    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 256,
-    "MCAST_GO_SIGNAL_ADDR": go_msg_addr, "UNICAST_GO_SIGNAL_ADDR": go_msg_addr,
-    "DISTRIBUTED_DISPATCHER": 0, "FIRST_STREAM_USED": 48,
-    "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
-    "NUM_PHYSICAL_UNICAST_CORES": 0,
-    "WORKER_MCAST_GRID": mcast_grid, "NUM_WORKER_CORES_TO_MCAST": cfg.num_worker_cores,
-  }
-
-  dispatch_s_defs = {
-    "DISPATCH_KERNEL": 1, "FD_CORE_TYPE": 0,
-    "MY_NOC_X": dx, "MY_NOC_Y": dy,
-    "UPSTREAM_NOC_X": px, "UPSTREAM_NOC_Y": py,
-    "DOWNSTREAM_NOC_X": dx, "DOWNSTREAM_NOC_Y": dy,
-    "CB_BASE": cfg.dispatch_s_buffer_base,
-    "CB_LOG_PAGE_SIZE": cfg.dispatch_s_cb_log_page_size,
-    "CB_SIZE": cfg.dispatch_s_buffer_size,
-    "MY_DISPATCH_CB_SEM_ID": 0, "UPSTREAM_DISPATCH_CB_SEM_ID": 1,
-    "DISPATCH_S_SYNC_SEM_BASE_ADDR": cfg.dispatch_s_sync_sem_addr,
-    "MCAST_GO_SIGNAL_ADDR": go_msg_addr, "UNICAST_GO_SIGNAL_ADDR": go_msg_addr,
-    "DISTRIBUTED_DISPATCHER": 0, "FIRST_STREAM_USED": 48,
-    "MAX_NUM_WORKER_SEMS": 8, "MAX_NUM_GO_SIGNAL_NOC_DATA_ENTRIES": 256,
-    "VIRTUALIZE_UNICAST_CORES": 0, "NUM_VIRTUAL_UNICAST_CORES": 0,
-    "NUM_PHYSICAL_UNICAST_CORES": 0,
-    "WORKER_MCAST_GRID": mcast_grid, "NUM_WORKER_CORES_TO_MCAST": cfg.num_worker_cores,
-  }
-
-  def _to_defs(d: dict) -> list[str]:
-    return [f"-D{k}={v}" for k, v in d.items()]
-
-  cq_src = _REPO / "firmware" / "cq"
-  cq_inc = [str(cq_src)]
-  prefetch_src = (cq_src / "cq_prefetch.cpp").read_text()
-  dispatch_src = (cq_src / "cq_dispatch.cpp").read_text()
-  dispatch_s_src = (cq_src / "cq_dispatch_subordinate.cpp").read_text()
+  cfg_hash = hashlib.sha256((_CQ_SRC_DIR / "cq_fixed_config.hpp").read_bytes()).hexdigest()[:16]
+  source_tag = f"// cq_fixed_config={cfg_hash}\n"
 
   return CompiledCQKernels(
-    prefetch_brisc=compiler._compile_dataflow(prefetch_src, "brisc", noc_index=0,
-      extra_defines=_to_defs(prefetch_defs), extra_includes=cq_inc,
-      cflags=_CQ_CFLAGS, xip_relocate=True),
-    dispatch_brisc=compiler._compile_dataflow(dispatch_src, "brisc", noc_index=1,
-      extra_defines=_to_defs(dispatch_defs), extra_includes=cq_inc,
-      cflags=_CQ_CFLAGS, xip_relocate=True),
-    dispatch_s_ncrisc=compiler._compile_dataflow(dispatch_s_src, "ncrisc", noc_index=1,
-      extra_defines=_to_defs(dispatch_s_defs), extra_includes=cq_inc,
-      cflags=_CQ_CFLAGS, xip_relocate=True),
+    prefetch_brisc=compiler._compile_dataflow(source_tag + _CQ_PREFETCH_SRC, "brisc", noc_index=0,
+      extra_includes=_CQ_INC,
+      xip_relocate=True),
+    dispatch_brisc=compiler._compile_dataflow(source_tag + _CQ_DISPATCH_SRC, "brisc", noc_index=1,
+      extra_includes=_CQ_INC,
+      xip_relocate=True),
+    dispatch_s_ncrisc=compiler._compile_dataflow(source_tag + _CQ_DISPATCH_S_SRC, "ncrisc", noc_index=1,
+      extra_includes=_CQ_INC,
+      xip_relocate=True),
   )
 
 def _tile_size(fmt: int) -> int:
   return {
-    0: 4096,                    # Float32
-    1: 2048, 5: 2048,           # Float16, Float16_b
-    2: 1088, 6: 1088, 10: 1088, 26: 1088,  # Bfp8, Bfp8_b, Lf8, Fp8_e4m3
-    3: 576, 7: 576,             # Bfp4, Bfp4_b
-    11: 320, 15: 320,           # Bfp2, Bfp2_b
+    0: 4096,   # Float32
+    1: 2048,   # Float16
+    5: 2048,   # Float16_b
+    8: 4096,   # Int32
+    9: 2048,   # UInt16
+    14: 1024,  # Int8
+    24: 4096,  # UInt32
+    26: 1024,  # Fp8_e4m3
+    30: 1024,  # UInt8
   }.get(fmt) or (_ for _ in ()).throw(ValueError(f"unsupported format: {fmt}"))

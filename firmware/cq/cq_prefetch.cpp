@@ -16,6 +16,7 @@
 //  Using the normal NoC APIs for writes and/or inline_dw_writes are not allowed on this kernel.
 //
 
+#include "cq_fixed_config.hpp"
 #include "api/dataflow/dataflow_api.h"
 #include "internal/dataflow/dataflow_api_addrgen.h"
 #include "cq_commands.hpp"

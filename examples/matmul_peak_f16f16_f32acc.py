@@ -10,7 +10,7 @@ import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.p
 import time
 import numpy as np
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
-from device import Device, Program, DataflowLaunch, CoreSet
+from device import Device, Program, DataflowLaunch
 from dram import DType
 
 # Matrix dimensions tuned for 10x11 core grid
@@ -103,7 +103,7 @@ void kernel_main() {{
   *(in0_recv_sem_ptr) = VALID;
 
   const InterleavedAddrGenFast<true> in0_gen = {{
-    .bank_base_address = in0_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.cname},
+    .bank_base_address = in0_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
 
   uint32_t in0_current_block_start = in0_start_tile_id;
@@ -229,10 +229,10 @@ void kernel_main() {{
   *(in1_recv_sem_ptr) = VALID;
 
   const InterleavedAddrGenFast<true> in1_gen = {{
-    .bank_base_address = in1_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.cname},
+    .bank_base_address = in1_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
   const InterleavedAddrGenFast<true> out_gen = {{
-    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.cname},
+    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
 
   // === in1 block loop ===
@@ -325,7 +325,7 @@ void kernel_main() {{
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
   const uint32_t tile_bytes = get_tile_size(cb_in1);
   const InterleavedAddrGenFast<true> out_gen = {{
-    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.cname},
+    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
 
   volatile tt_l1_ptr uint32_t* in1_recv_sem_ptr =
@@ -671,7 +671,7 @@ def main():
         continue
       dataflow.append(
         DataflowLaunch(
-          cores=CoreSet.from_cores(cores),
+          cores=cores,
           reader=reader_k,
           writer=writer_k,
           reader_rt_args=reader_args,
@@ -686,7 +686,7 @@ def main():
       cbs=[0, 1, 16, 24],
       tile_size=TILE_BYTES,
       num_pages=CB0_PAGES,
-      cores=active_cores,
+      cores=len(active_cores),
       num_sems=NUM_SEMS,
       cb_config={
         0:  (CB0_PAGES, TILE_BYTES),

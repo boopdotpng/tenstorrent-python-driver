@@ -1,25 +1,16 @@
-from device_runtime import Program, DataflowLaunch, CoreSet, CoreRange, TileGrid, ArgGen
+from device_runtime import Program, DataflowLaunch, TileGrid, ArgGen
 from device_dispatch import SlowDevice, FastDevice
-from helpers import USE_SLOW_DISPATCH
+from helpers import USE_USB_DISPATCH
+
+__all__ = ["Program", "DataflowLaunch", "TileGrid", "ArgGen", "SlowDevice", "FastDevice", "Device"]
 
 class Device:
-  def __init__(self, device: int = 0):
-    if USE_SLOW_DISPATCH:
-      self._impl = SlowDevice(device=device)
-      return
+  def __new__(cls, device: int = 0):
+    if USE_USB_DISPATCH:
+      return SlowDevice(device=device)
     try:
-      self._impl = FastDevice(device=device)
+      return FastDevice(device=device)
     except RuntimeError as exc:
       if "missing fast-dispatch firmware" not in str(exc): raise
       print(f"[blackhole-py] {exc}; falling back to slow dispatch")
-      self._impl = SlowDevice(device=device)
-
-  def __getattr__(self, name: str):
-    return getattr(self._impl, name)
-
-  def close(self):
-    self._impl.close()
-
-__all__ = [
-  "ArgGen", "Program", "DataflowLaunch", "CoreSet", "CoreRange", "TileGrid", "SlowDevice", "FastDevice", "Device"
-]
+      return SlowDevice(device=device)

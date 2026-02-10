@@ -2,7 +2,9 @@ import os, struct
 from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
 from dataclasses import dataclass
 
-USE_SLOW_DISPATCH = os.environ.get("TT_SLOW_DISPATCH") == "1"
+USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
+HiReloc = tuple[int, int]
+LoReloc = tuple[int, int, int]
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
@@ -45,7 +47,6 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
   # convert ABS HI20/LO12 references to text symbols into PCREL-style encodings.
   data = bytearray(elf)
 
-  # ELF32 header fields we need.
   e_phoff = struct.unpack_from("<I", data, 28)[0]
   e_shoff = struct.unpack_from("<I", data, 32)[0]
   e_phentsize, e_phnum = struct.unpack_from("<HH", data, 42)
@@ -56,17 +57,14 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
   if e_phoff + e_phentsize * e_phnum > len(data) or e_shoff + e_shentsize * e_shnum > len(data):
     return elf
 
-  # Reloc types (RISC-V ELF32).
   R_RISCV_HI20 = 26
   R_RISCV_LO12_I = 27
   R_RISCV_LO12_S = 28
 
-  # Section header helpers.
   def shdr(i: int) -> tuple[int, int, int, int, int, int, int, int, int, int]:
     off = e_shoff + i * e_shentsize
     return struct.unpack_from("<IIIIIIIIII", data, off)
 
-  # Symbol table entry helper.
   def sym(symtab_idx: int, sym_idx: int) -> tuple[int, int, int, int, int, int]:
     _, _, _, _, sh_offset, sh_size, sh_link, _, _, sh_entsize = shdr(symtab_idx)
     if sh_entsize < 16:
@@ -77,7 +75,6 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
     st_name, st_value, st_size, st_info, st_other, st_shndx = struct.unpack_from("<IIIBBH", data, soff)
     return st_name, st_value, st_size, st_info, st_other, st_shndx
 
-  # First PT_LOAD is text segment for these kernels.
   text_vaddr, text_memsz = None, None
   for i in range(e_phnum):
     off = e_phoff + i * e_phentsize
@@ -90,7 +87,6 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
   text_end = text_vaddr + text_memsz
 
   def is_text_addr(addr: int) -> bool:
-    # Linker symbols like __kernel_data_lma can sit exactly at text end.
     return text_vaddr <= addr <= text_end
 
   def read_u32_at_vaddr(sec_idx: int, addr: int) -> int:
@@ -107,7 +103,6 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
       raise ValueError("reloc offset out of section")
     struct.pack_into("<I", data, sh_offset + rel, value & 0xFFFFFFFF)
 
-  # Process each SHT_RELA section whose target is allocatable/non-NOBITS.
   for rel_sec_idx in range(e_shnum):
     sh_name, sh_type, _, _, sh_offset, sh_size, sh_link, sh_info, _, sh_entsize = shdr(rel_sec_idx)
     if sh_type != 4:  # SHT_RELA
@@ -120,8 +115,8 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
       continue
 
     rela_count = sh_size // sh_entsize
-    hi_by_sym: dict[int, list[tuple[int, int]]] = {}
-    lo_relocs: list[tuple[int, int, int]] = []
+    hi_by_sym: dict[int, list[HiReloc]] = {}
+    lo_relocs: list[LoReloc] = []
 
     for j in range(rela_count):
       roff = sh_offset + j * sh_entsize
@@ -142,7 +137,6 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
       hi_list = hi_by_sym.get(lo_sym)
       if not hi_list:
         continue
-      # Match nearest preceding HI20 of same symbol.
       hi_offset, hi_addend = hi_list[0]
       for cand_off, cand_add in hi_list:
         if cand_off < lo_offset:
@@ -151,16 +145,13 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
           break
 
       _, st_value, _, _, _, _ = sym(sh_link, lo_sym)
-      # Same math tt-metal uses for ABS->PCREL conversion.
       value = (st_value + hi_addend - hi_offset) & 0xFFFFFFFF
 
       hi_insn = read_u32_at_vaddr(sh_info, hi_offset)
-      # Expect LUI opcode.
       if (hi_insn & 0x7F) != 0x37:
         continue
       rd = (hi_insn >> 7) & 0x1F
       new_hi_imm = ((value + 0x800) >> 12) & 0xFFFFF
-      # AUIPC opcode with same rd.
       new_hi = (new_hi_imm << 12) | (rd << 7) | 0x17
       write_u32_at_vaddr(sh_info, hi_offset, new_hi)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
 from codegen import Compiler
-from device import Device, Program, DataflowLaunch, CoreSet
+from device import Device, Program, DataflowLaunch
 from dram import DType
 
 K_READER = r"""
@@ -92,7 +92,7 @@ def _bf16_from_f32(x: float) -> int:
 def _f32_from_bf16(x: int) -> float:
   return struct.unpack("<f", struct.pack("<I", (x & 0xFFFF) << 16))[0]
 
-def _make_bf16_buffer(n_tiles: int, *, seed: int = 0) -> bytes:
+def _make_bf16_buffer(n_tiles: int, seed: int = 0) -> bytes:
   r = random.Random(seed)
   out = bytearray(n_tiles * 32 * 32 * 2)
   for i in range(n_tiles * 32 * 32):
@@ -139,7 +139,7 @@ def main():
 
     program = Program(
       dataflow=[DataflowLaunch(
-        cores=CoreSet.from_cores(device.dispatchable_cores),
+        cores=device.dispatchable_cores,
         reader=reader,
         writer=writer,
         reader_rt_args=reader_args,

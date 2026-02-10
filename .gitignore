@@ -1,4 +1,6 @@
 __pycache__
+.ruff-cache/
+.vscode/
 tt-metal-deps/
 .metal-cache/
 progress.md

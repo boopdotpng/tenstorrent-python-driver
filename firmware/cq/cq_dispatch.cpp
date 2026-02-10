@@ -10,6 +10,7 @@
 //  - # blocks must evenly divide the dispatch buffer size
 //  - dispatch buffer base must be page size aligned
 
+#include "cq_fixed_config.hpp"
 #include "api/dataflow/dataflow_api.h"
 #include "internal/dataflow/dataflow_api_addrgen.h"
 #include "api/debug/assert.h"

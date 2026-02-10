@@ -1,62 +1,23 @@
 import os, struct, time
 from dataclasses import dataclass, field
-from typing import ClassVar, Callable
+from typing import ClassVar, Callable, Literal
 from pathlib import Path
 from defs import *
 from codegen import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import align_down, generate_jal_instruction, noc_xy
 
-# Per-core arg generator: (core_idx, core_xy, num_cores) -> list[int]
-ArgGen = Callable[[int, tuple[int, int], int], list[int]]
-
-@dataclass
-class CoreRange:
-  start: tuple[int, int]
-  end: tuple[int, int]
-
-  def __post_init__(self):
-    x0, y0 = self.start
-    x1, y1 = self.end
-    self.start = (min(x0, x1), min(y0, y1))
-    self.end = (max(x0, x1), max(y0, y1))
-
-  def cores(self) -> list[tuple[int, int]]:
-    x0, y0 = self.start
-    x1, y1 = self.end
-    return [(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)]
-
-@dataclass
-class CoreSet:
-  ranges: list[CoreRange]
-
-  @staticmethod
-  def from_cores(cores: list[tuple[int, int]]) -> "CoreSet":
-    remaining = set(cores)
-    ranges: list[CoreRange] = []
-    while remaining:
-      x0, y0 = min(remaining, key=lambda xy: (xy[1], xy[0]))
-      x1 = x0
-      while (x1 + 1, y0) in remaining:
-        x1 += 1
-      y1 = y0
-      while all((x, y1 + 1) in remaining for x in range(x0, x1 + 1)):
-        y1 += 1
-      for y in range(y0, y1 + 1):
-        for x in range(x0, x1 + 1):
-          remaining.remove((x, y))
-      ranges.append(CoreRange((x0, y0), (x1, y1)))
-    return CoreSet(ranges=ranges)
-
-  def cores(self) -> list[tuple[int, int]]:
-    out: set[tuple[int, int]] = set()
-    for r in self.ranges:
-      out.update(r.cores())
-    return sorted(out, key=lambda xy: (xy[1], xy[0]))
+CoreSpec = int | Literal["all"]
+Core = tuple[int, int]
+DramTile = tuple[int, int, int]
+BankPort = tuple[int, int]
+CoreList = list[Core]
+DramTileList = list[DramTile]
+ArgGen = Callable[[int, Core, int], list[int]]
 
 @dataclass
 class DataflowLaunch:
-  cores: CoreSet | CoreRange | list[tuple[int, int]]
+  cores: CoreList
   reader_rt_args: list[int] | ArgGen
   writer_rt_args: list[int] | ArgGen
   reader: CompiledKernel | None = None
@@ -70,20 +31,20 @@ class Program:
   cbs: list[int]
   tile_size: int
   num_pages: int
-  cores: list[tuple[int, int]] | None = None
+  cores: CoreSpec = "all"
   num_sems: int = 0
   cb_config: dict[int, tuple[int, int]] | None = None  # {cb_id: (num_pages, page_size)}
 
 @dataclass
 class TileGrid:
-  ARC: ClassVar[tuple[int, int]] = (8, 0)
+  ARC: ClassVar[Core] = (8, 0)
   TENSIX_X: ClassVar[tuple[int, ...]] = (*range(1, 8), *range(10, 15))
   TENSIX_Y: ClassVar[tuple[int, int]] = (2, 11)
-  TENSIX: ClassVar[list[tuple[int, int]]] = [(x, y) for x in TENSIX_X for y in range(2, 12)]
-  TENSIX_MCAST: ClassVar[list[tuple[int, int]]] = [(1, 7), (10, 14)]
+  TENSIX: ClassVar[CoreList] = [(x, y) for x in TENSIX_X for y in range(2, 12)]
+  TENSIX_MCAST: ClassVar[CoreList] = [(1, 7), (10, 14)]
 
   harvested_dram_bank: int
-  dram: list[tuple[int, int, int]] = field(init=False)
+  dram: DramTileList = field(init=False)
 
   def __post_init__(self):
     self.dram = [(bank, Dram.BANK_X[bank], y) for bank in range(Dram.BANK_COUNT)
@@ -111,7 +72,7 @@ class CommonDevice:
     self.dispatchable_cores = list(self.worker_cores)
     self.upload_firmware()
 
-  def _core_exists(self, core: tuple[int, int]) -> bool:
+  def _core_exists(self, core: Core) -> bool:
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
     cfg = TLBConfig(addr=reg_base, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
@@ -216,7 +177,7 @@ class CommonDevice:
 
     self._wait_firmware_ready()
 
-  def _firmware_skip_cores(self) -> set[tuple[int, int]]:
+  def _firmware_skip_cores(self) -> set[Core]:
     return set()
 
   def _wait_firmware_ready(self):
@@ -238,9 +199,9 @@ class CommonDevice:
     NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
     WORKER_EP_LOGICAL = {0: [2, 1], 1: [0, 1], 2: [0, 1], 3: [0, 1], 4: [2, 1], 5: [2, 1], 6: [2, 1], 7: [2, 1]}
 
-    def dram_translated_map(harvested_bank: int | None) -> dict[tuple[int, int], tuple[int, int]]:
+    def dram_translated_map(harvested_bank: int | None) -> dict[BankPort, Core]:
       START_X, START_Y, PORTS, TOTAL_BANKS = 17, 12, 3, 8
-      m: dict[tuple[int, int], tuple[int, int]] = {}
+      m: dict[BankPort, Core] = {}
 
       def map_banks(start: int, end: int, x: int, y0: int = START_Y):
         y = y0
@@ -347,18 +308,12 @@ class CommonDevice:
     if aiclk <= Arc.DEFAULT_AICLK:
       raise RuntimeError(f"AICLK failed to enter busy state (last={aiclk} MHz)")
 
-  def _set_power_state_idle(self):
-    try:
-      self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
-    except Exception:
-      pass
-
   def _close(self):
     if hasattr(self, "dram"): self.dram.close()
     if hasattr(self, "win"): self.win.free()
     os.close(self.fd)
 
-  def arc_msg(self, msg: int, arg0: int = 0, arg1: int = 0, *, queue: int = 0, timeout_ms: int = 1000) -> list[int]:
+  def arc_msg(self, msg: int, arg0: int = 0, arg1: int = 0, queue: int = 0, timeout_ms: int = 1000) -> list[int]:
     MSG_QUEUE_SIZE, REQUEST_MSG_LEN, RESPONSE_MSG_LEN = 4, 8, 8
     MSG_QUEUE_POINTER_WRAP = 2 * MSG_QUEUE_SIZE
     HEADER_BYTES, REQUEST_BYTES, RESPONSE_BYTES = 8 * 4, REQUEST_MSG_LEN * 4, RESPONSE_MSG_LEN * 4
@@ -407,5 +362,5 @@ class CommonDevice:
 
   def close(self):
     if hasattr(self, "fd"):
-      self._set_power_state_idle()
+      self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
     self._close()

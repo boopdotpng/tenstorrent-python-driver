@@ -1,4 +1,3 @@
-# Hardware constants + kernel driver ioctl structs for Blackhole (p100a)
 import ctypes
 from ctypes import (
   LittleEndianStructure as S,
@@ -9,18 +8,12 @@ from ctypes import (
 )
 from enum import Enum
 
-# -- TLB sizes ----------------------------------------------------------------
-
 class TLBSize(Enum):
   MiB_2 = 1 << 21  # BAR 0: 201 available, for L1/registers
   GiB_4 = 1 << 32  # BAR 4: 8 available, for GDDR6 banks
 
-# -- DRAM constants ------------------------------------------------------------
-
 DRAM_BARRIER_BASE = 0x0
 DRAM_ALIGNMENT = 64
-
-# -- Tensix L1 memory map -----------------------------------------------------
 
 class TensixL1:
   SIZE = 0x180000
@@ -36,17 +29,13 @@ class TensixL1:
   TRISC2_BASE = 0x006640
   DATA_BUFFER_SPACE_BASE = 0x037000
 
-  # Init scratch for local-mem relocation
   BRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x0082B0
   NCRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x00A2B0
   TRISC0_INIT_LOCAL_L1_BASE_SCRATCH = 0x00C2B0
   TRISC1_INIT_LOCAL_L1_BASE_SCRATCH = 0x00D2B0
   TRISC2_INIT_LOCAL_L1_BASE_SCRATCH = 0x00E2B0
 
-  # Bank-to-NoC mapping tables (written by host, read by firmware)
   MEM_BANK_TO_NOC_SCRATCH = 0x0112B0
-
-# -- Tensix MMIO registers ----------------------------------------------------
 
 class TensixMMIO:
   LOCAL_RAM_START = 0xFFB00000
@@ -65,8 +54,6 @@ class TensixMMIO:
   SOFT_RESET_BRISC_ONLY_RUN = 0x47000  # keep TRISC/NCRISC in reset, release BRISC
   SOFT_RESET_BRISC_NCRISC_RUN = 0x7000  # keep TRISC in reset, release BRISC/NCRISC
 
-# -- ARC -----------------------------------------------------------------------
-
 class Arc:
   NOC_BASE = 0x80000000
   CSM_START = 0x10000000
@@ -81,8 +68,6 @@ class Arc:
   TAG_GDDR_ENABLED = 36
   DEFAULT_AICLK = 800
   DEFAULT_GDDR_ENABLED = 0xFF
-
-# -- DRAM banks ----------------------------------------------------------------
 
 class Dram:
   BANK_COUNT = 8
@@ -101,8 +86,6 @@ class Dram:
   }
   BANK_X = {b: 0 if b < 4 else 9 for b in range(8)}
 
-# -- Kernel driver ioctls ------------------------------------------------------
-
 TENSTORRENT_IOCTL_MAGIC = 0xFA
 IOCTL_PIN_PAGES = 7
 IOCTL_UNPIN_PAGES = 10
@@ -112,8 +95,6 @@ IOCTL_CONFIGURE_TLB = 13
 
 PIN_PAGES_CONTIGUOUS = 1
 PIN_PAGES_NOC_DMA = 2
-
-# -- Ioctl structs -------------------------------------------------------------
 
 class PinPagesIn(S):
   _fields_ = [("output_size_bytes", u32), ("flags", u32), ("virtual_address", u64), ("size", u64)]
@@ -161,13 +142,8 @@ class NocTlbConfig(S):
 class ConfigureTlbIn(S):
   _fields_ = [("tlb_id", u32), ("reserved", u32), ("config", NocTlbConfig)]
 
-# -- Firmware dispatch structs -------------------------------------------------
-
 def as_bytes(obj) -> bytes:
   return ctypes.string_at(ctypes.addressof(obj), ctypes.sizeof(obj))
-
-class CB:
-  NUM_CIRCULAR_BUFFERS = 32
 
 class LocalCBConfig(S):
   _pack_ = 1
@@ -267,17 +243,14 @@ class FastDispatch:
   PREFETCH_CMDDAT_Q_SIZE = 256 * 1024
   PREFETCH_SCRATCH_DB_SIZE = 128 * 1024
 
-class CQPrefetchCmdId:
-  RELAY_INLINE = 5
-
-class CQDispatchCmdId:
-  WRITE_LINEAR = 1
-  WRITE_LINEAR_H_HOST = 3
-  WRITE_PACKED = 5
-  WRITE_PACKED_LARGE = 6
-  WAIT = 7
-  SEND_GO_SIGNAL = 14
-  SET_GO_SIGNAL_NOC_DATA = 17
+CQ_PREFETCH_CMD_RELAY_INLINE = 5
+CQ_DISPATCH_CMD_WRITE_LINEAR = 1
+CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST = 3
+CQ_DISPATCH_CMD_WRITE_PACKED = 5
+CQ_DISPATCH_CMD_WRITE_PACKED_LARGE = 6
+CQ_DISPATCH_CMD_WAIT = 7
+CQ_DISPATCH_CMD_SEND_GO_SIGNAL = 14
+CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA = 17
 
 CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE = 0x02
 CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK = 0x01

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import struct, random
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
-from device import Device, Program, DataflowLaunch, CoreSet
+from device import Device, Program, DataflowLaunch
 from dram import DType
 
 M, K, N = 2048, 2048, 2048
@@ -205,7 +205,7 @@ def main():
 
     program = Program(
       dataflow=[DataflowLaunch(
-        cores=CoreSet.from_cores(cores),
+        cores=cores,
         reader=reader,
         writer=writer,
         reader_rt_args=reader_args,
@@ -216,7 +216,7 @@ def main():
       cbs=[0, 1, 16],
       tile_size=tile_bytes,
       num_pages=2,
-      cores=cores,
+      cores=active_cores,
     )
 
     total, dispatch = device.run(program, wait=True)

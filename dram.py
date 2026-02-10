@@ -1,6 +1,7 @@
 import os, mmap, fcntl, ctypes
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import Callable
 from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn, PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES
 from tlb import TLBConfig, TLBWindow, TLBMode
@@ -9,16 +10,20 @@ from helpers import _IO, align_up
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
 TILE_ELEMS = TILE_R * TILE_C
+Core = tuple[int, int]
+DramTile = tuple[int, int, int]
+Shape = tuple[int, ...]
 
 class DType(Enum):
   float32 = 4
+  float16 = 2
   int32 = 4
   uint32 = 4
-  float16 = 2
-  bfloat16 = 2
   uint16 = 2
   int8 = 1
+  fp8_e4m3 = 1
   uint8 = 1
+  bfloat16 = uint16  # compatibility alias
 
 def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
   n_tiles = len(data) // (TILE_ELEMS * bpe)
@@ -35,7 +40,7 @@ def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
           out[dst : dst + FACE_C * bpe] = data[src : src + FACE_C * bpe]
   return bytes(out)
 
-def _grid_transform(data: bytes, bpe: int, shape: tuple[int, ...], forward: bool) -> bytes:
+def _grid_transform(data: bytes, bpe: int, shape: Shape, forward: bool) -> bytes:
   assert len(shape) >= 2, "Expected at least 2 dimensions"
   rows, cols = shape[-2], shape[-1]
   assert rows % TILE_R == 0 and cols % TILE_C == 0, "Last two dimensions must be tile-aligned"
@@ -45,7 +50,6 @@ def _grid_transform(data: bytes, bpe: int, shape: tuple[int, ...], forward: bool
   slice_bytes = rows * cols * bpe
   assert len(data) == batch * slice_bytes, "Data size does not match shape"
   tile_rows, tile_cols = rows // TILE_R, cols // TILE_C
-  tiles_per_slice = tile_rows * tile_cols
   out = bytearray(len(data))
   for b in range(batch):
     base = b * slice_bytes
@@ -59,11 +63,11 @@ def _grid_transform(data: bytes, bpe: int, shape: tuple[int, ...], forward: bool
           out[dst : dst + TILE_C * bpe] = data[src : src + TILE_C * bpe]
   return bytes(out)
 
-def tilize(data: bytes, bpe: int, shape: tuple[int, ...]) -> bytes:
+def tilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   data = _grid_transform(data, bpe, shape, forward=True)
   return _face_transform(data, bpe, forward=True)
 
-def untilize(data: bytes, bpe: int, shape: tuple[int, ...]) -> bytes:
+def untilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   data = _face_transform(data, bpe, forward=False)
   return _grid_transform(data, bpe, shape, forward=False)
 
@@ -168,22 +172,15 @@ void kernel_main() {
 }
 """
 
-_drain_kernel = None
-_fill_kernel = None
+@lru_cache(maxsize=1)
+def _drain_kernel():
+  from codegen import Compiler
+  return Compiler()._compile_dataflow(_DRAIN_KERNEL_SRC, "ncrisc", noc_index=0)
 
-def _get_drain_kernel():
-  global _drain_kernel
-  if _drain_kernel is None:
-    from codegen import Compiler
-    _drain_kernel = Compiler()._compile_dataflow(_DRAIN_KERNEL_SRC, "ncrisc", noc_index=0)
-  return _drain_kernel
-
-def _get_fill_kernel():
-  global _fill_kernel
-  if _fill_kernel is None:
-    from codegen import Compiler
-    _fill_kernel = Compiler()._compile_dataflow(_FILL_KERNEL_SRC, "ncrisc", noc_index=0)
-  return _fill_kernel
+@lru_cache(maxsize=1)
+def _fill_kernel():
+  from codegen import Compiler
+  return Compiler()._compile_dataflow(_FILL_KERNEL_SRC, "ncrisc", noc_index=0)
 
 @dataclass(frozen=True)
 class DramBuffer:
@@ -192,18 +189,11 @@ class DramBuffer:
   size: int
   page_size: int
   dtype: DType | None = None
-  shape: tuple[int, ...] | None = None
+  shape: Shape | None = None
 
 class DramAllocator:
-  def __init__(
-    self,
-    fd: int,
-    dram_tiles: list[tuple[int, int, int]],
-    *,
-    run_fn: Callable | None = None,
-    sync_fn: Callable | None = None,
-    enable_sysmem: bool = False,
-  ):
+  def __init__(self, fd: int, dram_tiles: list[DramTile], run_fn: Callable | None = None, sync_fn: Callable | None = None,
+               enable_sysmem: bool = False):
     self.fd = fd
     self.bank_tiles = dram_tiles[:: Dram.TILES_PER_BANK]
     self.next = Dram.DRAM_WRITE_OFFSET
@@ -217,10 +207,8 @@ class DramAllocator:
     self._inflight_manual_reads: list[DramBuffer] = []
     self._ready_reads: dict[int, list[bytes]] = {}
 
-  def alloc(
-    self, size: int, name: str | None = None, *, page_size: int | None = None,
-    dtype: DType | None = None, shape: tuple[int, ...] | None = None
-  ) -> DramBuffer:
+  def alloc(self, size: int, name: str | None = None, page_size: int | None = None, dtype: DType | None = None,
+            shape: Shape | None = None) -> DramBuffer:
     num_banks = len(self.bank_tiles)
     page_size = min(
       self.max_page_size, page_size or align_up((size + num_banks - 1) // num_banks, DRAM_ALIGNMENT)
@@ -232,17 +220,13 @@ class DramAllocator:
     self.next = align_up(self.next + pages_per_bank * page_size, DRAM_ALIGNMENT)
     return DramBuffer(name=name, addr=addr, size=size, page_size=page_size, dtype=dtype, shape=shape)
 
-  def alloc_write(
-    self, data: bytes, name: str | None = None, *, page_size: int | None = None,
-    dtype: DType | None = None, shape: tuple[int, ...] | None = None
-  ) -> DramBuffer:
+  def alloc_write(self, data: bytes, name: str | None = None, page_size: int | None = None, dtype: DType | None = None,
+                  shape: Shape | None = None) -> DramBuffer:
     buf = self.alloc(len(data), name=name, page_size=page_size, dtype=dtype, shape=shape)
     self.write(buf, data)
     return buf
 
-  def _for_each_page(
-    self, buf: DramBuffer, size: int, mode: TLBMode, fn: Callable[[int, int], None]
-  ) -> list[tuple[int, int, int]]:
+  def _for_each_page(self, buf: DramBuffer, size: int, mode: TLBMode, fn: Callable[[int, int], None]) -> list[DramTile]:
     num_banks = len(self.bank_tiles)
     pages = (size + buf.page_size - 1) // buf.page_size
     touched = []
@@ -258,7 +242,7 @@ class DramAllocator:
         local_page += 1
     return touched
 
-  def barrier(self, tiles: list[tuple[int, int, int]]):
+  def barrier(self, tiles: list[DramTile]):
     for flag in Dram.BARRIER_FLAGS:
       for _, x, y in tiles:
         self.win.configure(TLBConfig(addr=0, start=(x, y), end=(x, y), noc=0, mcast=False, mode=TLBMode.STRICT))
@@ -288,7 +272,7 @@ class DramAllocator:
     cores = all_cores[:min(len(all_cores), n_tiles)]
     base_args = [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset]
 
-    def reader_args(core_idx: int, core_xy: tuple[int,int], n_cores: int) -> list[int]:
+    def reader_args(core_idx: int, core_xy: Core, n_cores: int) -> list[int]:
       start = core_idx * tiles_per_core
       count = min(tiles_per_core, n_tiles - start) if start < n_tiles else 0
       return base_args + [start, count, buf.page_size] + extra_args
@@ -296,12 +280,12 @@ class DramAllocator:
     self._run_fn(Program(
       dataflow=[DataflowLaunch(cores=cores, reader=kernel, reader_rt_args=reader_args, writer_rt_args=[])],
       compute=None, compute_rt_args=[], cbs=[0],
-      tile_size=buf.page_size, num_pages=2, cores=cores,
+      tile_size=buf.page_size, num_pages=2, cores=len(cores),
     ), timing=False, wait=False)
 
   def _write_fast(self, buf: DramBuffer, data: bytes):
     self.sysmem.buf[:len(data)] = data
-    self._run_transfer_kernel(buf, _get_fill_kernel(), len(data))
+    self._run_transfer_kernel(buf, _fill_kernel(), len(data))
 
   def _write_slow(self, buf: DramBuffer, data: bytes):
     # Slow TLB writes bypass CQ ordering; drain any queued device work first.
@@ -330,12 +314,10 @@ class DramAllocator:
     return out
 
   def enqueue_read(self, buf: DramBuffer):
-    """Queue a DRAM readback; execution is deferred until the next sync."""
     use_fast = self.sysmem is not None and buf.size <= self.sysmem.size
     self._pending_reads.append((buf, use_fast))
 
   def prepare_sync(self):
-    """Prepare queued reads before waiting on device completion."""
     if not self._pending_reads:
       return
     next_off = 0
@@ -354,7 +336,6 @@ class DramAllocator:
     self._pending_reads.clear()
 
   def finish_sync(self):
-    """Finalize queued reads after device completion."""
     for buf, off in self._inflight_fast_reads:
       self._store_ready_read(buf, self._read_fast_result(buf, off))
     self._inflight_fast_reads.clear()
@@ -365,8 +346,8 @@ class DramAllocator:
   def _store_ready_read(self, buf: DramBuffer, data: bytes):
     self._ready_reads.setdefault(id(buf), []).append(data)
 
-  def _enqueue_read_fast(self, buf: DramBuffer, *, sysmem_local_offset: int):
-    self._run_transfer_kernel(buf, _get_drain_kernel(), buf.size, extra_args=[sysmem_local_offset])
+  def _enqueue_read_fast(self, buf: DramBuffer, sysmem_local_offset: int):
+    self._run_transfer_kernel(buf, _drain_kernel(), buf.size, extra_args=[sysmem_local_offset])
 
   def _read_fast_result(self, buf: DramBuffer, off: int) -> bytes:
     assert self.sysmem is not None

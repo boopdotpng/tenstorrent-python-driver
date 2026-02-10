@@ -10,7 +10,7 @@ import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.p
 import time
 import numpy as np
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
-from device import Device, Program, DataflowLaunch, CoreSet
+from device import Device, Program, DataflowLaunch
 from dram import DType
 
 # Matrix dimensions tuned for 10x11 core grid
@@ -641,7 +641,7 @@ def main():
         continue
       dataflow.append(
         DataflowLaunch(
-          cores=CoreSet.from_cores(cores),
+          cores=cores,
           reader=reader_k,
           writer=writer_k,
           reader_rt_args=reader_args,
@@ -656,7 +656,7 @@ def main():
       cbs=[0, 1, 16, 24],
       tile_size=TILE_BYTES,
       num_pages=CB0_PAGES,
-      cores=active_cores,
+      cores=len(active_cores),
       num_sems=NUM_SEMS,
       cb_config={
         0:  (CB0_PAGES, TILE_BYTES),

@@ -5,6 +5,8 @@ from defs import *
 from helpers import _IO, noc1
 import fcntl, mmap
 
+Core = tuple[int, int]
+
 class TLBMode(Enum):
   RELAXED = 0  # bulk transfers, may reorder
   STRICT = 1   # full ordering, slow dispatch
@@ -13,8 +15,8 @@ class TLBMode(Enum):
 @dataclass
 class TLBConfig:
   addr: int
-  start: tuple[int, int] | None = None
-  end: tuple[int, int] | None = None
+  start: Core | None = None
+  end: Core | None = None
   noc: int = 0
   mcast: bool = False
   mode: TLBMode = TLBMode.RELAXED
@@ -103,5 +105,5 @@ class TLBWindow:
   def __enter__(self):
     return self
 
-  def __exit__(self, *_):
+  def __exit__(self, *_exc):
     self.free()
