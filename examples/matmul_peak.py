@@ -43,8 +43,8 @@ IN0_SEND_SEM, IN0_RECV_SEM = 0, 1
 IN1_SEND_SEM, IN1_RECV_SEM = 2, 3
 NUM_SEMS = 4
 
-WARMUP_ITERS = 3
-TIMED_ITERS = 1
+WARMUP_ITERS = 2
+TIMED_ITERS = 5
 
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
 K_READER_SENDER = f"""
@@ -671,27 +671,15 @@ def main():
       device.run(program)
 
     print(f"Timing ({TIMED_ITERS} iters)...")
-    total_s = 0.0
-    dispatch_s = 0.0
     t0_wall = time.perf_counter()
     for _ in range(TIMED_ITERS):
-      total, dispatch = device.run(program)
-      total_s += total
-      dispatch_s += dispatch
+      device.run(program)
     elapsed_wall = (time.perf_counter() - t0_wall) / TIMED_ITERS
-    elapsed_total = total_s / TIMED_ITERS
-    elapsed_compute = (total_s - dispatch_s) / TIMED_ITERS
 
     flops = 2.0 * M * N * K
     tflops_wall = flops / elapsed_wall / 1e12
-    tflops_total = flops / elapsed_total / 1e12
-    tflops_compute = flops / elapsed_compute / 1e12
-    print(f"\nAvg latency (compute): {elapsed_compute * 1e3:.3f} ms")
-    print(f"Throughput (compute):  {tflops_compute:.2f} TFLOPS (HiFi2 bf16, {NUM_ROWS * NUM_COLS} cores)")
-    print(f"Avg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
-    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS")
-    print(f"Avg latency (total):   {elapsed_total * 1e3:.3f} ms")
-    print(f"Throughput (total):    {tflops_total:.2f} TFLOPS")
+    print(f"\nAvg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
+    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS (HiFi2 bf16, {NUM_ROWS * NUM_COLS} cores)")
     c_rm = device.dram.read(c_buf)
     _validate_matmul(a_ref, b_ref, c_rm)
 
