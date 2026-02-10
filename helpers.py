@@ -6,9 +6,13 @@ USE_SLOW_DISPATCH = os.environ.get("TT_SLOW_DISPATCH") == "1"
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
+def align_up(n: int, a: int) -> int: return (n + a - 1) & ~(a - 1)
+
 def align_down(value: int, alignment: TLBSize) -> tuple[int, int]:
   base = value & ~(alignment.value - 1)
   return base, value - base
+
+def noc_xy(x: int, y: int) -> int: return ((y << 6) | x) & 0xFFFF
 
 def noc1(x: int, y: int) -> tuple[int, int]: return (16 - x, 11 - y)
 

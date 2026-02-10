@@ -2,18 +2,12 @@ import ctypes, fcntl, mmap, struct, time
 from dataclasses import dataclass, field
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_down
+from helpers import _IO, align_down, align_up, noc_xy
 from codegen import CQConfig, compile_cq_kernels
 from dram import DramAllocator
 from device_runtime import CommonDevice, Program, DataflowLaunch, CoreSet, CoreRange, ArgGen
 
 PAGE_SIZE = 4096
-
-def _align_up(n: int, a: int) -> int:
-  return (n + a - 1) & ~(a - 1)
-
-def _pack_noc_xy(x: int, y: int) -> int:
-  return ((y << 6) | x) & 0xFFFF
 
 @dataclass(frozen=True)
 class _HostCQ:
@@ -40,41 +34,31 @@ class _DeviceCQ:
   dispatch_cb_pages: int
 
 def _device_cq_layout(*, prefetch_q_entries: int) -> _DeviceCQ:
-  l1_base = FastDispatch.BH_TENSIX_DEFAULT_UNRESERVED
-  prefetch_q_rd_ptr_addr = l1_base + FastDispatch.BH_PREFETCH_Q_RD_PTR_OFF
-  prefetch_q_pcie_rd_ptr_addr = l1_base + FastDispatch.BH_PREFETCH_Q_PCIE_RD_PTR_OFF
-  completion_q_wr_ptr_addr = l1_base + FastDispatch.BH_COMPLETION_Q_WR_PTR_OFF
-  completion_q_rd_ptr_addr = l1_base + FastDispatch.BH_COMPLETION_Q_RD_PTR_OFF
-  completion_q0_last_event_ptr_addr = l1_base + FastDispatch.BH_COMPLETION_Q0_LAST_EVENT_PTR_OFF
-  completion_q1_last_event_ptr_addr = l1_base + FastDispatch.BH_COMPLETION_Q1_LAST_EVENT_PTR_OFF
-  dispatch_s_sync_sem_addr = l1_base + FastDispatch.BH_DISPATCH_S_SYNC_SEM_OFF
-  prefetch_q_base = l1_base + FastDispatch.BH_UNRESERVED_OFF
-  prefetch_q_size = prefetch_q_entries * FastDispatch.PREFETCH_Q_ENTRY_BYTES
-  cmddat_q_base = _align_up(prefetch_q_base + prefetch_q_size, FastDispatch.PCIE_ALIGNMENT)
-  scratch_db_base = _align_up(cmddat_q_base + FastDispatch.PREFETCH_CMDDAT_Q_SIZE, FastDispatch.PCIE_ALIGNMENT)
-  dispatch_cb_pages = (512 * 1024) >> 12
+  b = FastDispatch.BH_TENSIX_DEFAULT_UNRESERVED
+  pq_base = b + FastDispatch.BH_UNRESERVED_OFF
+  pq_size = prefetch_q_entries * FastDispatch.PREFETCH_Q_ENTRY_BYTES
+  cmddat = align_up(pq_base + pq_size, FastDispatch.PCIE_ALIGNMENT)
   return _DeviceCQ(
-    l1_base=l1_base,
-    prefetch_q_rd_ptr_addr=prefetch_q_rd_ptr_addr,
-    prefetch_q_pcie_rd_ptr_addr=prefetch_q_pcie_rd_ptr_addr,
-    completion_q_wr_ptr_addr=completion_q_wr_ptr_addr,
-    completion_q_rd_ptr_addr=completion_q_rd_ptr_addr,
-    completion_q0_last_event_ptr_addr=completion_q0_last_event_ptr_addr,
-    completion_q1_last_event_ptr_addr=completion_q1_last_event_ptr_addr,
-    dispatch_s_sync_sem_addr=dispatch_s_sync_sem_addr,
-    prefetch_q_base=prefetch_q_base,
-    prefetch_q_size=prefetch_q_size,
-    cmddat_q_base=cmddat_q_base,
-    scratch_db_base=scratch_db_base,
-    dispatch_cb_pages=dispatch_cb_pages,
+    l1_base=b,
+    prefetch_q_rd_ptr_addr=b + FastDispatch.BH_PREFETCH_Q_RD_PTR_OFF,
+    prefetch_q_pcie_rd_ptr_addr=b + FastDispatch.BH_PREFETCH_Q_PCIE_RD_PTR_OFF,
+    completion_q_wr_ptr_addr=b + FastDispatch.BH_COMPLETION_Q_WR_PTR_OFF,
+    completion_q_rd_ptr_addr=b + FastDispatch.BH_COMPLETION_Q_RD_PTR_OFF,
+    completion_q0_last_event_ptr_addr=b + FastDispatch.BH_COMPLETION_Q0_LAST_EVENT_PTR_OFF,
+    completion_q1_last_event_ptr_addr=b + FastDispatch.BH_COMPLETION_Q1_LAST_EVENT_PTR_OFF,
+    dispatch_s_sync_sem_addr=b + FastDispatch.BH_DISPATCH_S_SYNC_SEM_OFF,
+    prefetch_q_base=pq_base, prefetch_q_size=pq_size,
+    cmddat_q_base=cmddat,
+    scratch_db_base=align_up(cmddat + FastDispatch.PREFETCH_CMDDAT_Q_SIZE, FastDispatch.PCIE_ALIGNMENT),
+    dispatch_cb_pages=(512 * 1024) >> 12,
   )
 
 def _host_cq_layout(*, sysmem_size: int, issue_size: int, completion_size: int) -> _HostCQ:
-  sysmem_size = _align_up(sysmem_size, PAGE_SIZE)
+  sysmem_size = align_up(sysmem_size, PAGE_SIZE)
   issue_base = FastDispatch.HOST_UNRESERVED_OFF
-  issue_size = _align_up(issue_size, FastDispatch.PCIE_ALIGNMENT)
+  issue_size = align_up(issue_size, FastDispatch.PCIE_ALIGNMENT)
   completion_base = issue_base + issue_size
-  completion_size = _align_up(completion_size, FastDispatch.PCIE_ALIGNMENT)
+  completion_size = align_up(completion_size, FastDispatch.PCIE_ALIGNMENT)
   need = completion_base + completion_size
   if need > sysmem_size:
     raise ValueError(f"sysmem_size too small: need {need}, have {sysmem_size}")
@@ -190,7 +174,7 @@ class _FastCQ:
     if self._recording:
       self._recorded.append(record)
       return
-    wr = _align_up(self.issue_wr, FastDispatch.PCIE_ALIGNMENT)
+    wr = align_up(self.issue_wr, FastDispatch.PCIE_ALIGNMENT)
     if wr + len(record) > self.host.issue_size: wr = 0
     base = self.host.issue_base + wr
     self.sysmem[base : base + len(record)] = record
@@ -222,12 +206,20 @@ class _FastCQ:
     if off != len(stream):
       raise RuntimeError(f"CQ replay size mismatch: consumed {off} bytes from {len(stream)}-byte stream")
 
+  def _relay_inline(self, inner: bytes):
+    prefetch = CQPrefetchCmd()
+    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
+    prefetch.payload.relay_inline.length = len(inner)
+    stride = align_up(ctypes.sizeof(CQPrefetchCmd) + len(inner), FastDispatch.PCIE_ALIGNMENT)
+    prefetch.payload.relay_inline.stride = stride
+    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(inner))
+    self._issue_write(as_bytes(prefetch) + inner + pad)
+
   def enqueue_write_packed(self, *, cores: list[tuple[int, int]], addr: int, data: bytes | list[bytes]):
     count = len(cores)
     uniform = isinstance(data, bytes)
     payload_size = len(data) if uniform else len(data[0])
 
-    # Build dispatch cmd (16 bytes)
     dispatch = CQDispatchCmd()
     dispatch.cmd_id = CQDispatchCmdId.WRITE_PACKED
     dispatch.payload.write_packed.flags = CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE if uniform else 0
@@ -236,38 +228,25 @@ class _FastCQ:
     dispatch.payload.write_packed.size = payload_size
     dispatch.payload.write_packed.addr = addr
 
-    # Build sub-cmd array (count × 4 bytes), padded to L1_ALIGNMENT
     sub_cmds = b"".join(
-      as_bytes(CQDispatchWritePackedUnicastSubCmd(noc_xy_addr=_pack_noc_xy(x, y)))
+      as_bytes(CQDispatchWritePackedUnicastSubCmd(noc_xy_addr=noc_xy(x, y)))
       for x, y in cores
     )
-    sub_cmds_padded = sub_cmds.ljust(_align_up(len(sub_cmds), FastDispatch.L1_ALIGNMENT), b"\0")
+    sub_cmds_padded = sub_cmds.ljust(align_up(len(sub_cmds), FastDispatch.L1_ALIGNMENT), b"\0")
 
-    # Build data section
     if uniform:
-      data_section = bytes(data).ljust(_align_up(payload_size, FastDispatch.L1_ALIGNMENT), b"\0")
+      data_section = bytes(data).ljust(align_up(payload_size, FastDispatch.L1_ALIGNMENT), b"\0")
     else:
-      stride = _align_up(payload_size, FastDispatch.L1_ALIGNMENT)
+      stride = align_up(payload_size, FastDispatch.L1_ALIGNMENT)
       data_section = b"".join(bytes(d).ljust(stride, b"\0") for d in data)
 
-    inner = as_bytes(dispatch) + sub_cmds_padded + data_section
-
-    # Wrap in prefetch relay inline cmd
-    prefetch = CQPrefetchCmd()
-    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-    prefetch.payload.relay_inline.dispatcher_type = 0
-    prefetch.payload.relay_inline.pad = 0
-    prefetch.payload.relay_inline.length = len(inner)
-    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(inner), FastDispatch.PCIE_ALIGNMENT)
-    prefetch.payload.relay_inline.stride = stride
-    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(inner))
-    self._issue_write(as_bytes(prefetch) + inner + pad)
+    self._relay_inline(as_bytes(dispatch) + sub_cmds_padded + data_section)
 
   def enqueue_write_packed_large(self, *, dests: list[tuple[int, int]], addr: int, data: bytes):
     """Packed large write: sends identical data to mcast destinations.
     dests: list of (noc_xy_mcast, num_mcast_dests) — each entry is one sub-cmd."""
     alignment = FastDispatch.L1_ALIGNMENT
-    data_padded = bytes(data).ljust(_align_up(len(data), alignment), b"\0")
+    data_padded = bytes(data).ljust(align_up(len(data), alignment), b"\0")
     max_batch = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS
 
     for batch_start in range(0, len(dests), max_batch):
@@ -283,24 +262,13 @@ class _FastCQ:
 
       sub_cmds = b"".join(
         as_bytes(CQDispatchWritePackedLargeSubCmd(
-          noc_xy_addr=noc_xy, addr=addr, length_minus1=len(data) - 1,
+          noc_xy_addr=mcast_xy, addr=addr, length_minus1=len(data) - 1,
           num_mcast_dests=n_dests,
           flags=CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK,
-        )) for noc_xy, n_dests in batch
+        )) for mcast_xy, n_dests in batch
       )
-      sub_cmds_padded = sub_cmds.ljust(_align_up(len(sub_cmds), alignment), b"\0")
-      data_section = data_padded * count
-
-      inner = as_bytes(dispatch) + sub_cmds_padded + data_section
-      prefetch = CQPrefetchCmd()
-      prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-      prefetch.payload.relay_inline.dispatcher_type = 0
-      prefetch.payload.relay_inline.pad = 0
-      prefetch.payload.relay_inline.length = len(inner)
-      stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(inner), FastDispatch.PCIE_ALIGNMENT)
-      prefetch.payload.relay_inline.stride = stride
-      pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(inner))
-      self._issue_write(as_bytes(prefetch) + inner + pad)
+      sub_cmds_padded = sub_cmds.ljust(align_up(len(sub_cmds), alignment), b"\0")
+      self._relay_inline(as_bytes(dispatch) + sub_cmds_padded + data_padded * count)
 
   def enqueue_write_linear(self, *, tile: tuple[int, int], addr: int, data: bytes):
     x, y = tile
@@ -309,37 +277,17 @@ class _FastCQ:
     dispatch.payload.write_linear.num_mcast_dests = 0
     dispatch.payload.write_linear.write_offset_index = 0
     dispatch.payload.write_linear.pad1 = 0
-    dispatch.payload.write_linear.noc_xy_addr = _pack_noc_xy(x, y)
+    dispatch.payload.write_linear.noc_xy_addr = noc_xy(x, y)
     dispatch.payload.write_linear.addr = addr
     dispatch.payload.write_linear.length = len(data)
-    payload = as_bytes(dispatch) + bytes(data)
-
-    prefetch = CQPrefetchCmd()
-    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-    prefetch.payload.relay_inline.dispatcher_type = 0
-    prefetch.payload.relay_inline.pad = 0
-    prefetch.payload.relay_inline.length = len(payload)
-    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(payload), FastDispatch.PCIE_ALIGNMENT)
-    prefetch.payload.relay_inline.stride = stride
-    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(payload))
-    self._issue_write(as_bytes(prefetch) + payload + pad)
+    self._relay_inline(as_bytes(dispatch) + bytes(data))
 
   def enqueue_set_go_signal_noc_data(self, *, noc_words: list[int]):
     payload_words = b"".join(struct.pack("<I", w & 0xFFFFFFFF) for w in noc_words)
     dispatch = CQDispatchCmd()
     dispatch.cmd_id = CQDispatchCmdId.SET_GO_SIGNAL_NOC_DATA
     dispatch.payload.set_go_signal_noc_data.num_words = len(noc_words)
-    payload = as_bytes(dispatch) + payload_words
-
-    prefetch = CQPrefetchCmd()
-    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-    prefetch.payload.relay_inline.dispatcher_type = 0
-    prefetch.payload.relay_inline.pad = 0
-    prefetch.payload.relay_inline.length = len(payload)
-    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(payload), FastDispatch.PCIE_ALIGNMENT)
-    prefetch.payload.relay_inline.stride = stride
-    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(payload))
-    self._issue_write(as_bytes(prefetch) + payload + pad)
+    self._relay_inline(as_bytes(dispatch) + payload_words)
 
   def enqueue_send_go_signal(
     self,
@@ -359,17 +307,7 @@ class _FastCQ:
     dispatch.payload.mcast.noc_data_start_index = noc_data_start_index & 0xFF
     dispatch.payload.mcast.wait_count = wait_count & 0xFFFFFFFF
     dispatch.payload.mcast.wait_stream = wait_stream & 0xFFFFFFFF
-    payload = as_bytes(dispatch)
-
-    prefetch = CQPrefetchCmd()
-    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-    prefetch.payload.relay_inline.dispatcher_type = 0
-    prefetch.payload.relay_inline.pad = 0
-    prefetch.payload.relay_inline.length = len(payload)
-    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(payload), FastDispatch.PCIE_ALIGNMENT)
-    prefetch.payload.relay_inline.stride = stride
-    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(payload))
-    self._issue_write(as_bytes(prefetch) + payload + pad)
+    self._relay_inline(as_bytes(dispatch))
 
   def enqueue_wait_stream(self, *, stream: int, count: int, clear_stream: bool = True):
     dispatch = CQDispatchCmd()
@@ -381,17 +319,7 @@ class _FastCQ:
     dispatch.payload.wait.stream = stream
     dispatch.payload.wait.addr = 0
     dispatch.payload.wait.count = count
-    payload = as_bytes(dispatch)
-
-    prefetch = CQPrefetchCmd()
-    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-    prefetch.payload.relay_inline.dispatcher_type = 0
-    prefetch.payload.relay_inline.pad = 0
-    prefetch.payload.relay_inline.length = len(payload)
-    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(payload), FastDispatch.PCIE_ALIGNMENT)
-    prefetch.payload.relay_inline.stride = stride
-    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(payload))
-    self._issue_write(as_bytes(prefetch) + payload + pad)
+    self._relay_inline(as_bytes(dispatch))
 
   def enqueue_host_event(self, *, event_id: int, pad1: int = 0):
     payload_data = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(FastDispatch.L1_ALIGNMENT, b"\0")
@@ -401,17 +329,7 @@ class _FastCQ:
     dispatch.payload.write_linear_host.pad1 = pad1 & 0xFFFF
     dispatch.payload.write_linear_host.pad2 = 0
     dispatch.payload.write_linear_host.length = ctypes.sizeof(CQDispatchCmd) + len(payload_data)
-    payload = as_bytes(dispatch) + payload_data
-
-    prefetch = CQPrefetchCmd()
-    prefetch.cmd_id = CQPrefetchCmdId.RELAY_INLINE
-    prefetch.payload.relay_inline.dispatcher_type = 0
-    prefetch.payload.relay_inline.pad = 0
-    prefetch.payload.relay_inline.length = len(payload)
-    stride = _align_up(ctypes.sizeof(CQPrefetchCmd) + len(payload), FastDispatch.PCIE_ALIGNMENT)
-    prefetch.payload.relay_inline.stride = stride
-    pad = b"\0" * (stride - ctypes.sizeof(CQPrefetchCmd) - len(payload))
-    self._issue_write(as_bytes(prefetch) + payload + pad)
+    self._relay_inline(as_bytes(dispatch) + payload_data)
 
   def _read_completion_wr_ptr(self) -> tuple[int, int]:
     raw = struct.unpack("<I", self.sysmem[FastDispatch.HOST_COMPLETION_Q_WR_OFF : FastDispatch.HOST_COMPLETION_Q_WR_OFF + 4])[0]
@@ -453,13 +371,6 @@ class _FastCQ:
         print(f"  completion wr=0x{wr_16b:x} toggle={wr_toggle} rd=0x{self._completion_rd_16b:x} rd_toggle={self._completion_rd_toggle}")
         raise TimeoutError("timeout waiting for CQ host completion event")
       time.sleep(0.0002)
-
-  def init_prefetch_l1(self):
-    end_ptr = self.dev.prefetch_q_base + self.dev.prefetch_q_size
-    self.prefetch_win.uc[self.dev.prefetch_q_rd_ptr_addr : self.dev.prefetch_q_rd_ptr_addr + 4] = struct.pack("<I", end_ptr)
-    pcie_base = self.noc_local + self.host.issue_base
-    self.prefetch_win.uc[self.dev.prefetch_q_pcie_rd_ptr_addr : self.dev.prefetch_q_pcie_rd_ptr_addr + 4] = struct.pack("<I", pcie_base)
-    self.prefetch_win.uc[self.dev.prefetch_q_base : self.dev.prefetch_q_base + self.dev.prefetch_q_size] = b"\0" * self.dev.prefetch_q_size
 
   def reset_run_state(self):
     self.issue_wr = 0
@@ -538,21 +449,21 @@ class SlowDevice(CommonDevice):
     dispatch_mode: int = DevMsgs.DISPATCH_MODE_HOST,
     sem_off: int | None = None,
   ):
-    align16 = lambda n: (n + 15) & ~15
+
 
     rta_offsets = [0, rta_sizes[0], rta_sizes[0] + rta_sizes[1]]
-    rta_total = align16(rta_offsets[2] + rta_sizes[2])
+    rta_total = align_up(rta_offsets[2] + rta_sizes[2], 16)
 
     # Semaphore space: num_sems * 16 bytes between per-core args and shared data
     sem_size = program.num_sems * 16
     if sem_off is None:
       sem_off = rta_total
-    shared_off_start = align16(sem_off + sem_size)
+    shared_off_start = align_up(sem_off + sem_size, 16)
     crta_off = shared_off_start
 
     local_cb_mask, local_cb_blob = self._build_local_cb_blob(program)
     local_cb_off = shared_off_start
-    kernel_off = align16(local_cb_off + len(local_cb_blob))
+    kernel_off = align_up(local_cb_off + len(local_cb_blob), 16)
 
     kernels = {"brisc": writer, "ncrisc": reader}
     if program.compute:
@@ -565,7 +476,7 @@ class SlowDevice(CommonDevice):
     for name, idx in proc:
       if (k := kernels.get(name)) is None: continue
       kernel_text_off[idx] = off
-      off = align16(off + len(k.xip))
+      off = align_up(off + len(k.xip), 16)
       enables |= 1 << idx
 
     # Shared image: from local_cb_off to end (CB config + kernel binaries)
@@ -659,7 +570,7 @@ class SlowDevice(CommonDevice):
   def _uniform_sem_off(self, program: Program, cores: list[tuple[int, int]],
                        launch_by_core: dict) -> int:
     """Compute a uniform sem_offset across all launches so semaphore L1 addresses match."""
-    align16 = lambda n: (n + 15) & ~15
+
     max_rta_total = 0
     seen = set()
     for core in cores:
@@ -669,9 +580,37 @@ class SlowDevice(CommonDevice):
         continue
       seen.add(lid)
       rta_sizes, _ = self._build_rta(program, launch, 0, core, len(cores), role_idx, role_n)
-      rta_total = align16(sum(rta_sizes))
+      rta_total = align_up(sum(rta_sizes), 16)
       max_rta_total = max(max_rta_total, rta_total)
     return max_rta_total
+
+  def _prepare_core_payloads(
+    self,
+    program: Program,
+    cores: list[tuple[int, int]],
+    launch_by_core: dict,
+    dispatch_mode: int,
+  ) -> tuple[dict, dict, dict]:
+    num_cores = len(cores)
+    sem_off = self._uniform_sem_off(program, cores, launch_by_core) if program.num_sems > 0 else None
+    rta_by_core: dict[tuple[int, int], bytes] = {}
+    shared_by_core: dict[tuple[int, int], tuple[int, bytes]] = {}
+    launch_by_core_blob: dict[tuple[int, int], bytes] = {}
+    shared_cache: dict[tuple, tuple[int, bytes, bytes]] = {}
+    for core_idx, core in enumerate(cores):
+      launch, role_idx, role_n = launch_by_core[core]
+      rta_sizes, rta = self._build_rta(program, launch, core_idx, core, num_cores, role_idx, role_n, sem_off=sem_off)
+      key = (launch.reader, launch.writer, *rta_sizes, dispatch_mode)
+      if key not in shared_cache:
+        shared_cache[key] = self._pack_kernel_shared(
+          program, reader=launch.reader, writer=launch.writer,
+          rta_sizes=rta_sizes, dispatch_mode=dispatch_mode, sem_off=sem_off,
+        )[:3]
+      shared_off, shared_img, launch_blob = shared_cache[key]
+      rta_by_core[core] = rta
+      shared_by_core[core] = (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img)
+      launch_by_core_blob[core] = launch_blob
+    return rta_by_core, shared_by_core, launch_by_core_blob
 
   @staticmethod
   def _core_rects(cores: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
@@ -727,28 +666,8 @@ class SlowDevice(CommonDevice):
     all_rects = self._core_rects(cores)
     self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, reset_blob)])
 
-    sem_off = self._uniform_sem_off(program, cores, launch_by_core) if program.num_sems > 0 else None
-    rta_by_core: dict[tuple[int, int], bytes] = {}
-    shared_by_core: dict[tuple[int, int], tuple[int, bytes]] = {}
-    launch_by_core_blob: dict[tuple[int, int], bytes] = {}
-    shared_cache: dict[tuple[object, object, int, int, int, int], tuple[int, bytes, bytes]] = {}
-    for core_idx, core in enumerate(cores):
-      launch, role_idx, role_n = launch_by_core[core]
-      rta_sizes, rta = self._build_rta(program, launch, core_idx, core, num_cores, role_idx, role_n, sem_off=sem_off)
-      key = (launch.reader, launch.writer, rta_sizes[0], rta_sizes[1], rta_sizes[2], DevMsgs.DISPATCH_MODE_HOST)
-      if key not in shared_cache:
-        shared_cache[key] = self._pack_kernel_shared(
-          program,
-          reader=launch.reader,
-          writer=launch.writer,
-          rta_sizes=rta_sizes,
-          dispatch_mode=DevMsgs.DISPATCH_MODE_HOST,
-          sem_off=sem_off,
-        )[:3]
-      shared_off, shared_img, launch_blob = shared_cache[key]
-      rta_by_core[core] = rta
-      shared_by_core[core] = (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img)
-      launch_by_core_blob[core] = launch_blob
+    rta_by_core, shared_by_core, launch_by_core_blob = self._prepare_core_payloads(
+      program, cores, launch_by_core, DevMsgs.DISPATCH_MODE_HOST)
 
     def grouped_writes(payload_by_core: dict[tuple[int, int], bytes], addr: int):
       groups: dict[bytes, list[tuple[int, int]]] = {}
@@ -790,12 +709,6 @@ class SlowDevice(CommonDevice):
 class FastDevice(SlowDevice):
   DISPATCH_STREAM_INDEX = 48
   DISPATCH_MSG_OFFSET = 0
-
-  def _core_exists(self, core: tuple[int, int]) -> bool:
-    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
-    cfg = TLBConfig(addr=reg_base, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      return win.read32(reg_off) != 0xFFFF_FFFF
 
   def _select_dispatch_core_pair(self) -> tuple[tuple[int, int], tuple[int, int]]:
     # Prefer dedicated dispatch column so dispatch stays off compute columns.
@@ -939,7 +852,7 @@ class FastDevice(SlowDevice):
     # -- Dispatch core: BRISC + NCRISC, 2 semaphores --
     disp_sem = [0, 0]  # sem0=upstream CB (starts at 0), sem1=dispatch_s upstream
     disp_brisc_off = n_rt + len(disp_sem) * l1a
-    disp_ncrisc_off = _align_up(disp_brisc_off + len(cq.dispatch_brisc.xip), l1a)
+    disp_ncrisc_off = align_up(disp_brisc_off + len(cq.dispatch_brisc.xip), l1a)
     disp_img, disp_launch = self._build_cq_launch(
       rt_args=[0, 0, 0], sem_values=disp_sem,
       kernel_text_off=disp_brisc_off, ncrisc_text_off=disp_ncrisc_off)
@@ -947,7 +860,7 @@ class FastDevice(SlowDevice):
     # Upload to prefetch core
     cfg = TLBConfig(addr=0, start=self.prefetch_core, end=self.prefetch_core, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      self._cq.init_prefetch_l1()
+      self._cq.reset_run_state()
       win.write(TensixL1.KERNEL_CONFIG_BASE, pref_img, use_uc=True, restore=False)
       win.write(TensixL1.KERNEL_CONFIG_BASE + pref_kernel_off, cq.prefetch_brisc.xip, use_uc=True, restore=False)
       win.write(TensixL1.LAUNCH, as_bytes(pref_launch), use_uc=True, restore=False)
@@ -1007,24 +920,8 @@ class FastDevice(SlowDevice):
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=(0).to_bytes(4, "little"))
 
-    sem_off = self._uniform_sem_off(program, cores, launch_by_core) if program.num_sems > 0 else None
-    rta_by_core: dict[tuple[int, int], bytes] = {}
-    shared_by_core: dict[tuple[int, int], tuple[int, bytes]] = {}
-    launch_by_core_blob: dict[tuple[int, int], bytes] = {}
-    shared_cache: dict[tuple[object, object, int, int, int, int], tuple[int, bytes, bytes]] = {}
-    for core_idx, core in enumerate(cores):
-      launch, role_idx, role_n = launch_by_core[core]
-      rta_sizes, rta = self._build_rta(program, launch, core_idx, core, num_cores, role_idx, role_n, sem_off=sem_off)
-      key = (launch.reader, launch.writer, rta_sizes[0], rta_sizes[1], rta_sizes[2], dispatch_mode)
-      if key not in shared_cache:
-        shared_cache[key] = self._pack_kernel_shared(
-          program, reader=launch.reader, writer=launch.writer,
-          rta_sizes=rta_sizes, dispatch_mode=dispatch_mode, sem_off=sem_off,
-        )[:3]
-      shared_off, shared_img, launch_blob = shared_cache[key]
-      rta_by_core[core] = rta
-      shared_by_core[core] = (TensixL1.KERNEL_CONFIG_BASE + shared_off, shared_img)
-      launch_by_core_blob[core] = launch_blob
+    rta_by_core, shared_by_core, launch_by_core_blob = self._prepare_core_payloads(
+      program, cores, launch_by_core, dispatch_mode)
 
     def write_packed_by_size(payload_by_core: dict[tuple[int, int], bytes], addr: int):
       by_size: dict[int, list[tuple[tuple[int, int], bytes]]] = {}

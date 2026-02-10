@@ -1,4 +1,4 @@
-from helpers import pack_xip_elf, load_pt_load, PTLoad
+from helpers import pack_xip_elf, load_pt_load, PTLoad, noc_xy
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -417,15 +417,6 @@ class CompiledCQKernels:
   dispatch_brisc: CompiledKernel     # cq_dispatch on dispatch core BRISC
   dispatch_s_ncrisc: CompiledKernel  # cq_dispatch_subordinate on dispatch core NCRISC
 
-def _noc_mcast_encoding(x0: int, y0: int, x1: int, y1: int) -> int:
-  """Encode a multicast rectangle as a 32-bit NOC address. BH NOC encoding: (y << 6) | x."""
-  start = (y0 << 6) | x0
-  end = (y1 << 6) | x1
-  return (start << 16) | end
-
-def _noc_xy(x: int, y: int) -> int:
-  return (y << 6) | x
-
 def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
   """Compile the 3 CQ kernels (prefetch, dispatch, dispatch_subordinate) with baked-in config."""
   compiler = Compiler()
@@ -436,7 +427,7 @@ def compile_cq_kernels(cfg: CQConfig) -> CompiledCQKernels:
   # NOC multicast grid for worker go signals
   gx0, gy0 = cfg.worker_grid_start
   gx1, gy1 = cfg.worker_grid_end
-  mcast_grid = _noc_mcast_encoding(gx0, gy0, gx1, gy1)
+  mcast_grid = (noc_xy(gx0, gy0) << 16) | noc_xy(gx1, gy1)
 
   # Shared fabric defines (unused in HD mode, but consumed unconditionally as constexpr)
   fabric_zeros = {

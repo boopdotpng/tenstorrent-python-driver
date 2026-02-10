@@ -5,7 +5,7 @@ from pathlib import Path
 from defs import *
 from codegen import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import align_down, generate_jal_instruction
+from helpers import align_down, generate_jal_instruction, noc_xy
 
 # Per-core arg generator: (core_idx, core_xy, num_cores) -> list[int]
 ArgGen = Callable[[int, tuple[int, int], int], list[int]]
@@ -270,15 +270,13 @@ class CommonDevice:
         map_banks(half, TOTAL_BANKS - 1, START_X + 1)
       return m
 
-    def pack_xy(x: int, y: int) -> int: return ((y << 6) | x) & 0xFFFF
-
     dram_translated = dram_translated_map(self.harvested_dram)
     dram_xy = []
     for noc in range(NUM_NOCS):
       for logical_bank in range(NUM_DRAM_BANKS):
         port = WORKER_EP_LOGICAL[logical_bank][noc]
         x, y = dram_translated[(logical_bank, port)]
-        dram_xy.append(pack_xy(x, y))
+        dram_xy.append(noc_xy(x, y))
 
     tensix_cols = sorted({x for x, _ in self.worker_cores})
     l1_xy = []
@@ -288,7 +286,7 @@ class CommonDevice:
         row_idx = bank_id // len(tensix_cols)
         x = tensix_cols[col_idx]
         y = 2 + (row_idx % 10)
-        l1_xy.append(pack_xy(x, y))
+        l1_xy.append(noc_xy(x, y))
 
     dram_offsets = [0] * NUM_DRAM_BANKS
     l1_offsets = [0] * NUM_L1_BANKS
