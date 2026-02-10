@@ -368,6 +368,7 @@ void kernel_main() {{
 K_COMPUTE = f"""
 #include <cstdint>
 #define FP32_DEST_ACC_EN 1
+#define PACKER_L1_ACC 1
 #include "compute_kernel_api/matmul.h"
 #include "compute_kernel_api/pack.h"
 #include "compute_kernel_api/tile_move_copy.h"
@@ -398,6 +399,7 @@ void MAIN {{
     transpose, out_subblock_w, out_subblock_h, in0_block_w);
 
   bool enable_reload = false;
+  uint32_t out_num_tiles_to_wait = out_subblock_num_tiles;
 
   for (uint32_t block = 0; block < num_blocks; block++) {{
     const bool last_out = (block == (num_blocks - 1));
@@ -419,7 +421,6 @@ void MAIN {{
             copy_tile(tt::CBIndex::c_24, i, i);
           }}
           cb_pop_front(tt::CBIndex::c_24, out_subblock_num_tiles);
-
           mm_block_init_short_with_dt(
             tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_24,
             transpose, out_subblock_w, out_subblock_h, in0_block_w);
@@ -436,10 +437,13 @@ void MAIN {{
             0, transpose, out_subblock_w, out_subblock_h, in0_block_w);
         }}
         tile_regs_commit();
+
         if (last_out) {{
+          // Final block: pack to CB16 (bf16 output), L1 acc off
           cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
           tile_regs_wait();
           PACK((pack_reconfig_data_format(tt::CBIndex::c_16)));
+          PACK((llk_pack_reconfig_l1_acc(0)));
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             pack_tile(i, tt::CBIndex::c_16);
@@ -447,9 +451,19 @@ void MAIN {{
           tile_regs_release();
           cb_push_back(tt::CBIndex::c_16, out_subblock_num_tiles);
         }} else {{
+          // Intermediate: L1 accumulate into CB24 (F32)
+          if (block == 0) {{
+            cb_reserve_back(tt::CBIndex::c_16, out_num_tiles_to_wait);
+            out_num_tiles_to_wait += out_subblock_num_tiles;
+          }}
           cb_reserve_back(tt::CBIndex::c_24, out_subblock_num_tiles);
           tile_regs_wait();
-          PACK((pack_reconfig_data_format(tt::CBIndex::c_24)));
+          if (block == 0) {{
+            PACK((pack_reconfig_data_format(tt::CBIndex::c_24)));
+            PACK((llk_pack_reconfig_l1_acc(0)));
+          }} else if (block == 1) {{
+            PACK((llk_pack_reconfig_l1_acc(1)));
+          }}
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
             pack_tile(i, tt::CBIndex::c_24);
@@ -463,7 +477,14 @@ void MAIN {{
       in0_index_subblock_offset += in0_subblock_num_tiles;
     }}
 
-    enable_reload = !last_out;
+    // Pop CB24 to reset circular buffer pointers — L1 data persists for next
+    // block's L1 acc read-modify-write. Skip before last 2 blocks so the
+    // accumulated result stays available for the final reload.
+    if (block < num_blocks - 2) {{
+      cb_wait_front(tt::CBIndex::c_24, out_block_num_tiles);
+      cb_pop_front(tt::CBIndex::c_24, out_block_num_tiles);
+    }}
+    if (block == num_blocks - 2) enable_reload = true;
 
     cb_pop_front(tt::CBIndex::c_0, in0_block_num_tiles);
     cb_pop_front(tt::CBIndex::c_1, in1_block_num_tiles);
@@ -678,11 +699,13 @@ def main():
     print(f"\nWarmup ({WARMUP_ITERS} iters)...")
     for _ in range(WARMUP_ITERS):
       device.run(program)
+    device.sync()
 
     print(f"Timing ({TIMED_ITERS} iters)...")
     t0_wall = time.perf_counter()
     for _ in range(TIMED_ITERS):
       device.run(program)
+    device.sync()
     elapsed_wall = (time.perf_counter() - t0_wall) / TIMED_ITERS
 
     flops = 2.0 * M * N * K

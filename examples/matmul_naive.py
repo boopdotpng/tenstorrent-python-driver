@@ -219,7 +219,7 @@ def main():
       cores=cores,
     )
 
-    total, dispatch = device.run(program)
+    total, dispatch = device.run(program, wait=True)
     flops = 2 * M * N * K
     compute = total - dispatch
     print(f"TFLOPS (compute only): {flops / compute / 1e12:.2f}, TFLOPS (total): {flops / total / 1e12:.2f}")

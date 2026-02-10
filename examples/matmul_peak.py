@@ -669,11 +669,13 @@ def main():
     print(f"\nWarmup ({WARMUP_ITERS} iters)...")
     for _ in range(WARMUP_ITERS):
       device.run(program)
+    device.sync()
 
     print(f"Timing ({TIMED_ITERS} iters)...")
     t0_wall = time.perf_counter()
     for _ in range(TIMED_ITERS):
       device.run(program)
+    device.sync()
     elapsed_wall = (time.perf_counter() - t0_wall) / TIMED_ITERS
 
     flops = 2.0 * M * N * K

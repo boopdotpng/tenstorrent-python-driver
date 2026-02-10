@@ -90,10 +90,8 @@ def _host_cq_layout(*, sysmem_size: int, issue_size: int, completion_size: int) 
 class _CachedRun:
   cold_stream: bytearray       # full stream: uploads + GO (first run only)
   cold_sizes: list[int]
-  cold_event_offset: int
   hot_stream: bytearray        # minimal stream: reset + sem_zero + GO (repeat runs)
   hot_sizes: list[int]
-  hot_event_offset: int
   run_count: int = 0
 
 class _FastCQ:
@@ -215,14 +213,14 @@ class _FastCQ:
     return stream, sizes, event_offset
 
   def replay(self, stream: bytearray, entry_sizes: list[int]):
-    """Write pre-built CQ stream to sysmem in one shot, then poke prefetch_q entries."""
-    wr = _align_up(self.issue_wr, FastDispatch.PCIE_ALIGNMENT)
-    if wr + len(stream) > self.host.issue_size: wr = 0
-    base = self.host.issue_base + wr
-    self.sysmem[base : base + len(stream)] = stream
-    self.issue_wr = wr + len(stream)
+    """Issue pre-built CQ stream record-by-record so queue-space checks happen per entry."""
+    off = 0
     for size_16b in entry_sizes:
-      self._write_prefetch_q_entry(size_16b)
+      size = size_16b << 4
+      self._issue_write(stream[off : off + size])
+      off += size
+    if off != len(stream):
+      raise RuntimeError(f"CQ replay size mismatch: consumed {off} bytes from {len(stream)}-byte stream")
 
   def enqueue_write_packed(self, *, cores: list[tuple[int, int]], addr: int, data: bytes | list[bytes]):
     count = len(cores)
@@ -477,10 +475,16 @@ class _FastCQ:
     self._write_completion_rd_ptr()
 
 class SlowDevice(CommonDevice):
-  def __init__(self, device: int = 0):
+  def __init__(self, device: int = 0, *, enable_sysmem: bool = False):
     super().__init__(device=device)
     self.win = TLBWindow(self.fd, TLBSize.MiB_2)
-    self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram, run_fn=self.run)
+    self.dram = DramAllocator(
+      fd=self.fd,
+      dram_tiles=self.tiles.dram,
+      run_fn=self.run,
+      sync_fn=self.sync,
+      enable_sysmem=enable_sysmem,
+    )
 
   @staticmethod
   def _tile_ready(win: TLBWindow) -> bool:
@@ -704,7 +708,7 @@ class SlowDevice(CommonDevice):
           raise TimeoutError(f"timeout waiting for core ({x}, {y})")
         time.sleep(0.0002)
 
-  def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
+  def run(self, program: Program, *, timing: bool = False, wait: bool = True) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else self.dispatchable_cores
     if not cores:
       raise ValueError("program has no cores")
@@ -773,6 +777,16 @@ class SlowDevice(CommonDevice):
       print(f"run: {dispatch * 1e3:.3f} ms")
     return dispatch, 0.0
 
+  def sync(self, timeout_s: float = 10.0):
+    # Slow-dispatch run is synchronous; finalize any deferred host readbacks.
+    if hasattr(self, "dram"):
+      self.dram.prepare_sync()
+      self.dram.finish_sync()
+    return
+
+  def synchronize(self, timeout_s: float = 10.0):
+    self.sync(timeout_s=timeout_s)
+
 class FastDevice(SlowDevice):
   DISPATCH_STREAM_INDEX = 48
   DISPATCH_MSG_OFFSET = 0
@@ -809,7 +823,7 @@ class FastDevice(SlowDevice):
     issue_size: int = 64 * 1024 * 1024,
     completion_size: int = 32 * 1024 * 1024,
   ):
-    super().__init__(device=device)
+    super().__init__(device=device, enable_sysmem=True)
     self.prefetch_core, self.dispatch_core = getattr(self, "_dispatch_core_pair", self._select_dispatch_core_pair())
     self.dispatchable_cores = [c for c in self.worker_cores if c not in {self.prefetch_core, self.dispatch_core}]
     self._cq = _FastCQ(
@@ -1033,8 +1047,7 @@ class FastDevice(SlowDevice):
       go_signal=go.all, wait_stream=48, wait_count=0,
       num_unicast_txns=num_cores, noc_data_start_index=0)
     self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
-    self._cq.enqueue_host_event(event_id=0)
-    cold_stream, cold_sizes, cold_event_offset = self._cq.stop_recording()
+    cold_stream, cold_sizes, _ = self._cq.stop_recording()
 
     # --- Hot stream: per-run state only ---
     self._cq.start_recording()
@@ -1045,15 +1058,14 @@ class FastDevice(SlowDevice):
       go_signal=go.all, wait_stream=48, wait_count=0,
       num_unicast_txns=num_cores, noc_data_start_index=0)
     self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
-    self._cq.enqueue_host_event(event_id=0)
-    hot_stream, hot_sizes, hot_event_offset = self._cq.stop_recording()
+    hot_stream, hot_sizes, _ = self._cq.stop_recording()
 
     return _CachedRun(
-      cold_stream=cold_stream, cold_sizes=cold_sizes, cold_event_offset=cold_event_offset,
-      hot_stream=hot_stream, hot_sizes=hot_sizes, hot_event_offset=hot_event_offset,
+      cold_stream=cold_stream, cold_sizes=cold_sizes,
+      hot_stream=hot_stream, hot_sizes=hot_sizes,
     )
 
-  def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
+  def run(self, program: Program, *, timing: bool = False, wait: bool = False) -> tuple[float, float]:
     cache_key = id(program)
     cached = self._program_cache.get(cache_key)
     if cached is None:
@@ -1065,20 +1077,33 @@ class FastDevice(SlowDevice):
     cached.run_count += 1
     # is_hot = False  # uncomment to force cold path for debugging
     if is_hot:
-      stream, sizes, ev_off = cached.hot_stream, cached.hot_sizes, cached.hot_event_offset
+      stream, sizes = cached.hot_stream, cached.hot_sizes
     else:
-      stream, sizes, ev_off = cached.cold_stream, cached.cold_sizes, cached.cold_event_offset
+      stream, sizes = cached.cold_stream, cached.cold_sizes
 
-    event_id = self._event_id; self._event_id += 1
-    struct.pack_into("<I", stream, ev_off, event_id & 0xFFFFFFFF)
-
-    cores = program.cores if program.cores is not None else self.dispatchable_cores
+    do_wait = wait or timing
     t0 = time.perf_counter()
     self._cq.replay(stream, sizes)
     t1 = time.perf_counter()
+    if do_wait:
+      self.sync(timeout_s=10.0, debug_cores=(program.cores if program.cores is not None else self.dispatchable_cores))
+    t2 = time.perf_counter()
+    total = t2 - t0
+    dispatch = t1 - t0
+    if timing:
+      print(f"total: {total * 1e3:.3f} ms")
+      print(f"dispatch: {dispatch * 1e3:.3f} ms")
+    return total, dispatch
+
+  def sync(self, timeout_s: float = 10.0, *, debug_cores: list[tuple[int, int]] | None = None):
+    self.dram.prepare_sync()
+    event_id = self._event_id
+    self._event_id += 1
+    self._cq.enqueue_host_event(event_id=event_id)
     try:
-      self._cq.wait_host_event(event_id=event_id, timeout_s=10.0)
+      self._cq.wait_host_event(event_id=event_id, timeout_s=timeout_s)
     except TimeoutError:
+      cores = debug_cores if debug_cores is not None else self.dispatchable_cores
       win = self.win
       l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
       for x, y in (cores[:3] + cores[-1:]):
@@ -1096,10 +1121,7 @@ class FastDevice(SlowDevice):
       print(f"  dispatch ({dx},{dy}): stream48 AVAILABLE=0x{avail:08x}")
       TLBWindow(self.fd, TLBSize.MiB_2, TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT))
       raise
-    t2 = time.perf_counter()
-    total = t2 - t0
-    dispatch = t1 - t0
-    if timing:
-      print(f"total: {total * 1e3:.3f} ms")
-      print(f"dispatch: {dispatch * 1e3:.3f} ms")
-    return total, dispatch
+    self.dram.finish_sync()
+
+  def synchronize(self, timeout_s: float = 10.0):
+    self.sync(timeout_s=timeout_s)

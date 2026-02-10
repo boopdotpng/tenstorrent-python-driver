@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Callable
 from defs import DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn, PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, USE_SLOW_DISPATCH
+from helpers import _IO
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16
@@ -114,6 +114,7 @@ void kernel_main() {
   uint32_t tile_offset = get_arg_val<uint32_t>(3);
   uint32_t n_tiles = get_arg_val<uint32_t>(4);
   uint32_t page_size = get_arg_val<uint32_t>(5);
+  uint32_t sysmem_local_offset = get_arg_val<uint32_t>(6);
   constexpr uint32_t cb_id = tt::CBIndex::c_0;
   const InterleavedAddrGenFast<true> dram = {
     .bank_base_address = dram_addr,
@@ -127,7 +128,7 @@ void kernel_main() {
     uint32_t l1_addr = get_write_ptr(cb_id);
     noc_async_read_tile(tile_id, dram, l1_addr);
     noc_async_read_barrier();
-    uint64_t dst = pcie_base + sysmem_offset + (uint64_t)tile_id * page_size;
+    uint64_t dst = pcie_base + sysmem_offset + sysmem_local_offset + (uint64_t)tile_id * page_size;
     noc_async_write(l1_addr, dst, page_size);
     noc_async_write_barrier();
     cb_push_back(cb_id, 1);
@@ -197,14 +198,27 @@ class DramBuffer:
   shape: tuple[int, ...] | None = None
 
 class DramAllocator:
-  def __init__(self, fd: int, dram_tiles: list[tuple[int, int, int]], *, run_fn: Callable | None = None):
+  def __init__(
+    self,
+    fd: int,
+    dram_tiles: list[tuple[int, int, int]],
+    *,
+    run_fn: Callable | None = None,
+    sync_fn: Callable | None = None,
+    enable_sysmem: bool = False,
+  ):
     self.fd = fd
     self.bank_tiles = dram_tiles[:: Dram.TILES_PER_BANK]
     self.next = Dram.DRAM_WRITE_OFFSET
     self.max_page_size = 2 * 1024 * 1024
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
     self._run_fn = run_fn
-    self.sysmem = None if USE_SLOW_DISPATCH or run_fn is None else Sysmem(self.fd)
+    self._sync_fn = sync_fn
+    self.sysmem = Sysmem(self.fd) if enable_sysmem and run_fn is not None else None
+    self._pending_reads: list[tuple[DramBuffer, bool]] = []
+    self._inflight_fast_reads: list[tuple[DramBuffer, int]] = []
+    self._inflight_manual_reads: list[DramBuffer] = []
+    self._ready_reads: dict[int, list[bytes]] = {}
 
   def alloc(
     self, size: int, name: str | None = None, *, page_size: int | None = None,
@@ -300,9 +314,12 @@ class DramAllocator:
       num_pages=2,
       cores=cores,
     )
-    self._run_fn(program, timing=False)
+    self._run_fn(program, timing=False, wait=False)
 
   def _write_slow(self, buf: DramBuffer, data: bytes):
+    # Slow TLB writes bypass CQ ordering; drain any queued device work first.
+    if self._sync_fn is not None:
+      self._sync_fn()
     view = memoryview(data)
 
     def do_write(addr: int, off: int):
@@ -313,11 +330,55 @@ class DramAllocator:
     self.barrier(touched)
 
   def read(self, buf: DramBuffer) -> bytes:
-    if self.sysmem is not None and buf.size <= self.sysmem.size:
-      return self._read_fast(buf)
-    return self._read_slow(buf)
+    self.enqueue_read(buf)
+    if self._sync_fn is None:
+      raise RuntimeError("read requires a sync_fn to finalize queued DRAM transfers")
+    self._sync_fn()
+    key = id(buf)
+    if key not in self._ready_reads or not self._ready_reads[key]:
+      raise RuntimeError(f"readback for buffer '{buf.name or hex(buf.addr)}' was not finalized by sync")
+    out = self._ready_reads[key].pop(0)
+    if not self._ready_reads[key]:
+      del self._ready_reads[key]
+    return out
 
-  def _read_fast(self, buf: DramBuffer) -> bytes:
+  def enqueue_read(self, buf: DramBuffer):
+    """Queue a DRAM readback; execution is deferred until the next sync."""
+    use_fast = self.sysmem is not None and buf.size <= self.sysmem.size
+    self._pending_reads.append((buf, use_fast))
+
+  def prepare_sync(self):
+    """Prepare queued reads before waiting on device completion."""
+    if not self._pending_reads:
+      return
+    next_off = 0
+    for buf, use_fast in self._pending_reads:
+      if use_fast:
+        assert self.sysmem is not None
+        n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
+        span = n_tiles * buf.page_size
+        off = _align(next_off, buf.page_size)
+        if off + span <= self.sysmem.size:
+          self._enqueue_read_fast(buf, sysmem_local_offset=off)
+          self._inflight_fast_reads.append((buf, off))
+          next_off = off + span
+          continue
+      self._inflight_manual_reads.append(buf)
+    self._pending_reads.clear()
+
+  def finish_sync(self):
+    """Finalize queued reads after device completion."""
+    for buf, off in self._inflight_fast_reads:
+      self._store_ready_read(buf, self._read_fast_result(buf, off))
+    self._inflight_fast_reads.clear()
+    for buf in self._inflight_manual_reads:
+      self._store_ready_read(buf, self._read_slow_now(buf))
+    self._inflight_manual_reads.clear()
+
+  def _store_ready_read(self, buf: DramBuffer, data: bytes):
+    self._ready_reads.setdefault(id(buf), []).append(data)
+
+  def _enqueue_read_fast(self, buf: DramBuffer, *, sysmem_local_offset: int):
     assert self.sysmem is not None and self._run_fn is not None
     sm = self.sysmem
     drain = _get_drain_kernel()
@@ -339,7 +400,7 @@ class DramAllocator:
       start = core_idx * tiles_per_core
       count = min(tiles_per_core, n_tiles - start)
       if start >= n_tiles: count = 0
-      return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size]
+      return [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset, start, count, buf.page_size, sysmem_local_offset]
 
     program = Program(
       dataflow=[DataflowLaunch(cores=cores, reader=drain, reader_rt_args=reader_args, writer_rt_args=[])],
@@ -350,14 +411,17 @@ class DramAllocator:
       num_pages=2,
       cores=cores,
     )
-    self._run_fn(program, timing=False)
-    result = bytes(sm.buf[:buf.size])
+    self._run_fn(program, timing=False, wait=False)
+
+  def _read_fast_result(self, buf: DramBuffer, off: int) -> bytes:
+    assert self.sysmem is not None
+    result = bytes(self.sysmem.buf[off : off + buf.size])
     if buf.dtype is not None:
       assert buf.shape is not None, "Shape is required when dtype is set"
       return untilize(result, buf.dtype.value, buf.shape)
     return result
 
-  def _read_slow(self, buf: DramBuffer) -> bytes:
+  def _read_slow_now(self, buf: DramBuffer) -> bytes:
     result = bytearray(buf.size)
 
     def do_read(addr: int, off: int):
