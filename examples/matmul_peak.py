@@ -614,27 +614,16 @@ def main():
       device.run(program)
 
     print(f"Timing ({TIMED_ITERS} iters)...")
-    total_s = 0.0
-    dispatch_s = 0.0
     t0_wall = time.perf_counter()
     for _ in range(TIMED_ITERS):
-      total, dispatch = device.run(program)
-      total_s += total
-      dispatch_s += dispatch
+      device.run(program)
     elapsed_wall = (time.perf_counter() - t0_wall) / TIMED_ITERS
-    elapsed_total = total_s / TIMED_ITERS
-    elapsed_compute = (total_s - dispatch_s) / TIMED_ITERS
 
     flops = 2.0 * M * N * K
     tflops_wall = flops / elapsed_wall / 1e12
-    tflops_total = flops / elapsed_total / 1e12
-    tflops_compute = flops / elapsed_compute / 1e12
     print(f"\nAvg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
     print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS")
-    print(f"\nAvg latency (total):   {elapsed_total * 1e3:.3f} ms")
-    print(f"Throughput (total):    {tflops_total:.2f} TFLOPS (LoFi bf16, {NUM_ROWS * NUM_COLS} cores)")
-    print(f"Avg latency (compute): {elapsed_compute * 1e3:.3f} ms")
-    print(f"Throughput (compute):  {tflops_compute:.2f} TFLOPS")
+    print(f"Cores used:            {NUM_ROWS * NUM_COLS}")
 
   finally:
     device.close()

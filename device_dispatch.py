@@ -1,5 +1,5 @@
 import ctypes, fcntl, mmap, struct, time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import _IO, align_down
@@ -86,6 +86,17 @@ def _host_cq_layout(*, sysmem_size: int, issue_size: int, completion_size: int) 
     completion_size=completion_size,
   )
 
+@dataclass
+class _CachedRun:
+  cold_stream: bytearray       # full stream: uploads + GO (first run only)
+  cold_sizes: list[int]
+  cold_event_offset: int
+  hot_stream: bytearray        # minimal stream: reset + sem_zero + GO (repeat runs)
+  hot_sizes: list[int]
+  hot_event_offset: int
+  num_cores: int
+  run_count: int = 0
+
 class _FastCQ:
   def __init__(
     self,
@@ -141,7 +152,8 @@ class _FastCQ:
     self._completion_rd_toggle = 0
     self._init_host_completion_ctrl()
     self._write_completion_rd_ptr()
-    self.profile_reset()
+    self._recording = False
+    self._recorded: list[bytes] = []
 
   def close(self):
     try:
@@ -169,10 +181,7 @@ class _FastCQ:
     if not (0 < size_16b <= 0x7FFF):
       raise ValueError(f"prefetch entry out of range: {size_16b}")
     idx = self.prefetch_q_wr_idx
-    wait_dt = self._wait_prefetch_slot_free(idx)
-    self._profile_wait_s += wait_dt
-    if wait_dt > 1e-9:
-      self._profile_wait_count += 1
+    self._wait_prefetch_slot_free(idx)
     off = self.dev.prefetch_q_base + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
     self.prefetch_win.uc[off : off + 2] = struct.pack("<H", size_16b)
     entries = self.dev.prefetch_q_size // FastDispatch.PREFETCH_Q_ENTRY_BYTES
@@ -181,32 +190,40 @@ class _FastCQ:
   def _issue_write(self, record: bytes):
     if len(record) % FastDispatch.PCIE_ALIGNMENT != 0:
       raise ValueError("record must be 64B-aligned")
-    t0 = time.perf_counter()
+    if self._recording:
+      self._recorded.append(record)
+      return
     wr = _align_up(self.issue_wr, FastDispatch.PCIE_ALIGNMENT)
     if wr + len(record) > self.host.issue_size: wr = 0
     base = self.host.issue_base + wr
     self.sysmem[base : base + len(record)] = record
     self.issue_wr = wr + len(record)
     self._write_prefetch_q_entry(len(record) >> 4)
-    self._profile_entries += 1
-    self._profile_bytes += len(record)
-    self._profile_issue_s += time.perf_counter() - t0
 
-  def profile_reset(self):
-    self._profile_entries = 0
-    self._profile_bytes = 0
-    self._profile_wait_count = 0
-    self._profile_wait_s = 0.0
-    self._profile_issue_s = 0.0
+  def start_recording(self):
+    self._recording = True
+    self._recorded = []
 
-  def profile_snapshot(self) -> dict[str, float]:
-    return {
-      "entries": float(self._profile_entries),
-      "bytes": float(self._profile_bytes),
-      "wait_count": float(self._profile_wait_count),
-      "wait_ms": self._profile_wait_s * 1e3,
-      "issue_ms": self._profile_issue_s * 1e3,
-    }
+  def stop_recording(self) -> tuple[bytearray, list[int], int]:
+    """Return (stream, entry_sizes, event_id_offset) for the recorded commands."""
+    self._recording = False
+    records = self._recorded
+    self._recorded = []
+    stream = bytearray(b"".join(records))
+    sizes = [len(r) >> 4 for r in records]
+    last_start = len(stream) - len(records[-1])
+    event_offset = last_start + ctypes.sizeof(CQPrefetchCmd) + ctypes.sizeof(CQDispatchCmd)
+    return stream, sizes, event_offset
+
+  def replay(self, stream: bytearray, entry_sizes: list[int]):
+    """Write pre-built CQ stream to sysmem in one shot, then poke prefetch_q entries."""
+    wr = _align_up(self.issue_wr, FastDispatch.PCIE_ALIGNMENT)
+    if wr + len(stream) > self.host.issue_size: wr = 0
+    base = self.host.issue_base + wr
+    self.sysmem[base : base + len(stream)] = stream
+    self.issue_wr = wr + len(stream)
+    for size_16b in entry_sizes:
+      self._write_prefetch_q_entry(size_16b)
 
   def enqueue_write_packed(self, *, cores: list[tuple[int, int]], addr: int, data: bytes | list[bytes]):
     count = len(cores)
@@ -677,6 +694,17 @@ class SlowDevice(CommonDevice):
     num_dests = (x1 - x0 + 1) * (y1 - y0 + 1)
     return noc_xy, num_dests
 
+  def _wait_cores_done(self, cores: list[tuple[int, int]], timeout_s: float = 10.0):
+    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+    deadline = time.perf_counter() + timeout_s
+    for x, y in cores:
+      l1_cfg.start = l1_cfg.end = (x, y)
+      self.win.configure(l1_cfg)
+      while self.win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
+        if time.perf_counter() > deadline:
+          raise TimeoutError(f"timeout waiting for core ({x}, {y})")
+        time.sleep(0.0002)
+
   def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
     cores = program.cores if program.cores is not None else self.dispatchable_cores
     if not cores:
@@ -692,7 +720,6 @@ class SlowDevice(CommonDevice):
     go_blob = as_bytes(go)
 
     mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
-    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
     win = self.win
     all_rects = self._core_rects(cores)
     self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, reset_blob)])
@@ -738,22 +765,14 @@ class SlowDevice(CommonDevice):
 
     t_dispatch_start = time.perf_counter()
     self._mcast_write_rects(win, mcast_cfg, all_rects, [(TensixL1.GO_MSG, go_blob)])
-    t_compute_start = time.perf_counter()
 
-    for x, y in cores:
-      l1_cfg.start = l1_cfg.end = (x, y)
-      win.configure(l1_cfg)
-      deadline = time.perf_counter() + 10.0
-      while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
-        if time.perf_counter() > deadline:
-          raise TimeoutError(f"timeout waiting for core ({x}, {y})")
+    self._wait_cores_done(cores, timeout_s=10.0)
 
     t_end = time.perf_counter()
-    dispatch = t_compute_start - t_dispatch_start
-    compute = t_end - t_compute_start
+    dispatch = t_end - t_dispatch_start
     if timing:
-      print(f"compute: {compute * 1e3:.3f} ms")
-    return dispatch + compute, dispatch
+      print(f"run: {dispatch * 1e3:.3f} ms")
+    return dispatch, 0.0
 
 class FastDevice(SlowDevice):
   DISPATCH_STREAM_INDEX = 48
@@ -804,6 +823,7 @@ class FastDevice(SlowDevice):
       prefetch_q_entries=FastDispatch.PREFETCH_Q_ENTRIES_WORKER_DEFAULT,
     )
     self._event_id = 1
+    self._program_cache: dict[int, _CachedRun] = {}
     self._start_dispatch_cores()
     time.sleep(0.3)  # give dispatch firmware time to init
 
@@ -943,10 +963,9 @@ class FastDevice(SlowDevice):
   def _packed_large_dests(self, cores: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return [self._rect_to_noc_mcast(rect) for rect in self._core_rects(cores)]
 
-  def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
+  def _build_cq_stream(self, program: Program) -> _CachedRun:
+    """Build cold (full upload) and hot (minimal repeat) CQ streams."""
     cores = program.cores if program.cores is not None else self.dispatchable_cores
-    if not cores:
-      raise ValueError("program has no cores")
     num_cores = len(cores)
     launch_by_core = self._core_launches(program, cores)
 
@@ -954,18 +973,17 @@ class FastDevice(SlowDevice):
     reset.bits.signal = DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST
     reset_blob = as_bytes(reset)
     go = GoMsg()
-    # Always set dispatch core coordinates when using DEV mode so workers
-    # can compute the correct dispatch_addr for notify_dispatch_core_done.
     go.bits.dispatch_message_offset = FastDevice.DISPATCH_MSG_OFFSET
     go.bits.master_x = self.dispatch_core[0]
     go.bits.master_y = self.dispatch_core[1]
     go.bits.signal = DevMsgs.RUN_MSG_GO
+    dispatch_mode = DevMsgs.DISPATCH_MODE_DEV
 
-    dispatch_mode = DevMsgs.DISPATCH_MODE_DEV  # always DEV for testing
-    go_msg_index_zero = (0).to_bytes(4, "little")
+    # --- Cold stream: full upload + GO ---
+    self._cq.start_recording()
     mcast_dests = self._packed_large_dests(cores)
     self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
-    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=go_msg_index_zero)
+    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=(0).to_bytes(4, "little"))
 
     sem_off = self._uniform_sem_off(program, cores, launch_by_core) if program.num_sems > 0 else None
     rta_by_core: dict[tuple[int, int], bytes] = {}
@@ -978,12 +996,8 @@ class FastDevice(SlowDevice):
       key = (launch.reader, launch.writer, rta_sizes[0], rta_sizes[1], rta_sizes[2], dispatch_mode)
       if key not in shared_cache:
         shared_cache[key] = self._pack_kernel_shared(
-          program,
-          reader=launch.reader,
-          writer=launch.writer,
-          rta_sizes=rta_sizes,
-          dispatch_mode=dispatch_mode,
-          sem_off=sem_off,
+          program, reader=launch.reader, writer=launch.writer,
+          rta_sizes=rta_sizes, dispatch_mode=dispatch_mode, sem_off=sem_off,
         )[:3]
       shared_off, shared_img, launch_blob = shared_cache[key]
       rta_by_core[core] = rta
@@ -995,9 +1009,8 @@ class FastDevice(SlowDevice):
       for core, payload in payload_by_core.items():
         by_size.setdefault(len(payload), []).append((core, payload))
       for entries in by_size.values():
-        group_cores = [core for core, _ in entries]
-        group_payloads = [payload for _, payload in entries]
-        self._cq.enqueue_write_packed(cores=group_cores, addr=addr, data=group_payloads)
+        self._cq.enqueue_write_packed(
+          cores=[c for c, _ in entries], addr=addr, data=[p for _, p in entries])
 
     write_packed_by_size(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
     write_packed_by_size(launch_by_core_blob, TensixL1.LAUNCH)
@@ -1007,79 +1020,84 @@ class FastDevice(SlowDevice):
     for (addr, payload), group_cores in shared_groups.items():
       self._cq.enqueue_write_packed_large(dests=self._packed_large_dests(group_cores), addr=addr, data=payload)
 
-    t_dispatch_start = time.perf_counter()
-    # CQ wait path: dispatch sends GO + waits for worker completion + notifies host
     noc_words = [(y << 6) | x for x, y in cores]
-    self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)  # clear stale count
+    self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)
     self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
     self._cq.enqueue_send_go_signal(
       go_signal=go.all, wait_stream=48, wait_count=0,
       num_unicast_txns=num_cores, noc_data_start_index=0)
     self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
-    event_id = self._event_id; self._event_id += 1
-    self._cq.enqueue_host_event(event_id=event_id)
-    t_compute_start = time.perf_counter()
+    self._cq.enqueue_host_event(event_id=0)
+    cold_stream, cold_sizes, cold_event_offset = self._cq.stop_recording()
 
-    # Poll completion queue event marker emitted after dispatch-side WAIT(stream==num_cores)
+    # --- Hot stream: full re-upload (same as cold, to isolate correctness) ---
+    self._cq.start_recording()
+    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG, data=reset_blob)
+    self._cq.enqueue_write_packed_large(dests=mcast_dests, addr=TensixL1.GO_MSG_INDEX, data=(0).to_bytes(4, "little"))
+    write_packed_by_size(rta_by_core, TensixL1.KERNEL_CONFIG_BASE)
+    write_packed_by_size(launch_by_core_blob, TensixL1.LAUNCH)
+    for (addr, payload), group_cores in shared_groups.items():
+      self._cq.enqueue_write_packed_large(dests=self._packed_large_dests(group_cores), addr=addr, data=payload)
+    self._cq.enqueue_wait_stream(stream=48, count=0, clear_stream=True)
+    self._cq.enqueue_set_go_signal_noc_data(noc_words=noc_words)
+    self._cq.enqueue_send_go_signal(
+      go_signal=go.all, wait_stream=48, wait_count=0,
+      num_unicast_txns=num_cores, noc_data_start_index=0)
+    self._cq.enqueue_wait_stream(stream=48, count=num_cores, clear_stream=True)
+    self._cq.enqueue_host_event(event_id=0)
+    hot_stream, hot_sizes, hot_event_offset = self._cq.stop_recording()
+
+    return _CachedRun(
+      cold_stream=cold_stream, cold_sizes=cold_sizes, cold_event_offset=cold_event_offset,
+      hot_stream=hot_stream, hot_sizes=hot_sizes, hot_event_offset=hot_event_offset,
+      num_cores=num_cores,
+    )
+
+  def run(self, program: Program, *, timing: bool = False) -> tuple[float, float]:
+    cache_key = id(program)
+    cached = self._program_cache.get(cache_key)
+    if cached is None:
+      cached = self._build_cq_stream(program)
+      self._program_cache[cache_key] = cached
+
+    # Pick cold (first run, full upload) or hot (repeat, minimal)
+    is_hot = cached.run_count > 0
+    cached.run_count += 1
+    # is_hot = False  # uncomment to force cold path for debugging
+    if is_hot:
+      stream, sizes, ev_off = cached.hot_stream, cached.hot_sizes, cached.hot_event_offset
+    else:
+      stream, sizes, ev_off = cached.cold_stream, cached.cold_sizes, cached.cold_event_offset
+
+    event_id = self._event_id; self._event_id += 1
+    struct.pack_into("<I", stream, ev_off, event_id & 0xFFFFFFFF)
+
+    t_dispatch_start = time.perf_counter()
+    self._cq.replay(stream, sizes)
+
+    cores = program.cores if program.cores is not None else self.dispatchable_cores
     try:
       self._cq.wait_host_event(event_id=event_id, timeout_s=10.0)
     except TimeoutError:
       win = self.win
-      # Debug: check worker GO_MSG state and launch mode
       l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-      sample = cores[:3] + cores[-1:]
-      for x, y in sample:
+      for x, y in (cores[:3] + cores[-1:]):
         l1_cfg.start = l1_cfg.end = (x, y)
         win.configure(l1_cfg)
         go_val = win.read32(TensixL1.GO_MSG)
-        # Read mode byte from launch msg kernel config (offset 42 in LaunchMsg)
         mode_val = win.uc[TensixL1.LAUNCH + 42]
-        # Read debug area at 0x100
-        dbg = [win.read32(0x100 + i*4) for i in range(8)]
         print(f"  core ({x},{y}): GO_MSG=0x{go_val:08x} signal=0x{(go_val>>24)&0xff:02x} mode={mode_val}")
-        if dbg[0] == 0xDEAD0001:
-          disp_lo, disp_hi, nidx = dbg[1], dbg[2], dbg[3]
-          disp_addr = (disp_hi << 32) | disp_lo
-          done = "yes" if dbg[5] in (0xDEAD0002, 0xDEAD0003) else f"no (0x{dbg[5]:08x})"
-          hw_posted = dbg[6]
-          sw_posted = dbg[7]
-          print(f"    notify_done={done} dispatch_addr=0x{disp_addr:016x} noc_idx={nidx}")
-          print(f"    NOC_HW_POSTED_WR_SENT={hw_posted} SW_POSTED_WR_ISSUED={sw_posted}")
-        else:
-          print(f"    DEBUG: no DEV epilog marker (dbg[0]=0x{dbg[0]:08x})")
-      # Read stream 48 registers on dispatch core
       dx, dy = self.dispatch_core
-      s48_base = 0xFFB70000  # NOC_OVERLAY_START + 48 * 0x1000
-      s48_avail_off = 297 * 4  # STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE
-      s48_update_off = 270 * 4  # STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE
-      tlb_base = s48_base & ~((1 << 21) - 1)  # 2MB-aligned
+      s48_base = 0xFFB70000
+      tlb_base = s48_base & ~((1 << 21) - 1)
       dcfg = TLBConfig(addr=tlb_base, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
       self._cq.dispatch_win.configure(dcfg)
-      avail = self._cq.dispatch_win.read32(s48_base - tlb_base + s48_avail_off)
-      update = self._cq.dispatch_win.read32(s48_base - tlb_base + s48_update_off)
-      print(f"  dispatch ({dx},{dy}): stream48 AVAILABLE=0x{avail:08x} ({avail}) UPDATE_REG=0x{update:08x}")
-      # Read L1 addr 0 on dispatch core (check if workers wrote there instead of stream reg)
-      dcfg_l1 = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-      self._cq.dispatch_win.configure(dcfg_l1)
-      l1_0 = self._cq.dispatch_win.read32(0)
-      l1_4 = self._cq.dispatch_win.read32(4)
-      print(f"  dispatch L1[0x0]=0x{l1_0:08x} L1[0x4]=0x{l1_4:08x}")
-      # Read prefetch RD ptr to check how far CQ got
-      pf_rd = self._cq.dispatch_win.read32(self._cq.dev.prefetch_q_rd_ptr_addr)
-      pf_pcie_rd = self._cq.dispatch_win.read32(self._cq.dev.prefetch_q_pcie_rd_ptr_addr)
-      cq_wr = self._cq.dispatch_win.read32(self._cq.dev.completion_q_wr_ptr_addr)
-      print(f"  dispatch prefetch_rd=0x{pf_rd:08x} pcie_rd=0x{pf_pcie_rd:08x} cq_wr=0x{cq_wr:08x}")
-      # Restore dispatch_win config
-      dcfg2 = TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-      self._cq.dispatch_win.configure(dcfg2)
-      # Check prefetch queue entry consumption
-      for i in range(min(8, self._cq.dev.prefetch_q_size // 2)):
-        v = self._cq._read_prefetch_entry(i)
-        if v != 0: print(f"  prefetch_q[{i}] = 0x{v:04x} (not consumed)")
+      avail = self._cq.dispatch_win.read32(s48_base - tlb_base + 297 * 4)
+      print(f"  dispatch ({dx},{dy}): stream48 AVAILABLE=0x{avail:08x}")
+      TLBWindow(self.fd, TLBSize.MiB_2, TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT))
       raise
     t_end = time.perf_counter()
-    dispatch = t_compute_start - t_dispatch_start
-    compute = t_end - t_compute_start
+    dispatch = t_end - t_dispatch_start
     if timing:
-      print(f"compute: {compute * 1e3:.3f} ms")
-    return dispatch + compute, dispatch
+      print(f"run: {dispatch * 1e3:.3f} ms")
+    return dispatch, 0.0

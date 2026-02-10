@@ -2,9 +2,12 @@
 from __future__ import annotations
 import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
+import time
 from codegen import Compiler
 from device import Device, Program, DataflowLaunch, CoreSet
 from dram import DType
+
+TILES_PER_CORE = 64
 
 K_READER = r"""
 #include <cstdint>
@@ -107,7 +110,7 @@ def main():
   device = Device()
   try:
     num_cores = len(device.dispatchable_cores)
-    n_tiles = num_cores * 4
+    n_tiles = num_cores * TILES_PER_CORE
     tile_size_bytes = 32 * 32 * 2
     tiles_per_core = (n_tiles + num_cores - 1) // num_cores
 
@@ -151,7 +154,12 @@ def main():
       tile_size=tile_size_bytes,
       num_pages=2,
     )
+    t0 = time.perf_counter()
     device.run(program)
+    elapsed_s = time.perf_counter() - t0
+    tops = (n_tiles * 32 * 32) / elapsed_s / 1e12
+    print(f"Wall latency: {elapsed_s * 1e3:.3f} ms")
+    print(f"Throughput:   {tops:.6f} TOPS")
 
     out = device.dram.read(dst_buf)
 
