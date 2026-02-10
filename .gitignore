@@ -1,3 +1,4 @@
 __pycache__
 tt-metal-deps/
+.metal-cache/
 progress.md
