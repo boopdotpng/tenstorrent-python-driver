@@ -65,6 +65,8 @@ _INCLUDE_PATHS = [
   "tt_metal/third_party/tt_llk/tt_llk_blackhole/llk_lib",
   "runtime/sfpi/include",
 ]
+_INC = _DEPS / "include"
+_INCLUDES = [f"-I{_INC}", *(f"-I{_INC / p}" for p in _INCLUDE_PATHS)]
 
 _CFLAGS = (
   "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
@@ -80,6 +82,10 @@ _DEVICE_DEFINES = [
   "-DNUM_DRAM_BANKS=7", "-DIS_NOT_POW2_NUM_DRAM_BANKS=1",
   "-DNUM_L1_BANKS=110", "-DIS_NOT_POW2_NUM_L1_BANKS=1",
   "-DPCIE_NOC_X=19", "-DPCIE_NOC_Y=24",
+]
+_KERNEL_DEFINES = [
+  "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
+  "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
 ]
 
 _CQ_SRC_DIR = _REPO / "firmware" / "cq"
@@ -152,8 +158,6 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
   cc = _SFPI / "riscv-tt-elf-g++"
   assert cc.is_file(), f"missing compiler: {cc}"
 
-  inc = _DEPS / "include"
-  includes = [f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
   common_defines = [
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
@@ -173,7 +177,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
     compile_args = [
       opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
-      *common_defines, *target_defs, *includes,
+      *common_defines, *target_defs, *_INCLUDES,
     ]
     link_objs = [str(lib / "tmu-crt0.o"), "out.o", *(str(lib / o) for o in extra), str(lib / "substitutes.o")]
     fw_link_args = [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay", f"-T{ld}", *link_objs]
@@ -197,10 +201,8 @@ class Compiler:
   def __init__(self, ckernel: CkernelConfig = CkernelConfig()):
     self._cc = _SFPI / "riscv-tt-elf-g++"
     self._objcopy = _SFPI / "riscv-tt-elf-objcopy"
-    self._nm = _SFPI / "riscv-tt-elf-nm"
     self._ckernel = ckernel
-    inc = _DEPS / "include"
-    self._includes = ["-I.", f"-I{_CKERNEL_DEFAULTS}", f"-I{inc}"] + [f"-I{inc / p}" for p in _INCLUDE_PATHS]
+    self._includes = ["-I.", f"-I{_CKERNEL_DEFAULTS}", *_INCLUDES]
     assert self._cc.is_file(), f"missing compiler: {self._cc}\nDownload toolchain to {_DEPS / 'sfpi-toolchain'}"
     self._fw = compile_firmware()
 
@@ -222,8 +224,7 @@ class Compiler:
                         extra_includes: Strs | None = None,
                         xip_relocate: bool = False) -> CompiledKernel:
     defines = [
-      "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
-      "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
+      *_KERNEL_DEFINES,
       f"-DCOMPILE_FOR_{target.upper()}",
       f"-DPROCESSOR_INDEX={0 if target == 'brisc' else 1}",
       f"-DNOC_INDEX={noc_index}", "-DNOC_MODE=0",
@@ -238,8 +239,7 @@ class Compiler:
   def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
     stage = ("unpack", "math", "pack")[trisc_id]
     defines = [
-      "-DTENSIX_FIRMWARE", "-DLOCAL_MEM_EN=0", "-DARCH_BLACKHOLE",
-      "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", "-DKERNEL_BUILD", *_DEVICE_DEFINES,
+      *_KERNEL_DEFINES,
       f"-DCOMPILE_FOR_TRISC={trisc_id}",
       f"-DPROCESSOR_INDEX={trisc_id + 2}",
       f"-DUCK_CHLKC_{stage.upper()}", f"-DNAMESPACE=chlkc_{stage}",
@@ -312,24 +312,13 @@ class Compiler:
   def _weaken_fw_symbols(self, build: Path, fw: Path) -> Path:
     out = build / "fw.elf"
     out.write_bytes(fw.read_bytes())
-
-    result = subprocess.run([str(self._nm), "-a", str(out)], cwd=build, check=True, capture_output=True, text=True)
-    localize, weaken = [], []
-    for line in result.stdout.splitlines():
-      parts = line.split()
-      if len(parts) < 3: continue
-      _, sym_type, name = parts[:3]
-      if sym_type == "U" or not sym_type.isupper(): continue
-      if name == "__global_pointer$" or name.startswith("__fw_export_"): continue
-      # Data symbols get weakened, code symbols get localized
-      if sym_type in "BDRSGV":
-        weaken.append(name)
-      else:
-        localize.append(name)
-
-    (build / "localize.txt").write_text("\n".join(sorted(set(localize))))
-    (build / "weaken.txt").write_text("\n".join(sorted(set(weaken))))
-    _run(self._objcopy, ["--localize-symbols=localize.txt", "--weaken-symbols=weaken.txt", str(out)], build)
+    _run(self._objcopy, [
+      "--localize-symbol=_start",
+      "--localize-symbol=main",
+      "--localize-symbol=exit",
+      "--weaken",
+      str(out),
+    ], build)
     return out
 
   def _write_trisc_stubs(self, build: Path):
@@ -401,7 +390,7 @@ def compile_cq_kernels() -> CompiledCQKernels:
   )
 
 def _tile_size(fmt: int) -> int:
-  return {
+  sizes = {
     0: 4096,   # Float32
     1: 2048,   # Float16
     5: 2048,   # Float16_b
@@ -411,4 +400,7 @@ def _tile_size(fmt: int) -> int:
     24: 4096,  # UInt32
     26: 1024,  # Fp8_e4m3
     30: 1024,  # UInt8
-  }.get(fmt) or (_ for _ in ()).throw(ValueError(f"unsupported format: {fmt}"))
+  }
+  if fmt not in sizes:
+    raise ValueError(f"unsupported format: {fmt}")
+  return sizes[fmt]

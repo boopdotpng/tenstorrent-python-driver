@@ -5,8 +5,6 @@ from defs import *
 from helpers import _IO, noc1
 import fcntl, mmap
 
-Core = tuple[int, int]
-
 class TLBMode(Enum):
   RELAXED = 0  # bulk transfers, may reorder
   STRICT = 1   # full ordering, slow dispatch

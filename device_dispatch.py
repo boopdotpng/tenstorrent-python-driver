@@ -38,10 +38,8 @@ DEV_COMPLETION_Q1_LAST_EVENT_PTR_ADDR = DEV_L1_BASE + FastDispatch.BH_COMPLETION
 DEV_DISPATCH_S_SYNC_SEM_ADDR = DEV_L1_BASE + FastDispatch.BH_DISPATCH_S_SYNC_SEM_OFF
 DEV_DISPATCH_CB_PAGES = (512 * 1024) >> 12
 
-Core = tuple[int, int]
 Rect = tuple[int, int, int, int]
 McastDest = tuple[int, int]
-CoreList = list[Core]
 CorePair = tuple[Core, Core]
 LaunchAssign = tuple[DataflowLaunch, int, int]
 LaunchByCore = dict[Core, LaunchAssign]
@@ -370,13 +368,6 @@ class SlowDevice(CommonDevice):
   def resolve_mcast_rects(self, cores: CoreSpec = "all") -> list[Rect]:
     return list(self._resolve_core_plan(cores).rects)
 
-  @staticmethod
-  def _tile_ready(win: TLBWindow) -> bool:
-    go = win.uc[TensixL1.GO_MSG + 3]
-    sync = win.read32(TensixL1.MAILBOX_BASE + 8)
-    dm1, tr0, tr1, tr2 = sync & 0xFF, (sync >> 8) & 0xFF, (sync >> 16) & 0xFF, (sync >> 24) & 0xFF
-    return go == DevMsgs.RUN_MSG_DONE and dm1 == 0 and tr1 == 0 and tr2 == 0 and tr0 in (0, 3)
-
   def _build_local_cb_blob(self, program: Program) -> tuple[int, bytes]:
     mask = 0
     for cb in program.cbs:
@@ -703,9 +694,6 @@ class SlowDevice(CommonDevice):
       self.dram.finish_sync()
     return
 
-  def synchronize(self, timeout_s: float = 10.0):
-    self.sync(timeout_s=timeout_s)
-
 class FastDevice(SlowDevice):
   DISPATCH_STREAM_INDEX = 48
   DISPATCH_MSG_OFFSET = 0
@@ -982,6 +970,3 @@ class FastDevice(SlowDevice):
       TLBWindow(self.fd, TLBSize.MiB_2, TLBConfig(addr=0, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT))
       raise
     self.dram.finish_sync()
-
-  def synchronize(self, timeout_s: float = 10.0):
-    self.sync(timeout_s=timeout_s)

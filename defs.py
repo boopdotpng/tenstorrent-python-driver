@@ -15,6 +15,11 @@ class TLBSize(Enum):
 DRAM_BARRIER_BASE = 0x0
 DRAM_ALIGNMENT = 64
 
+Core = tuple[int, int]
+DramTile = tuple[int, int, int]
+CoreList = list[Core]
+DramTileList = list[DramTile]
+
 class TensixL1:
   SIZE = 0x180000
   MAILBOX_BASE = 0x000060
@@ -344,3 +349,5 @@ class CQDispatchCmdPayload(ctypes.Union):
 class CQDispatchCmd(S):
   _pack_ = 1
   _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdPayload)]
+
+__all__ = [name for name in globals() if not name.startswith("_")]

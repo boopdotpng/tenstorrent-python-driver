@@ -8,11 +8,7 @@ from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import align_down, generate_jal_instruction, noc_xy
 
 CoreSpec = int | Literal["all"]
-Core = tuple[int, int]
-DramTile = tuple[int, int, int]
 BankPort = tuple[int, int]
-CoreList = list[Core]
-DramTileList = list[DramTile]
 ArgGen = Callable[[int, Core, int], list[int]]
 
 @dataclass
@@ -85,6 +81,9 @@ class CommonDevice:
     dm1, tr0, tr1, tr2 = sync & 0xFF, (sync >> 8) & 0xFF, (sync >> 16) & 0xFF, (sync >> 24) & 0xFF
     return go == DevMsgs.RUN_MSG_DONE and dm1 == 0 and tr1 == 0 and tr2 == 0 and tr0 in (0, 3)
 
+  def synchronize(self, timeout_s: float = 10.0):
+    self.sync(timeout_s=timeout_s)
+
   # Map each firmware target to its init scratch area in L1 (for local-mem data relocation)
   _INIT_SCRATCH = {
     "brisc":  TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
@@ -121,12 +120,6 @@ class CommonDevice:
     skip = self._firmware_skip_cores()
     cores = [core for core in self.worker_cores if core not in skip]
 
-    def _for_target_tiles(write_fn):
-      cfg.mcast = False
-      for core in cores:
-        cfg.start = cfg.end = core
-        write_fn()
-
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
       def _reset_and_stage():
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
@@ -152,7 +145,10 @@ class CommonDevice:
         ]:
           win.write32(reg - reg_base, base)
 
-      _for_target_tiles(_reset_and_stage)
+      cfg.mcast = False
+      for core in cores:
+        cfg.start = cfg.end = core
+        _reset_and_stage()
 
       test_tile = cores[0]
       cfg.start, cfg.end = test_tile, test_tile
@@ -166,14 +162,18 @@ class CommonDevice:
         cfg.addr, cfg.mode = 0, TLBMode.RELAXED
         win.configure(cfg)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
-      _for_target_tiles(_write_bank_tables)
+      for core in cores:
+        cfg.start = cfg.end = core
+        _write_bank_tables()
 
       def _release_brisc():
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.read32(reg_off)
         win.write32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
-      _for_target_tiles(_release_brisc)
+      for core in cores:
+        cfg.start = cfg.end = core
+        _release_brisc()
 
     self._wait_firmware_ready()
 
