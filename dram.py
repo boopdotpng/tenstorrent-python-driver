@@ -85,7 +85,6 @@ class Sysmem:
       flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
       prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
-    self.buf[:] = b'\x00' * self.size  # fault in all pages
     buf_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
     pin_buf = bytearray(ctypes.sizeof(PinPagesIn) + ctypes.sizeof(PinPagesOutExtended))
     pin_in = PinPagesIn.from_buffer(pin_buf)
