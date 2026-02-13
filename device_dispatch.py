@@ -730,7 +730,6 @@ class FastDevice(SlowDevice):
     self._program_cache: dict[int, _CachedRun] = {}
     self._go_signal_noc_words: tuple[int, ...] | None = None
     self._start_dispatch_cores()
-    time.sleep(0.3)  # give dispatch firmware time to init
 
   def close(self):
     if hasattr(self, "_cq"):
@@ -826,7 +825,6 @@ class FastDevice(SlowDevice):
       kernels=[(kernel_off, cq.dispatch_brisc.xip), (disp_ncrisc_off, cq.dispatch_s_ncrisc.xip)],
       init=self._init_dispatch_core_state,
     )
-    time.sleep(0.3)
 
   def _packed_large_dests(self, cores: CoreList) -> list[McastDest]:
     return [self._rect_to_noc_mcast(rect) for rect in self._core_rects(cores)]

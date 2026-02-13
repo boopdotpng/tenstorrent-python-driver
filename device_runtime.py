@@ -93,7 +93,32 @@ class CommonDevice:
     "trisc2": TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
   }
 
+  def _cores_needing_firmware(self, cores: list[Core]) -> list[Core]:
+    """Probe cores and return those that need firmware upload.
+    A core is 'ready' if BRISC is out of reset and the tile is idle (RUN_MSG_DONE).
+    Cores running stale CQ firmware or held in reset are returned for re-upload."""
+    if not cores: return cores
+    # Quick check: if the first core needs firmware, all likely do (cold boot)
+    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
+    cfg = TLBConfig(addr=reg_base, start=cores[0], end=cores[0], noc=0, mcast=False, mode=TLBMode.STRICT)
+    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+      def _core_ready(core: Core) -> bool:
+        cfg.start = cfg.end = core
+        cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
+        win.configure(cfg)
+        if win.read32(reg_off) & TensixMMIO.SOFT_RESET_BRISC: return False
+        cfg.addr, cfg.mode = 0, TLBMode.STRICT
+        win.configure(cfg)
+        return self._tile_ready(win)
+      if not _core_ready(cores[0]): return cores
+      return [c for c in cores[1:] if not _core_ready(c)]
+
   def upload_firmware(self):
+    skip = self._firmware_skip_cores()
+    all_cores = [core for core in self.worker_cores if core not in skip]
+    cores = self._cores_needing_firmware(all_cores)
+    if not cores: return
+
     fw = compile_firmware()
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
 
@@ -117,8 +142,6 @@ class CommonDevice:
     # We place a JAL instruction there to jump to the firmware entry point.
     jal_insn = generate_jal_instruction(TensixL1.BRISC_FIRMWARE_BASE)
     go_msg = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
-    skip = self._firmware_skip_cores()
-    cores = [core for core in self.worker_cores if core not in skip]
 
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
       def _reset_and_stage():
@@ -301,12 +324,11 @@ class CommonDevice:
   def _set_power_state_busy(self, timeout_s: float = 2.0):
     self.arc_msg(Arc.MSG_AICLK_GO_BUSY, 0, 0, timeout_ms=1000)
     deadline = time.monotonic() + timeout_s
-    aiclk = self._read_arc_telem_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK)
-    while time.monotonic() < deadline and aiclk <= Arc.DEFAULT_AICLK:
-      time.sleep(0.01)
+    while time.monotonic() < deadline:
       aiclk = self._read_arc_telem_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK)
-    if aiclk <= Arc.DEFAULT_AICLK:
-      raise RuntimeError(f"AICLK failed to enter busy state (last={aiclk} MHz)")
+      if aiclk > Arc.DEFAULT_AICLK: return
+      time.sleep(0.001)
+    raise RuntimeError(f"AICLK failed to enter busy state (last={aiclk} MHz)")
 
   def _close(self):
     if hasattr(self, "dram"): self.dram.close()
