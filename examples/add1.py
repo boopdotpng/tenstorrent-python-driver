@@ -152,7 +152,7 @@ def main():
       num_pages=2,
     )
     device.queue(program)
-    device.run(device.programs)
+    device.run()
 
     out = device.dram.read(dst_buf)
 

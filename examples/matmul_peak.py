@@ -669,12 +669,14 @@ def main():
     print(f"\nWarmup ({WARMUP_ITERS} iters)...")
     for _ in range(WARMUP_ITERS):
       device.queue(program)
-    device.run(device.programs)
+    device.run()
 
     print(f"Timing ({TIMED_ITERS} iters)...")
     for _ in range(TIMED_ITERS):
       device.queue(program)
-    elapsed_batch, _ = device.run(device.programs)
+    t0 = time.perf_counter()
+    device.run()
+    elapsed_batch = time.perf_counter() - t0
     elapsed_wall = elapsed_batch / TIMED_ITERS
 
     flops = 2.0 * M * N * K

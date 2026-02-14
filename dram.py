@@ -1,8 +1,8 @@
 import os, mmap, fcntl, ctypes
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
-from typing import Callable
 from defs import (
   DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn,
   PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES, Core, DramTile,
@@ -192,15 +192,14 @@ class DramBuffer:
   shape: Shape | None = None
 
 class DramAllocator:
-  def __init__(self, fd: int, dram_tiles: list[DramTile], run_fn: Callable | None = None,
-               enable_sysmem: bool = False):
+  def __init__(self, fd: int, dram_tiles: list[DramTile], device=None, enable_sysmem: bool = False):
     self.fd = fd
     self.bank_tiles = dram_tiles[:: Dram.TILES_PER_BANK]
     self.next = Dram.DRAM_WRITE_OFFSET
     self.max_page_size = 2 * 1024 * 1024
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
-    self._run_fn = run_fn
-    self.sysmem = Sysmem(self.fd) if enable_sysmem and run_fn is not None else None
+    self._device = device
+    self.sysmem = Sysmem(self.fd) if enable_sysmem and device is not None else None
 
   def alloc(self, size: int, name: str | None = None, page_size: int | None = None, dtype: DType | None = None,
             shape: Shape | None = None) -> DramBuffer:
@@ -257,12 +256,12 @@ class DramAllocator:
       self._write_slow(buf, data)
 
   def _run_transfer_kernel(self, buf: DramBuffer, kernel, size: int, extra_args: list[int] = []):
-    assert self.sysmem is not None and self._run_fn is not None
-    from device import Program, DataflowLaunch, TileGrid
+    assert self.sysmem is not None and self._device is not None
+    assert not self._device._exec_list, "queue must be empty for DRAM transfers"
+    from device import Program, DataflowLaunch
     n_tiles = (size + buf.page_size - 1) // buf.page_size
     sysmem_offset = self.sysmem.noc_addr & ((1 << 36) - 1)
-    dev = getattr(self._run_fn, "__self__", None)
-    all_cores = list(dev.dispatchable_cores) if dev and hasattr(dev, "dispatchable_cores") else list(TileGrid.TENSIX)
+    all_cores = list(self._device.dispatchable_cores)
     tiles_per_core = (n_tiles + len(all_cores) - 1) // len(all_cores)
     cores = all_cores[:min(len(all_cores), n_tiles)]
     base_args = [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset]
@@ -272,11 +271,12 @@ class DramAllocator:
       count = min(tiles_per_core, n_tiles - start) if start < n_tiles else 0
       return base_args + [start, count, buf.page_size] + extra_args
 
-    self._run_fn(Program(
+    self._device.queue(Program(
       dataflow=[DataflowLaunch(cores=cores, reader=kernel, reader_rt_args=reader_args, writer_rt_args=[])],
       compute=None, compute_rt_args=[], cbs=[0],
       tile_size=buf.page_size, num_pages=2, cores=len(cores),
     ))
+    self._device.run()
 
   def _write_fast(self, buf: DramBuffer, data: bytes):
     self.sysmem.buf[:len(data)] = data
