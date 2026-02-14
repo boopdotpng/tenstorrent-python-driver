@@ -192,7 +192,7 @@ class DramBuffer:
   shape: Shape | None = None
 
 class DramAllocator:
-  def __init__(self, fd: int, dram_tiles: list[DramTile], run_fn: Callable | None = None, sync_fn: Callable | None = None,
+  def __init__(self, fd: int, dram_tiles: list[DramTile], run_fn: Callable | None = None,
                enable_sysmem: bool = False):
     self.fd = fd
     self.bank_tiles = dram_tiles[:: Dram.TILES_PER_BANK]
@@ -200,12 +200,7 @@ class DramAllocator:
     self.max_page_size = 2 * 1024 * 1024
     self.win = TLBWindow(self.fd, TLBSize.GiB_4)
     self._run_fn = run_fn
-    self._sync_fn = sync_fn
     self.sysmem = Sysmem(self.fd) if enable_sysmem and run_fn is not None else None
-    self._pending_reads: list[tuple[DramBuffer, bool]] = []
-    self._inflight_fast_reads: list[tuple[DramBuffer, int]] = []
-    self._inflight_manual_reads: list[DramBuffer] = []
-    self._ready_reads: dict[int, list[bytes]] = {}
 
   def alloc(self, size: int, name: str | None = None, page_size: int | None = None, dtype: DType | None = None,
             shape: Shape | None = None) -> DramBuffer:
@@ -263,7 +258,7 @@ class DramAllocator:
 
   def _run_transfer_kernel(self, buf: DramBuffer, kernel, size: int, extra_args: list[int] = []):
     assert self.sysmem is not None and self._run_fn is not None
-    from device_runtime import Program, DataflowLaunch, TileGrid
+    from device import Program, DataflowLaunch, TileGrid
     n_tiles = (size + buf.page_size - 1) // buf.page_size
     sysmem_offset = self.sysmem.noc_addr & ((1 << 36) - 1)
     dev = getattr(self._run_fn, "__self__", None)
@@ -281,16 +276,13 @@ class DramAllocator:
       dataflow=[DataflowLaunch(cores=cores, reader=kernel, reader_rt_args=reader_args, writer_rt_args=[])],
       compute=None, compute_rt_args=[], cbs=[0],
       tile_size=buf.page_size, num_pages=2, cores=len(cores),
-    ), timing=False, wait=False)
+    ))
 
   def _write_fast(self, buf: DramBuffer, data: bytes):
     self.sysmem.buf[:len(data)] = data
     self._run_transfer_kernel(buf, _fill_kernel(), len(data))
 
   def _write_slow(self, buf: DramBuffer, data: bytes):
-    # Slow TLB writes bypass CQ ordering; drain any queued device work first.
-    if self._sync_fn is not None:
-      self._sync_fn()
     view = memoryview(data)
 
     def do_write(addr: int, off: int):
@@ -301,63 +293,20 @@ class DramAllocator:
     self.barrier(touched)
 
   def read(self, buf: DramBuffer) -> bytes:
-    self.enqueue_read(buf)
-    if self._sync_fn is None:
-      raise RuntimeError("read requires a sync_fn to finalize queued DRAM transfers")
-    self._sync_fn()
-    key = id(buf)
-    if key not in self._ready_reads or not self._ready_reads[key]:
-      raise RuntimeError(f"readback for buffer '{buf.name or hex(buf.addr)}' was not finalized by sync")
-    out = self._ready_reads[key].pop(0)
-    if not self._ready_reads[key]:
-      del self._ready_reads[key]
-    return out
+    if self.sysmem is not None and buf.size <= self.sysmem.size:
+      return self._read_fast(buf)
+    return self._read_slow(buf)
 
-  def enqueue_read(self, buf: DramBuffer):
-    use_fast = self.sysmem is not None and buf.size <= self.sysmem.size
-    self._pending_reads.append((buf, use_fast))
-
-  def prepare_sync(self):
-    if not self._pending_reads:
-      return
-    next_off = 0
-    for buf, use_fast in self._pending_reads:
-      if use_fast:
-        assert self.sysmem is not None
-        n_tiles = (buf.size + buf.page_size - 1) // buf.page_size
-        span = n_tiles * buf.page_size
-        off = align_up(next_off, buf.page_size)
-        if off + span <= self.sysmem.size:
-          self._enqueue_read_fast(buf, sysmem_local_offset=off)
-          self._inflight_fast_reads.append((buf, off))
-          next_off = off + span
-          continue
-      self._inflight_manual_reads.append(buf)
-    self._pending_reads.clear()
-
-  def finish_sync(self):
-    for buf, off in self._inflight_fast_reads:
-      self._store_ready_read(buf, self._read_fast_result(buf, off))
-    self._inflight_fast_reads.clear()
-    for buf in self._inflight_manual_reads:
-      self._store_ready_read(buf, self._read_slow_now(buf))
-    self._inflight_manual_reads.clear()
-
-  def _store_ready_read(self, buf: DramBuffer, data: bytes):
-    self._ready_reads.setdefault(id(buf), []).append(data)
-
-  def _enqueue_read_fast(self, buf: DramBuffer, sysmem_local_offset: int):
-    self._run_transfer_kernel(buf, _drain_kernel(), buf.size, extra_args=[sysmem_local_offset])
-
-  def _read_fast_result(self, buf: DramBuffer, off: int) -> bytes:
+  def _read_fast(self, buf: DramBuffer) -> bytes:
     assert self.sysmem is not None
-    result = bytes(self.sysmem.buf[off : off + buf.size])
+    self._run_transfer_kernel(buf, _drain_kernel(), buf.size, extra_args=[0])
+    result = bytes(self.sysmem.buf[:buf.size])
     if buf.dtype is not None:
       assert buf.shape is not None, "Shape is required when dtype is set"
       return untilize(result, buf.dtype.value, buf.shape)
     return result
 
-  def _read_slow_now(self, buf: DramBuffer) -> bytes:
+  def _read_slow(self, buf: DramBuffer) -> bytes:
     result = bytearray(buf.size)
 
     def do_read(addr: int, off: int):

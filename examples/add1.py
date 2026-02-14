@@ -151,7 +151,8 @@ def main():
       tile_size=tile_size_bytes,
       num_pages=2,
     )
-    device.run(program)
+    device.queue(program)
+    device.run(device.programs)
 
     out = device.dram.read(dst_buf)
 
