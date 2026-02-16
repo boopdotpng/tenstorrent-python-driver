@@ -2,6 +2,7 @@ import time
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from device import DeviceBase, Program, AddrPayload, Rect
+from helpers import PROFILER
 
 class SlowDevice(DeviceBase):
   def __init__(self, device: int = 0, enable_sysmem: bool = False, init_core_plans: bool = True):
@@ -43,6 +44,8 @@ class SlowDevice(DeviceBase):
     mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
     win = self.win
     self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.GO_MSG, reset_blob)])
+    if PROFILER:
+      self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.PROFILER_CONTROL, b"\0" * 128)])
 
     payloads = self._prepare_core_payloads(program, cores, launch_roles, DevMsgs.DISPATCH_MODE_HOST)
 
@@ -55,6 +58,9 @@ class SlowDevice(DeviceBase):
 
     self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.GO_MSG, go_blob)])
     self._wait_cores_done(cores, timeout_s=10.0)
+    if PROFILER:
+      import profiler
+      profiler.read_and_report(self, cores)
 
   def run(self):
     for p in self._exec_list:

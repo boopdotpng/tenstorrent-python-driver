@@ -2,7 +2,7 @@ import ctypes, fcntl, mmap, struct, time
 from typing import Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_up, noc_xy
+from helpers import _IO, align_up, noc_xy, PROFILER
 from codegen import compile_cq_kernels
 from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS
 
@@ -426,6 +426,9 @@ class FastDevice(DeviceBase):
 
   def _enqueue_program(self, plan, payloads, skip_upload: bool):
     cores, cq = plan.cores, self._cq
+    # Zero profiler control buffers so state doesn't accumulate across runs
+    if PROFILER:
+      cq.enqueue_write_packed_large(plan.mcast_dests, TensixL1.PROFILER_CONTROL, b"\0" * 128)
     # Route go signals
     cq.enqueue_set_go_signal_noc_data([(y << 6) | x for x, y in cores])
     # Reset cores
@@ -464,6 +467,9 @@ class FastDevice(DeviceBase):
     except TimeoutError:
       self._dump_debug(last_cores or self.dispatchable_cores)
       raise
+    if PROFILER and last_cores:
+      import profiler
+      profiler.read_and_report(self, last_cores)
     self._event_id += 1
     self._exec_list.clear()
 

@@ -1,4 +1,4 @@
-from helpers import pack_xip_elf, load_pt_load, PTLoad
+from helpers import pack_xip_elf, load_pt_load, PTLoad, PROFILER
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -162,6 +162,8 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
   ]
+  if PROFILER:
+    common_defines += ["-DPROFILE_KERNEL=1", "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536"]
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
   fw_src_dir = _REPO / "firmware"
@@ -172,7 +174,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     ld = ld_dir / f"firmware_{target}.ld"
     assert ld.is_file(), f"missing linker script: {ld}"
     src = fw_src_dir / src_name
-    cache_target = f"{target}_firmware"
+    cache_target = f"{target}_firmware" + ("_prof" if PROFILER else "")
     key = _source_target_cache_key(src.read_text(), cache_target)
     elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
     compile_args = [
@@ -230,6 +232,8 @@ class Compiler:
       f"-DNOC_INDEX={noc_index}", "-DNOC_MODE=0",
       *(extra_defines or []),
     ]
+    if PROFILER:
+      defines += ["-DPROFILE_KERNEL=1", "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536"]
     extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
     return self._build(
       src, target, defines, extra_objs, opt="-O2", trisc=False,
@@ -244,6 +248,8 @@ class Compiler:
       f"-DPROCESSOR_INDEX={trisc_id + 2}",
       f"-DUCK_CHLKC_{stage.upper()}", f"-DNAMESPACE=chlkc_{stage}",
     ]
+    if PROFILER:
+      defines += ["-DPROFILE_KERNEL=1", "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536"]
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
   def _build(self, kern: str, target: str, defines: Strs, extra_objs: Strs, opt: str, trisc: bool, extra_includes: Strs | None = None,
