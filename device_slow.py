@@ -58,11 +58,21 @@ class SlowDevice(DeviceBase):
 
     self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.GO_MSG, go_blob)])
     self._wait_cores_done(cores, timeout_s=10.0)
-    if PROFILER:
-      import profiler
-      profiler.read_and_report(self, cores)
 
   def run(self):
-    for p in self._exec_list:
+    programs_info = []
+    for i, p in enumerate(self._exec_list):
       self._run_single(p)
+      if PROFILER:
+        plan = self._resolve_core_plan(p.cores)
+        programs_info.append({
+          "cores": plan.cores,
+          "sources": getattr(p, "sources", {}),
+          "name": getattr(p, "name", None),
+          "index": i,
+        })
+    if PROFILER and programs_info:
+      import profiler, profiler_ui
+      data = profiler.collect(self, programs_info, dispatch_mode="slow")
+      profiler_ui.serve(data)
     self._exec_list.clear()

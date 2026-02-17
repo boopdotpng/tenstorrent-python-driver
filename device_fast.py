@@ -4,7 +4,7 @@ from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import _IO, align_up, noc_xy, PROFILER
 from codegen import compile_cq_kernels
-from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS
+from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS, _CorePayload
 
 class _FastCQ:
   NUM_CIRCULAR_BUFFERS = 32
@@ -280,6 +280,7 @@ class _FastCQ:
 class FastDevice(DeviceBase):
   DISPATCH_STREAM_INDEX = 48
   DISPATCH_MSG_OFFSET = 0
+  _PROFILER_BYTES_PER_RISC = 65536
 
   def _select_dispatch_core_pair(self) -> CorePair:
     ys = sorted({y for _, y in self.worker_cores})
@@ -307,6 +308,9 @@ class FastDevice(DeviceBase):
       dispatch_core=self.dispatch_core,
     )
     self._event_id = 1
+    self._profiler_dram_buf = None
+    self._profiler_flat_ids: dict[Core, int] = {}
+    self._profiler_core_count_per_dram = 0
 
     # Pre-compute constants
     reset = GoMsg()
@@ -426,9 +430,6 @@ class FastDevice(DeviceBase):
 
   def _enqueue_program(self, plan, payloads, skip_upload: bool):
     cores, cq = plan.cores, self._cq
-    # Zero profiler control buffers so state doesn't accumulate across runs
-    if PROFILER:
-      cq.enqueue_write_packed_large(plan.mcast_dests, TensixL1.PROFILER_CONTROL, b"\0" * 128)
     # Route go signals
     cq.enqueue_set_go_signal_noc_data([(y << 6) | x for x, y in cores])
     # Reset cores
@@ -448,15 +449,64 @@ class FastDevice(DeviceBase):
 
   # -- Run --
 
+  def _ensure_profiler_dram(self):
+    if self._profiler_dram_buf is not None:
+      return
+    cores = sorted(self.dispatchable_cores, key=lambda xy: (xy[0], xy[1]))
+    self._profiler_flat_ids = {core: i for i, core in enumerate(cores)}
+    bank_count = len(self.dram.bank_tiles)
+    self._profiler_core_count_per_dram = max(1, (len(cores) + bank_count - 1) // bank_count)
+    page_size = self._PROFILER_BYTES_PER_RISC * 5 * self._profiler_core_count_per_dram
+    self._profiler_dram_buf = self.dram.alloc(
+      page_size * bank_count, name="fast_profiler_dram", page_size=page_size
+    )
+
+  def _enqueue_profiler_init(self):
+    self._ensure_profiler_dram()
+    blobs = []
+    cores = sorted(self._profiler_flat_ids, key=lambda xy: (xy[0], xy[1]))
+    for core in cores:
+      x, y = core
+      ctrl = [0] * 32
+      ctrl[12] = self._profiler_dram_buf.addr
+      ctrl[14] = x
+      ctrl[15] = y
+      ctrl[16] = self._profiler_flat_ids[core]
+      ctrl[17] = self._profiler_core_count_per_dram
+      blobs.append(struct.pack("<32I", *ctrl))
+    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.PROFILER_CONTROL, data=blobs)
+
+  def _enqueue_profiler_reset_for_program(self, plan):
+    self._cq.enqueue_write_packed_large(
+      plan.mcast_dests, TensixL1.PROFILER_CONTROL + 5 * 4, b"\0" * (5 * 4)
+    )
+    self._cq.enqueue_write_packed_large(
+      plan.mcast_dests, TensixL1.PROFILER_CONTROL + 19 * 4, b"\0" * 4
+    )
+
   def run(self):
     if not self._exec_list: return
 
+    programs_snapshot = list(self._exec_list) if PROFILER else None
+    if PROFILER:
+      self._enqueue_profiler_init()
     prev_id = None
     last_cores = None
-    for program in self._exec_list:
+    for i, program in enumerate(self._exec_list):
       plan = self._resolve_core_plan(program.cores)
       payloads = self._build_payloads(program, plan)
-      self._enqueue_program(plan, payloads, skip_upload=(id(program) == prev_id))
+      if PROFILER:
+        self._enqueue_profiler_reset_for_program(plan)
+        patched = []
+        for p in payloads:
+          lm = LaunchMsg.from_buffer_copy(p.launch_blob)
+          lm.kernel_config.host_assigned_id = i + 1
+          patched.append(_CorePayload(
+            core=p.core, rta=p.rta, launch_blob=as_bytes(lm),
+            shared_addr=p.shared_addr, shared_blob=p.shared_blob,
+          ))
+        payloads = patched
+      self._enqueue_program(plan, payloads, skip_upload=(id(program) == prev_id and not PROFILER))
       prev_id = id(program)
       last_cores = plan.cores
 
@@ -467,11 +517,28 @@ class FastDevice(DeviceBase):
     except TimeoutError:
       self._dump_debug(last_cores or self.dispatchable_cores)
       raise
-    if PROFILER and last_cores:
-      import profiler
-      profiler.read_and_report(self, last_cores)
+    if PROFILER and programs_snapshot:
+      import profiler, profiler_ui
+      programs_info = []
+      for i, prog in enumerate(programs_snapshot):
+        plan = self._resolve_core_plan(prog.cores)
+        programs_info.append({
+          "cores": plan.cores,
+          "sources": getattr(prog, "sources", {}),
+          "name": getattr(prog, "name", None),
+          "index": i,
+        })
+      self._exec_list.clear()
+      data = profiler.collect_fast_dram(
+        self, programs_info,
+        core_flat_ids=self._profiler_flat_ids,
+        dram_buf=self._profiler_dram_buf,
+        core_count_per_dram=self._profiler_core_count_per_dram,
+        dispatch_cores=[self.prefetch_core, self.dispatch_core])
+      profiler_ui.serve(data)
+    else:
+      self._exec_list.clear()
     self._event_id += 1
-    self._exec_list.clear()
 
   def _dump_debug(self, cores: CoreList):
     win = self.win

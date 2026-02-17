@@ -150,6 +150,7 @@ def main():
       cbs=[0, 16],
       tile_size=tile_size_bytes,
       num_pages=2,
+      name="add1",
     )
     device.queue(program)
     device.run()

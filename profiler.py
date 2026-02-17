@@ -17,6 +17,8 @@ _GUARANTEED_2_H = 6   # FW scope end
 _GUARANTEED_3_H = 8   # Kernel child scope start
 _GUARANTEED_4_H = 10  # Kernel child scope end
 _CUSTOM_START = 12    # Optional markers begin here
+_HOST_BUF_END = 0
+_HOST_BUF_WORDS_PER_RISC = 65536 // 4
 
 def _parse_ts(w0, w1):
   """Extract 44-bit wall-clock timestamp from a profiler marker pair."""
@@ -157,3 +159,166 @@ def _print_report(profiles, freq_mhz, max_cores):
         print(f"    {r['name']:8s} {', '.join(parts)}")
 
   print(f"{'=' * 72}\n")
+
+def _core_total_cycles(profile):
+  """Total kernel cycles across all RISCs (max of per-RISC kernel durations)."""
+  best = 0
+  for r in profile["riscs"]:
+    if r["kern_start"] and r["kern_end"]:
+      best = max(best, r["kern_end"] - r["kern_start"])
+  return best
+
+def _risc_to_json(r):
+  """Convert a RISC profile dict to JSON-serializable form."""
+  d = {"name": r["name"], "end_idx": r["end_idx"]}
+  for k in ("fw_start", "fw_end", "kern_start", "kern_end"):
+    d[k] = r[k]
+  d["custom"] = [{"hash": zh, "type": pt, "ts": ts} for zh, pt, ts in r["custom"]]
+  return d
+
+def _parse_risc_words(words, flat_id, risc_id, program_ids):
+  """Split concatenated DRAM profiler stream into per-program RISC entries."""
+  n = len(words)
+  if n < _CUSTOM_START:
+    return {}
+  encoded_core = ((flat_id & 0xFF) << 3) | (risc_id & 0x7)
+
+  def is_chunk_start(i):
+    if i + (_CUSTOM_START - 1) >= n:
+      return False
+    if words[i + 3] not in program_ids:
+      return False
+    if (words[i + 2] & 0x7FF) != encoded_core:
+      return False
+    return all((words[i + j] & 0x80000000) != 0 for j in (_GUARANTEED_1_H, _GUARANTEED_2_H, _GUARANTEED_3_H, _GUARANTEED_4_H))
+
+  starts = [i for i in range(0, n, 4) if is_chunk_start(i)]
+  if not starts:
+    return {}
+
+  out = {}
+  for idx, start in enumerate(starts):
+    end = starts[idx + 1] if idx + 1 < len(starts) else n
+    if end - start < _CUSTOM_START:
+      continue
+    chunk = words[start:end]
+    fw_start = _parse_ts(chunk[_GUARANTEED_1_H], chunk[_GUARANTEED_1_H + 1])
+    fw_end = _parse_ts(chunk[_GUARANTEED_2_H], chunk[_GUARANTEED_2_H + 1])
+    kern_start = _parse_ts(chunk[_GUARANTEED_3_H], chunk[_GUARANTEED_3_H + 1])
+    kern_end = _parse_ts(chunk[_GUARANTEED_4_H], chunk[_GUARANTEED_4_H + 1])
+    custom = []
+    i = _CUSTOM_START
+    while i + 1 < len(chunk):
+      m = _parse_marker(chunk[i], chunk[i + 1])
+      if m: custom.append(m)
+      i += 2
+    out[chunk[3]] = {
+      "name": RISC_NAMES[risc_id],
+      "fw_start": fw_start, "fw_end": fw_end,
+      "kern_start": kern_start, "kern_end": kern_end,
+      "custom": custom,
+      "end_idx": len(chunk),
+    }
+  return out
+
+def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, freq_mhz=1000):
+  """Read profiler data and return JSON-serializable dict for the web UI.
+  programs_info: list of {"cores": CoreList, "sources": dict, "index": int}"""
+  from tlb import TLBConfig, TLBMode
+  from codegen import get_zone_map
+  from device import TileGrid
+
+  l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+  programs = []
+  for info in programs_info:
+    cores = info["cores"]
+    core_profiles = {}
+    for core in cores:
+      l1_cfg.start = l1_cfg.end = core
+      device.win.configure(l1_cfg)
+      p = read_core(device.win, core)
+      p["total_cycles"] = _core_total_cycles(p)
+      p["riscs"] = [_risc_to_json(r) for r in p["riscs"]]
+      p["core"] = list(core)
+      core_profiles[f"{core[0]},{core[1]}"] = p
+    programs.append({
+      "index": info["index"],
+      "name": info.get("name"),
+      "cores": [list(c) for c in cores],
+      "profiles": core_profiles,
+      "sources": info.get("sources", {}),
+    })
+
+  zone_map = get_zone_map()
+  zone_names = {str(h): {"name": n, "file": f, "line": l} for h, (n, f, l) in zone_map.items()}
+
+  return {
+    "dispatch_mode": dispatch_mode,
+    "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
+    "freq_mhz": freq_mhz,
+    "grid_x": list(TileGrid.TENSIX_X),
+    "grid_y": list(range(TileGrid.TENSIX_Y[0], TileGrid.TENSIX_Y[1] + 1)),
+    "programs": programs,
+    "zone_names": zone_names,
+  }
+
+def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count_per_dram, freq_mhz=1000, dispatch_cores=None):
+  """Read batched fast-dispatch profiler data from DRAM and return UI JSON."""
+  from tlb import TLBConfig, TLBMode
+  from codegen import get_zone_map
+  from device import TileGrid
+
+  l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+  dram_raw = device.dram.read(dram_buf)
+  page_size = dram_buf.page_size
+  program_ids = {info["index"] + 1 for info in programs_info}
+  by_index = {info["index"]: {"index": info["index"], "name": info.get("name"), "cores": [list(c) for c in info["cores"]], "profiles": {}, "sources": info.get("sources", {})}
+              for info in programs_info}
+
+  needed = set()
+  for info in programs_info:
+    needed.update(info["cores"])
+
+  for core in sorted(needed):
+    flat_id = core_flat_ids[core]
+    l1_cfg.start = l1_cfg.end = core
+    device.win.configure(l1_cfg)
+    ctrl_raw = bytes(device.win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
+    ctrl = struct.unpack("<32I", ctrl_raw)
+    page_id = flat_id // core_count_per_dram
+    slot = (flat_id % core_count_per_dram) * 5 * 65536
+    by_program = {}
+    for risc in range(5):
+      host_end = min(ctrl[_HOST_BUF_END + risc], _HOST_BUF_WORDS_PER_RISC)
+      base = page_id * page_size + slot + risc * 65536
+      raw = dram_raw[base : base + host_end * 4]
+      words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
+      for prog_id, r in _parse_risc_words(words, flat_id, risc, program_ids).items():
+        by_program.setdefault(prog_id, []).append(r)
+
+    for info in programs_info:
+      prog_id = info["index"] + 1
+      if core not in info["cores"]:
+        continue
+      riscs = by_program.get(prog_id, [])
+      if len(riscs) < 5:
+        present = {r["name"] for r in riscs}
+        for i, name in enumerate(RISC_NAMES):
+          if name not in present:
+            riscs.append({"name": name, "fw_start": None, "fw_end": None, "kern_start": None, "kern_end": None, "custom": [], "end_idx": 0})
+        riscs.sort(key=lambda r: RISC_NAMES.index(r["name"]))
+      p = {"core": list(core), "dropped": ctrl[_DROPPED], "done": ctrl[_DONE], "riscs": [_risc_to_json(r) for r in riscs]}
+      p["total_cycles"] = _core_total_cycles({"riscs": riscs})
+      by_index[info["index"]]["profiles"][f"{core[0]},{core[1]}"] = p
+
+  zone_map = get_zone_map()
+  zone_names = {str(h): {"name": n, "file": f, "line": l} for h, (n, f, l) in zone_map.items()}
+  return {
+    "dispatch_mode": "fast",
+    "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
+    "freq_mhz": freq_mhz,
+    "grid_x": list(TileGrid.TENSIX_X),
+    "grid_y": list(range(TileGrid.TENSIX_Y[0], TileGrid.TENSIX_Y[1] + 1)),
+    "programs": [by_index[i] for i in sorted(by_index)],
+    "zone_names": zone_names,
+  }

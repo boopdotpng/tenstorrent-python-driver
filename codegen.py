@@ -14,6 +14,19 @@ _KERNEL_CACHE_DIR = _CACHE / "kernels"
 _CKERNEL_DEFAULTS = _REPO / "firmware" / "ckernel_defaults"
 
 Strs = list[str]
+
+# Zone hash→name mapping captured from DeviceZoneScopedN #pragma messages
+_zone_map: dict[int, tuple[str, str, int]] = {}  # hash → (name, file, line)
+
+def _hash16(s: str) -> int:
+  """FNV1a-32 folded to 16 bits, matching Hash16_CT in kernel_profiler.hpp."""
+  h = 0x811c9dc5
+  for c in s.encode():
+    h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
+  return (h >> 16) ^ (h & 0xFFFF)
+
+def get_zone_map() -> dict[int, tuple[str, str, int]]:
+  return dict(_zone_map)
 LinkArgs = Strs | Callable[[Path], Strs]
 PrepareFn = Callable[[Path], None] | None
 
@@ -115,6 +128,18 @@ def _run(exe: Path, args: list[str], cwd: Path):
   r = subprocess.run([str(exe), *args], cwd=cwd, capture_output=True)
   if r.returncode != 0:
     raise RuntimeError(f"{exe.name} failed:\n{r.stderr.decode()}")
+  if PROFILER:
+    for line in r.stderr.decode(errors="replace").splitlines():
+      if "KERNEL_PROFILER" in line and "#pragma message:" in line:
+        # Format: "...#pragma message: name,file,line,KERNEL_PROFILER"
+        try:
+          msg = line.split("#pragma message:", 1)[1].strip().strip('"')
+          parts = msg.split(",")
+          if len(parts) >= 4 and parts[-1].strip() == "KERNEL_PROFILER":
+            name, fpath, lineno = parts[0].strip(), parts[1].strip(), int(parts[2].strip())
+            _zone_map[_hash16(name)] = (name, fpath, lineno)
+        except (ValueError, IndexError):
+          pass
 
 def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
                              prepare: PrepareFn = None):

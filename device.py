@@ -37,6 +37,8 @@ class Program:
   cores: CoreSpec = "all"
   num_sems: int = 0
   cb_config: dict[int, tuple[int, int]] | None = None  # {cb_id: (num_pages, page_size)}
+  sources: dict[str, str] = field(default_factory=dict)  # {"reader": src, "compute": src, ...}
+  name: str | None = None
 
 @dataclass(frozen=True)
 class _LaunchRole:
