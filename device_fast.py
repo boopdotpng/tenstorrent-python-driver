@@ -321,6 +321,8 @@ class FastDevice(DeviceBase):
     self._start_dispatch_cores()
 
   def close(self):
+    if getattr(self, "_closed", False):
+      return
     if hasattr(self, "_cq"):
       self._cq.close()
     super().close()
@@ -487,6 +489,7 @@ class FastDevice(DeviceBase):
   def run(self):
     if not self._exec_list: return
 
+    self.last_profile = None
     programs_snapshot = list(self._exec_list) if PROFILER else None
     if PROFILER:
       self._enqueue_profiler_init()
@@ -535,10 +538,15 @@ class FastDevice(DeviceBase):
         dram_buf=self._profiler_dram_buf,
         core_count_per_dram=self._profiler_core_count_per_dram,
         dispatch_cores=[self.prefetch_core, self.dispatch_core])
+      self.last_profile = data
+      self._event_id += 1
+      self.close()
       profiler_ui.serve(data)
+      return self.last_profile
     else:
       self._exec_list.clear()
     self._event_id += 1
+    return self.last_profile
 
   def _dump_debug(self, cores: CoreList):
     win = self.win

@@ -60,6 +60,7 @@ class SlowDevice(DeviceBase):
     self._wait_cores_done(cores, timeout_s=10.0)
 
   def run(self):
+    self.last_profile = None
     programs_info = []
     for i, p in enumerate(self._exec_list):
       self._run_single(p)
@@ -74,5 +75,10 @@ class SlowDevice(DeviceBase):
     if PROFILER and programs_info:
       import profiler, profiler_ui
       data = profiler.collect(self, programs_info, dispatch_mode="slow")
+      self.last_profile = data
+      self._exec_list.clear()
+      self.close()
       profiler_ui.serve(data)
+      return self.last_profile
     self._exec_list.clear()
+    return self.last_profile

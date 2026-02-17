@@ -1,4 +1,4 @@
-import os, struct, time
+import atexit, os, struct, time, weakref
 from dataclasses import dataclass, field
 from typing import ClassVar, Callable, Literal
 from pathlib import Path
@@ -17,6 +17,18 @@ CorePair = tuple[Core, Core]
 AddrPayload = tuple[int, bytes]
 RtaSizes = tuple[int, int, int]
 FAST_CQ_NUM_CIRCULAR_BUFFERS = 32
+_LIVE_DEVICE_REF = None
+
+def _close_live_devices_at_exit():
+  dev = _LIVE_DEVICE_REF() if _LIVE_DEVICE_REF is not None else None
+  if dev is None:
+    return
+  try:
+    dev.close()
+  except Exception:
+    pass
+
+atexit.register(_close_live_devices_at_exit)
 
 @dataclass
 class DataflowLaunch:
@@ -96,7 +108,10 @@ class CommonDevice:
     if not self.worker_cores:
       raise RuntimeError("no active Tensix worker cores detected")
     self.dispatchable_cores = list(self.worker_cores)
+    self._closed = False
     self.upload_firmware()
+    global _LIVE_DEVICE_REF
+    _LIVE_DEVICE_REF = weakref.ref(self)
 
   def _core_exists(self, core: Core) -> bool:
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
@@ -358,9 +373,17 @@ class CommonDevice:
     raise RuntimeError(f"AICLK failed to enter busy state (last={aiclk} MHz)")
 
   def _close(self):
+    if getattr(self, "_closed", False):
+      return
+    global _LIVE_DEVICE_REF
     if hasattr(self, "dram"): self.dram.close()
     if hasattr(self, "win"): self.win.free()
-    os.close(self.fd)
+    if isinstance(getattr(self, "fd", None), int) and self.fd >= 0:
+      os.close(self.fd)
+    self.fd = -1
+    self._closed = True
+    if _LIVE_DEVICE_REF is not None and _LIVE_DEVICE_REF() is self:
+      _LIVE_DEVICE_REF = None
 
   def arc_msg(self, msg: int, arg0: int = 0, arg1: int = 0, queue: int = 0, timeout_ms: int = 1000) -> list[int]:
     MSG_QUEUE_SIZE, REQUEST_MSG_LEN, RESPONSE_MSG_LEN = 4, 8, 8
@@ -410,9 +433,13 @@ class CommonDevice:
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
 
   def close(self):
-    if hasattr(self, "fd"):
-      self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
-    self._close()
+    if getattr(self, "_closed", False):
+      return
+    try:
+      if isinstance(getattr(self, "fd", None), int) and self.fd >= 0:
+        self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
+    finally:
+      self._close()
 
 
 class DeviceBase(CommonDevice):
@@ -423,6 +450,7 @@ class DeviceBase(CommonDevice):
     if init_core_plans:
       self._core_plans = self._build_core_plans()
     self._exec_list: list[Program] = []
+    self.last_profile: dict | None = None
     self.win = TLBWindow(self.fd, TLBSize.MiB_2)
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram, device=self, enable_sysmem=enable_sysmem)
 

@@ -1,5 +1,5 @@
 """Profiler web UI — serves an interactive grid visualization of device profiler data."""
-import json, threading
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 _data_json = ""

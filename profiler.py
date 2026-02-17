@@ -1,4 +1,5 @@
 """Device kernel profiler — reads wall-clock markers from L1 after kernel execution."""
+import re
 import struct
 from defs import TensixL1, CoreList
 
@@ -19,6 +20,13 @@ _GUARANTEED_4_H = 10  # Kernel child scope end
 _CUSTOM_START = 12    # Optional markers begin here
 _HOST_BUF_END = 0
 _HOST_BUF_WORDS_PER_RISC = 65536 // 4
+_ZONE_RE = re.compile(r'DeviceZoneScopedN\s*\(\s*"([^"]+)"')
+
+def _hash16(s: str) -> int:
+  h = 0x811C9DC5
+  for c in s.encode():
+    h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
+  return (h >> 16) ^ (h & 0xFFFF)
 
 def _parse_ts(w0, w1):
   """Extract 44-bit wall-clock timestamp from a profiler marker pair."""
@@ -176,6 +184,46 @@ def _risc_to_json(r):
   d["custom"] = [{"hash": zh, "type": pt, "ts": ts} for zh, pt, ts in r["custom"]]
   return d
 
+def _used_zone_hashes(programs):
+  used = set()
+  for prog in programs:
+    for p in prog["profiles"].values():
+      for r in p["riscs"]:
+        for z in r["custom"]:
+          used.add(z["hash"])
+  return used
+
+def _zone_names_from_sources(programs_info):
+  zone_names = {}
+  for info in programs_info:
+    for label, src in info.get("sources", {}).items():
+      if not src:
+        continue
+      for lineno, line in enumerate(src.splitlines(), start=1):
+        m = _ZONE_RE.search(line)
+        if not m:
+          continue
+        name = m.group(1)
+        h = _hash16(name)
+        key = str(h)
+        if key not in zone_names:
+          zone_names[key] = {"name": name, "file": label, "line": lineno}
+  return zone_names
+
+def _build_zone_names(programs_info, used_hashes):
+  from codegen import get_zone_map
+
+  zone_names = _zone_names_from_sources(programs_info)
+  compile_map = get_zone_map()
+  for h in used_hashes:
+    key = str(h)
+    if key in zone_names:
+      continue
+    if h in compile_map:
+      name, fpath, line = compile_map[h]
+      zone_names[key] = {"name": name, "file": fpath, "line": line}
+  return zone_names
+
 def _parse_risc_words(words, flat_id, risc_id, program_ids):
   """Split concatenated DRAM profiler stream into per-program RISC entries."""
   n = len(words)
@@ -225,7 +273,6 @@ def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, fr
   """Read profiler data and return JSON-serializable dict for the web UI.
   programs_info: list of {"cores": CoreList, "sources": dict, "index": int}"""
   from tlb import TLBConfig, TLBMode
-  from codegen import get_zone_map
   from device import TileGrid
 
   l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
@@ -249,8 +296,7 @@ def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, fr
       "sources": info.get("sources", {}),
     })
 
-  zone_map = get_zone_map()
-  zone_names = {str(h): {"name": n, "file": f, "line": l} for h, (n, f, l) in zone_map.items()}
+  zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
 
   return {
     "dispatch_mode": dispatch_mode,
@@ -265,7 +311,6 @@ def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, fr
 def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count_per_dram, freq_mhz=1000, dispatch_cores=None):
   """Read batched fast-dispatch profiler data from DRAM and return UI JSON."""
   from tlb import TLBConfig, TLBMode
-  from codegen import get_zone_map
   from device import TileGrid
 
   l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
@@ -311,14 +356,14 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
       p["total_cycles"] = _core_total_cycles({"riscs": riscs})
       by_index[info["index"]]["profiles"][f"{core[0]},{core[1]}"] = p
 
-  zone_map = get_zone_map()
-  zone_names = {str(h): {"name": n, "file": f, "line": l} for h, (n, f, l) in zone_map.items()}
+  programs = [by_index[i] for i in sorted(by_index)]
+  zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
   return {
     "dispatch_mode": "fast",
     "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
     "freq_mhz": freq_mhz,
     "grid_x": list(TileGrid.TENSIX_X),
     "grid_y": list(range(TileGrid.TENSIX_Y[0], TileGrid.TENSIX_Y[1] + 1)),
-    "programs": [by_index[i] for i in sorted(by_index)],
+    "programs": programs,
     "zone_names": zone_names,
   }
