@@ -143,7 +143,7 @@ def _run(exe: Path, args: list[str], cwd: Path):
 
 def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
                              prepare: PrepareFn = None):
-  if cache_elf.is_file():
+  if cache_elf.is_file() and not PROFILER:
     return
   build = Path(tempfile.mkdtemp(prefix=tmp_prefix))
   try:
@@ -301,7 +301,7 @@ class Compiler:
       },
     )
     cached_elf = _KERNEL_CACHE_DIR / f"{target}-{key[:16]}.elf"
-    if cached_elf.is_file():
+    if cached_elf.is_file() and not PROFILER:
       xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
       return CompiledKernel(xip=xip, xip_text_bytes=text_size)
     mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
