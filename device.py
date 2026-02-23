@@ -155,8 +155,9 @@ class CommonDevice:
 
   def upload_firmware(self):
     skip = self._firmware_skip_cores()
-    all_cores = [core for core in self.worker_cores if core not in skip]
-    cores = self._cores_needing_firmware(all_cores)
+    # Always upload firmware for this process so the active runtime mode
+    # (e.g. TT_PROFILER on/off) cannot inherit stale images from a prior run.
+    cores = [core for core in self.worker_cores if core not in skip]
     if not cores: return
 
     fw = compile_firmware()
