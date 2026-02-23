@@ -1,4 +1,4 @@
-import re
+import os, re
 import struct
 from defs import TensixL1, Dram
 from helpers import hash16
@@ -30,33 +30,9 @@ _PKT_TS_EVENT = 4
 _PKT_TS_DATA_16B = 5
 
 def _read_ctrl_and_buffer_base(win):
-  raw0 = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
-  raw1 = bytes(win.uc[TensixL1.PROFILER_CONTROL_ALT : TensixL1.PROFILER_CONTROL_ALT + 128])
-  c0 = struct.unpack("<32I", raw0)
-  c1 = struct.unpack("<32I", raw1)
-
-  def score(ctrl):
-    return (
-      sum(ctrl[_HOST_BUF_END : _HOST_BUF_END + 5]) +
-      sum(ctrl[_DEVICE_BUF_END : _DEVICE_BUF_END + 5]) +
-      int(ctrl[_DONE] != 0)
-    )
-
-  s0, s1 = score(c0), score(c1)
-  primary = c1 if s1 > s0 else c0
-  primary_buf = TensixL1.PROFILER_BUFFERS_ALT if s1 > s0 else TensixL1.PROFILER_BUFFERS
-  primary_ctrl_base = TensixL1.PROFILER_CONTROL_ALT if s1 > s0 else TensixL1.PROFILER_CONTROL
-
-  # Firmware/mailbox packing can differ by core; merge end pointers so fast DRAM decode
-  # does not drop cores when one control base is stale/zero for that core.
-  merged = list(primary)
-  for i in range(_HOST_BUF_END, _HOST_BUF_END + 5):
-    merged[i] = max(c0[i], c1[i])
-  for i in range(_DEVICE_BUF_END, _DEVICE_BUF_END + 5):
-    merged[i] = max(c0[i], c1[i])
-  merged[_DROPPED] = c0[_DROPPED] | c1[_DROPPED]
-  merged[_DONE] = max(c0[_DONE], c1[_DONE])
-  return tuple(merged), primary_buf, primary_ctrl_base
+  raw = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
+  ctrl = struct.unpack("<32I", raw)
+  return ctrl, TensixL1.PROFILER_BUFFERS, TensixL1.PROFILER_CONTROL
 
 def _hash_profiler_msg(name: str, fpath: str, lineno: int) -> int:
   return hash16(f"{name},{fpath},{lineno},KERNEL_PROFILER")
@@ -419,6 +395,8 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
   program_ids = {info["index"] + 1 for info in programs_info}
   by_index = {info["index"]: {"index": info["index"], "name": info.get("name"), "cores": [list(c) for c in info["cores"]], "profiles": {}, "sources": info.get("sources", {})}
               for info in programs_info}
+  debug = os.environ.get("TT_PROFILER_DEBUG") == "1"
+  debug_left = 3
 
   needed = set()
   for info in programs_info:
@@ -437,6 +415,17 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
       base = page_id * page_size + slot + risc * _HOST_BUF_BYTES_PER_RISC
       raw = dram_raw[base : base + host_end * 4]
       words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
+      if debug and debug_left > 0 and risc == 0:
+        dev_ends = [ctrl[_DEVICE_BUF_END + i] for i in range(5)]
+        host_ends = [ctrl[_HOST_BUF_END + i] for i in range(5)]
+        sample_words = list(words[:16])
+        nonzero = sum(1 for w in words[:128] if w != 0)
+        print(
+          f"[profdbg] core={core} ctrl_base=0x{ctrl_base:x} done={ctrl[_DONE]} dropped=0x{ctrl[_DROPPED]:x} "
+          f"host_ends={host_ends} dev_ends={dev_ends} host_end_r0={host_end} sample_nonzero_first128={nonzero}"
+        )
+        print(f"[profdbg] core={core} r0_words16={sample_words}")
+        debug_left -= 1
       for prog_id, r in _parse_risc_words(words, flat_id, risc, program_ids).items():
         by_program.setdefault(prog_id, []).append(r)
 

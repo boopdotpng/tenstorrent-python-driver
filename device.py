@@ -476,6 +476,10 @@ class DeviceBase(CommonDevice):
     if profile_data is not None:
       self.last_profile = profile_data
       self._exec_list.clear()
+      if os.environ.get("TT_PROFILER_UI") == "0":
+        import profiler
+        profiler.print_data_summary(profile_data)
+        return self.last_profile
       import profiler_ui
       profiler_ui.serve(profile_data)
       return self.last_profile

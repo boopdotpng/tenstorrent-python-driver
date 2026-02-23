@@ -465,27 +465,53 @@ class FastDevice(DeviceBase):
 
   def _enqueue_profiler_init(self):
     self._ensure_profiler_dram()
-    blobs = []
     cores = sorted(self._profiler_flat_ids, key=lambda xy: (xy[0], xy[1]))
-    for core in cores:
-      x, y = core
-      ctrl = [0] * 32
-      ctrl[12] = self._profiler_dram_buf.addr
-      ctrl[14] = x
-      ctrl[15] = y
-      ctrl[16] = self._profiler_flat_ids[core]
-      ctrl[17] = self._profiler_core_count_per_dram
-      blobs.append(struct.pack("<32I", *ctrl))
-    for addr in (TensixL1.PROFILER_CONTROL, TensixL1.PROFILER_CONTROL_ALT):
-      self._cq.enqueue_write_packed(cores=cores, addr=addr, data=blobs)
+    self._cq.enqueue_write_packed(
+      cores=cores,
+      addr=TensixL1.PROFILER_CONTROL,
+      data=[self._profiler_control_blob(core) for core in cores],
+    )
+
+  def _profiler_control_blob(self, core: Core) -> bytes:
+    x, y = core
+    ctrl = [0] * 32
+    # DRAM_PROFILER_ADDRESS_DEFAULT
+    ctrl[12] = self._profiler_dram_buf.addr
+    # NOC_X / NOC_Y
+    ctrl[14] = x
+    ctrl[15] = y
+    # FLAT_ID / CORE_COUNT_PER_DRAM
+    ctrl[16] = self._profiler_flat_ids[core]
+    ctrl[17] = self._profiler_core_count_per_dram
+    return struct.pack("<32I", *ctrl)
 
   def _enqueue_profiler_reset_for_program(self, plan):
-    for base in (TensixL1.PROFILER_CONTROL, TensixL1.PROFILER_CONTROL_ALT):
-      self._cq.enqueue_write_packed_large(
-        plan.mcast_dests, base + 5 * 4, b"\0" * (5 * 4)
-      )
-      self._cq.enqueue_write_packed_large(
-        plan.mcast_dests, base + 19 * 4, b"\0" * 4
+    # Reset active profiler progress fields while keeping configured routing.
+    base = TensixL1.PROFILER_CONTROL
+    self._cq.enqueue_write_packed_large(
+      plan.mcast_dests, base + 5 * 4, b"\0" * (5 * 4)
+    )
+    self._cq.enqueue_write_packed_large(
+      plan.mcast_dests, base + 19 * 4, b"\0" * 4
+    )
+
+  def _dump_profiler_timeout_state(self, cores: CoreList):
+    sample = cores[: min(4, len(cores))]
+    if not sample:
+      return
+    print("  profiler timeout core snapshot:")
+    for core in sample:
+      cfg = TLBConfig(addr=0, start=core, end=core, noc=0, mcast=False, mode=TLBMode.STRICT)
+      with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
+        go = win.uc[TensixL1.GO_MSG + 3]
+        launch_rd = win.read32(TensixL1.MAILBOX_BASE + 12)
+        run_counter = win.read32(TensixL1.PROFILER_CONTROL + 13 * 4)
+        done = win.read32(TensixL1.PROFILER_CONTROL + 19 * 4)
+        end_br = win.read32(TensixL1.PROFILER_CONTROL + 5 * 4)
+        end_nc = win.read32(TensixL1.PROFILER_CONTROL + 6 * 4)
+      print(
+        f"    core={core} go=0x{go:02x} launch_rd={launch_rd} "
+        f"run_counter={run_counter} done={done} dev_end_br={end_br} dev_end_nc={end_nc}"
       )
 
   def run(self):
@@ -520,7 +546,12 @@ class FastDevice(DeviceBase):
 
     self._cq.enqueue_host_event(self._event_id)
     self._cq.flush()
-    self._cq.wait_host_event(self._event_id, timeout_s=10.0)
+    try:
+      self._cq.wait_host_event(self._event_id, timeout_s=10.0)
+    except TimeoutError:
+      if PROFILER and last_cores is not None:
+        self._dump_profiler_timeout_state(last_cores)
+      raise
     self._event_id += 1
     if programs_info:
       import profiler

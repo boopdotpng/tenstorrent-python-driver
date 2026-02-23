@@ -275,7 +275,7 @@ class DramAllocator:
       dataflow=[DataflowLaunch(cores=cores, reader=kernel, reader_rt_args=reader_args, writer_rt_args=[])],
       compute=None, compute_rt_args=[], cbs=[0],
       tile_size=buf.page_size, num_pages=2, cores=len(cores),
-      profile=False,
+      profile=True,
     ))
     self._device.run()
 

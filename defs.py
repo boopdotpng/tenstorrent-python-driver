@@ -35,11 +35,18 @@ class TensixL1:
   DATA_BUFFER_SPACE_BASE = 0x037000
 
   # Profiler region (inside mailboxes_t)
-  PROFILER_CONTROL = 0x000960       # 32 × u32 = 128 bytes
-  PROFILER_BUFFERS = 0x0009E0       # 5 × 512 × u32 = 10240 bytes (one per RISC)
-  # Compatibility alias observed with alternate mailbox packing in some firmware variants.
-  PROFILER_CONTROL_ALT = 0x0009C0
-  PROFILER_BUFFERS_ALT = 0x000A40
+  # Derived from tt-metal dev_msgs/dev_mem_map for p100a (blackhole):
+  #   MEM_MAILBOX_BASE = 96 (0x60)
+  #   offsetof(mailboxes_t, profiler.control_vector) = 2400 (0x960)
+  #   offsetof(mailboxes_t, profiler.buffer) = 2528 (0x9e0)
+  # Effective addresses:
+  #   control = 0x60 + 0x960 = 0x9c0
+  #   buffer  = 0x60 + 0x9e0 = 0xa40
+  PROFILER_CONTROL = 0x0009C0       # 32 × u32 = 128 bytes
+  PROFILER_BUFFERS = 0x000A40       # 5 × 512 × u32 = 10240 bytes (one per RISC)
+  # Legacy/alternate section kept for debugging compatibility.
+  PROFILER_CONTROL_ALT = 0x000960
+  PROFILER_BUFFERS_ALT = 0x0009E0
   PROFILER_BUF_STRIDE = 2048        # bytes per RISC data buffer
   PROFILER_HOST_BUFFER_BYTES_PER_RISC = 65536
 
