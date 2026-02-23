@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Peak matmul benchmark with 2D multicast and optional fp32 accumulation.
-
-Roles follow TTNN-style partitioning with per-role kernels on disjoint core sets:
-- NCRISC (NOC0): in0 sender, in0 receiver
-- BRISC (NOC1): in1 sender+writer, in1 receiver+writer
-"""
 from __future__ import annotations
 
 import os
-import sys
 import time
-from pathlib import Path
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from codegen import CkernelConfig, Compiler, DataFormat, MathFidelity
 from device import DataflowLaunch, Device, Program

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Test queuing multiple different programs with different kernels and RTAs.
-
-Queues: add1(4 tiles) -> matmul_naive(256x256x256) -> add1(2 tiles, different RTAs)
-Then drains all outputs and prints/validates them.
-"""
 from __future__ import annotations
-import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 import random, struct
 from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
 from device import Device, Program, DataflowLaunch
@@ -191,19 +185,16 @@ void MAIN {{
 
 
 def make_const_tile(val: float) -> bytes:
-  """Make a single tile (32x32) of constant bf16 values."""
   b = bf16(val)
   return b.to_bytes(2, "little") * (32 * 32)
 
 def make_seq_tile(start: float, step: float = 0.125) -> bytes:
-  """Make a tile with sequential bf16 values (first 8 values matter for printing)."""
   buf = bytearray(32 * 32 * 2)
   for i in range(32 * 32):
     buf[i*2:(i+1)*2] = bf16(start + i * step).to_bytes(2, "little")
   return bytes(buf)
 
 def print_tile_corner(label: str, data: bytes, n: int = 8):
-  """Print first N values of a tile as floats."""
   vals = [f32(int.from_bytes(data[i*2:(i+1)*2], "little")) for i in range(n)]
   print(f"  {label}: {[f'{v:.4f}' for v in vals]}")
 

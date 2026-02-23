@@ -61,26 +61,11 @@ class SlowDevice(DeviceBase):
 
   def run(self):
     self.last_profile = None
-    programs_info = []
-    prof_idx = 0
     for p in self._exec_list:
       self._run_single(p)
-      if PROFILER and p.profile:
-        plan = self._resolve_core_plan(p.cores)
-        programs_info.append({
-          "cores": plan.cores,
-          "sources": getattr(p, "sources", {}),
-          "name": getattr(p, "name", None),
-          "index": prof_idx,
-        })
-        prof_idx += 1
-    if PROFILER and programs_info:
+    programs_info = self._profile_programs_info()
+    if programs_info:
       import profiler
       data = profiler.collect(self, programs_info, dispatch_mode="slow", freq_mhz=self.profiler_freq_mhz())
-      self.last_profile = data
-      self._exec_list.clear()
-      import profiler_ui
-      profiler_ui.serve(data)
-      return self.last_profile
-    self._exec_list.clear()
-    return self.last_profile
+      return self._finish_run(data)
+    return self._finish_run()

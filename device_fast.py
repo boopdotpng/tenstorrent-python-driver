@@ -280,7 +280,7 @@ class _FastCQ:
 class FastDevice(DeviceBase):
   DISPATCH_STREAM_INDEX = 48
   DISPATCH_MSG_OFFSET = 0
-  _PROFILER_BYTES_PER_RISC = 65536
+  _PROFILER_BYTES_PER_RISC = TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC
 
   def _select_dispatch_core_pair(self) -> CorePair:
     ys = sorted({y for _, y in self.worker_cores})
@@ -492,7 +492,7 @@ class FastDevice(DeviceBase):
     if not self._exec_list: return
 
     self.last_profile = None
-    programs_snapshot = [p for p in self._exec_list if getattr(p, "profile", True)] if PROFILER else []
+    programs_info = self._profile_programs_info()
     if PROFILER:
       self._enqueue_profiler_init()
     prev_id = None
@@ -521,19 +521,10 @@ class FastDevice(DeviceBase):
     self._cq.enqueue_host_event(self._event_id)
     self._cq.flush()
     self._cq.wait_host_event(self._event_id, timeout_s=10.0)
-    if PROFILER and programs_snapshot:
+    self._event_id += 1
+    if programs_info:
       import profiler
       freq_mhz = self.profiler_freq_mhz()
-      programs_info = []
-      for i, prog in enumerate(programs_snapshot):
-        plan = self._resolve_core_plan(prog.cores)
-        programs_info.append({
-          "cores": plan.cores,
-          "sources": getattr(prog, "sources", {}),
-          "name": getattr(prog, "name", None),
-          "index": i,
-        })
-      self._exec_list.clear()
       data = profiler.collect_fast_dram(
         self, programs_info,
         core_flat_ids=self._profiler_flat_ids,
@@ -541,12 +532,5 @@ class FastDevice(DeviceBase):
         core_count_per_dram=self._profiler_core_count_per_dram,
         freq_mhz=freq_mhz,
         dispatch_cores=[self.prefetch_core, self.dispatch_core])
-      self.last_profile = data
-      self._event_id += 1
-      import profiler_ui
-      profiler_ui.serve(data)
-      return self.last_profile
-    else:
-      self._exec_list.clear()
-    self._event_id += 1
-    return self.last_profile
+      return self._finish_run(data)
+    return self._finish_run()

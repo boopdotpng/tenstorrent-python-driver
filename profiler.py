@@ -1,7 +1,7 @@
-"""Device kernel profiler — reads wall-clock markers from L1 after kernel execution."""
 import re
 import struct
 from defs import TensixL1, Dram
+from helpers import hash16
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
@@ -19,7 +19,8 @@ _GUARANTEED_3_H = 8   # Kernel child scope start
 _GUARANTEED_4_H = 10  # Kernel child scope end
 _CUSTOM_START = 12    # Optional markers begin here
 _HOST_BUF_END = 0
-_HOST_BUF_WORDS_PER_RISC = 65536 // 4
+_HOST_BUF_BYTES_PER_RISC = TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC
+_HOST_BUF_WORDS_PER_RISC = _HOST_BUF_BYTES_PER_RISC // 4
 _ZONE_RE = re.compile(r'DeviceZoneScopedN\s*\(\s*"([^"]+)"')
 _PKT_ZONE_START = 0
 _PKT_ZONE_END = 1
@@ -57,23 +58,15 @@ def _read_ctrl_and_buffer_base(win):
   merged[_DONE] = max(c0[_DONE], c1[_DONE])
   return tuple(merged), primary_buf, primary_ctrl_base
 
-def _hash16(s: str) -> int:
-  h = 0x811C9DC5
-  for c in s.encode():
-    h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
-  return (h >> 16) ^ (h & 0xFFFF)
-
 def _hash_profiler_msg(name: str, fpath: str, lineno: int) -> int:
-  return _hash16(f"{name},{fpath},{lineno},KERNEL_PROFILER")
+  return hash16(f"{name},{fpath},{lineno},KERNEL_PROFILER")
 
 def _parse_ts(w0, w1):
-  """Extract 44-bit wall-clock timestamp from a profiler marker pair."""
   if not (w0 & 0x80000000): return None
   hi12 = w0 & 0xFFF
   return (hi12 << 32) | w1
 
 def _parse_marker(w0, w1):
-  """Parse a marker into (zone_hash, packet_type, timestamp) or None."""
   if not (w0 & 0x80000000): return None
   timer_id = (w0 >> 12) & 0x7FFFF
   zone_hash = timer_id & 0xFFFF
@@ -87,7 +80,6 @@ def _parse_marker(w0, w1):
   return zone_hash, ptype, ts
 
 def read_core(win, core):
-  """Read profiler data for one core via a TLB window. Returns dict with per-RISC timing."""
   ctrl, buf_base, _ = _read_ctrl_and_buffer_base(win)
 
   result = {"core": core, "dropped": ctrl[_DROPPED], "done": ctrl[_DONE], "riscs": []}
@@ -197,7 +189,6 @@ def _print_report(profiles, freq_mhz, max_cores):
   print(f"{'=' * 72}\n")
 
 def _core_total_cycles(profile):
-  """Kernel-only core wall time across RISCs: latest kernel end - earliest kernel start."""
   starts, ends = [], []
   best = 0
   for r in profile["riscs"]:
@@ -228,7 +219,6 @@ def print_data_summary(data):
     )
 
 def _risc_to_json(r):
-  """Convert a RISC profile dict to JSON-serializable form."""
   d = {"name": r["name"], "end_idx": r["end_idx"]}
   for k in ("fw_start", "fw_end", "kern_start", "kern_end"):
     d[k] = r[k]
@@ -261,7 +251,7 @@ def _zone_names_from_sources(programs_info):
           if key not in zone_names:
             zone_names[key] = {"name": name, "file": fpath, "line": lineno}
         # Keep name-only hash as a weak fallback for legacy/debug variants.
-        key = str(_hash16(name))
+        key = str(hash16(name))
         if key not in zone_names:
           zone_names[key] = {"name": name, "file": label, "line": lineno}
   return zone_names
@@ -280,8 +270,39 @@ def _build_zone_names(programs_info, used_hashes):
       zone_names[key] = {"name": name, "file": fpath, "line": line}
   return zone_names
 
+def _layout(device):
+  from device import TileGrid
+
+  dram_tiles = [
+    {
+      "bank": bank,
+      "x": Dram.BANK_X[bank],
+      "y": y,
+      "valid": bank != device.harvested_dram,
+    }
+    for bank in range(Dram.BANK_COUNT)
+    for y in Dram.BANK_TILE_YS[bank]
+  ]
+  # Keep a blank spacer column (x=8) left of right DRAM column (x=9) to match BH NoC layout.
+  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles} | {8})
+  grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
+  return dram_tiles, grid_x, grid_y
+
+def _profile_result(device, dispatch_mode, dispatch_cores, freq_mhz, programs, zone_names):
+  dram_tiles, grid_x, grid_y = _layout(device)
+  return {
+    "dispatch_mode": dispatch_mode,
+    "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
+    "freq_mhz": freq_mhz,
+    "grid_x": grid_x,
+    "grid_y": grid_y,
+    "programs": programs,
+    "zone_names": zone_names,
+    "dram_tiles": dram_tiles,
+    "harvested_dram_bank": device.harvested_dram,
+  }
+
 def _parse_risc_words(words, flat_id, risc_id, program_ids):
-  """Parse per-RISC profiler DRAM stream as concatenated runs."""
   n = len(words)
   if n < _CUSTOM_START:
     return {}
@@ -362,10 +383,7 @@ def _parse_risc_words(words, flat_id, risc_id, program_ids):
   return out
 
 def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, freq_mhz=1000):
-  """Read profiler data and return JSON-serializable dict for the web UI.
-  programs_info: list of {"cores": CoreList, "sources": dict, "index": int}"""
   from tlb import TLBConfig, TLBMode
-  from device import TileGrid
 
   l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
   programs = []
@@ -389,36 +407,10 @@ def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, fr
     })
 
   zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
-  dram_tiles = [
-    {
-      "bank": bank,
-      "x": Dram.BANK_X[bank],
-      "y": y,
-      "valid": bank != device.harvested_dram,
-    }
-    for bank in range(Dram.BANK_COUNT)
-    for y in Dram.BANK_TILE_YS[bank]
-  ]
-  # Keep a blank spacer column (x=8) left of right DRAM column (x=9) to match BH NoC layout.
-  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles} | {8})
-  grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
-
-  return {
-    "dispatch_mode": dispatch_mode,
-    "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
-    "freq_mhz": freq_mhz,
-    "grid_x": grid_x,
-    "grid_y": grid_y,
-    "programs": programs,
-    "zone_names": zone_names,
-    "dram_tiles": dram_tiles,
-    "harvested_dram_bank": device.harvested_dram,
-  }
+  return _profile_result(device, dispatch_mode, dispatch_cores, freq_mhz, programs, zone_names)
 
 def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count_per_dram, freq_mhz=1000, dispatch_cores=None):
-  """Read batched fast-dispatch profiler data from DRAM and return UI JSON."""
   from tlb import TLBConfig, TLBMode
-  from device import TileGrid
 
   l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
   # Avoid re-entering Device.run() while already inside profiler collection.
@@ -438,11 +430,11 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
     device.win.configure(l1_cfg)
     ctrl, _, ctrl_base = _read_ctrl_and_buffer_base(device.win)
     page_id = flat_id // core_count_per_dram
-    slot = (flat_id % core_count_per_dram) * 5 * 65536
+    slot = (flat_id % core_count_per_dram) * 5 * _HOST_BUF_BYTES_PER_RISC
     by_program = {}
     for risc in range(5):
       host_end = min(ctrl[_HOST_BUF_END + risc], _HOST_BUF_WORDS_PER_RISC)
-      base = page_id * page_size + slot + risc * 65536
+      base = page_id * page_size + slot + risc * _HOST_BUF_BYTES_PER_RISC
       raw = dram_raw[base : base + host_end * 4]
       words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
       for prog_id, r in _parse_risc_words(words, flat_id, risc, program_ids).items():
@@ -465,27 +457,4 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
 
   programs = [by_index[i] for i in sorted(by_index)]
   zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
-  dram_tiles = [
-    {
-      "bank": bank,
-      "x": Dram.BANK_X[bank],
-      "y": y,
-      "valid": bank != device.harvested_dram,
-    }
-    for bank in range(Dram.BANK_COUNT)
-    for y in Dram.BANK_TILE_YS[bank]
-  ]
-  # Keep a blank spacer column (x=8) left of right DRAM column (x=9) to match BH NoC layout.
-  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles} | {8})
-  grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
-  return {
-    "dispatch_mode": "fast",
-    "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
-    "freq_mhz": freq_mhz,
-    "grid_x": grid_x,
-    "grid_y": grid_y,
-    "programs": programs,
-    "zone_names": zone_names,
-    "dram_tiles": dram_tiles,
-    "harvested_dram_bank": device.harvested_dram,
-  }
+  return _profile_result(device, "fast", dispatch_cores, freq_mhz, programs, zone_names)

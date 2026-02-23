@@ -1,5 +1,5 @@
 import os, struct
-from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
+from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC, align_up
 from dataclasses import dataclass
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
@@ -9,7 +9,11 @@ LoReloc = tuple[int, int, int]
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
-def align_up(n: int, a: int) -> int: return (n + a - 1) & ~(a - 1)
+def hash16(s: str) -> int:
+  h = 0x811c9dc5
+  for c in s.encode():
+    h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
+  return (h >> 16) ^ (h & 0xFFFF)
 
 def align_down(value: int, alignment: TLBSize) -> tuple[int, int]:
   base = value & ~(alignment.value - 1)

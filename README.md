@@ -8,6 +8,11 @@ A full replacement of **tt-metal** and **tt-umd**, written in Python.
 ## instructions 
 Run `setup-deps.sh` to install the tarball containing the risc-v compiler, include headers, and libraries. Previously, you had to build a whole copy of `tt-metal` to get these headers, but the tarball contains the minimal set of files required to run all tt-metal kernels. 
 
+Run examples as modules from repo root:
+- `python3 -m examples.add1`
+- `python3 -m examples.matmul_naive`
+- `python3 -m examples.matmul_peak`
+- `python3 -m examples.test_queue`
 
 Currently, I have add1 and a very naive, slow matmul working. 
 

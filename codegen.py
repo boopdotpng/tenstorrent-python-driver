@@ -1,4 +1,5 @@
-from helpers import pack_xip_elf, load_pt_load, PTLoad, PROFILER
+from helpers import pack_xip_elf, load_pt_load, PTLoad, PROFILER, hash16
+from defs import TensixL1
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -17,13 +18,6 @@ Strs = list[str]
 
 # Zone hash→name mapping captured from DeviceZoneScopedN #pragma messages
 _zone_map: dict[int, tuple[str, str, int]] = {}  # hash → (name, file, line)
-
-def _hash16(s: str) -> int:
-  """FNV1a-32 folded to 16 bits, matching Hash16_CT in kernel_profiler.hpp."""
-  h = 0x811c9dc5
-  for c in s.encode():
-    h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
-  return (h >> 16) ^ (h & 0xFFFF)
 
 def get_zone_map() -> dict[int, tuple[str, str, int]]:
   return dict(_zone_map)
@@ -123,6 +117,10 @@ def _hash_default_ckernel_headers() -> str:
   return h.hexdigest()
 
 _CKERNEL_DEFAULTS_HASH = _hash_default_ckernel_headers()
+_PROFILE_DEFINES = [
+  "-DPROFILE_KERNEL=1",
+  f"-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC={TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC}",
+]
 
 def _run(exe: Path, args: list[str], cwd: Path):
   r = subprocess.run([str(exe), *args], cwd=cwd, capture_output=True)
@@ -150,7 +148,7 @@ def _run(exe: Path, args: list[str], cwd: Path):
         lineno = int(lineno_s)
       except ValueError:
         continue
-      _zone_map[_hash16(msg)] = (name, fpath, lineno)
+      _zone_map[hash16(msg)] = (name, fpath, lineno)
 
 def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
                              prepare: PrepareFn = None):
@@ -200,7 +198,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
   ]
   if PROFILER:
-    common_defines += ["-DPROFILE_KERNEL=1", "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536"]
+    common_defines += _PROFILE_DEFINES
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
   fw_src_dir = _REPO / "firmware"
@@ -270,7 +268,7 @@ class Compiler:
       *(extra_defines or []),
     ]
     if PROFILER:
-      defines += ["-DPROFILE_KERNEL=1", "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536"]
+      defines += _PROFILE_DEFINES
     extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
     return self._build(
       src, target, defines, extra_objs, opt="-O2", trisc=False,
@@ -286,7 +284,7 @@ class Compiler:
       f"-DUCK_CHLKC_{stage.upper()}", f"-DNAMESPACE=chlkc_{stage}",
     ]
     if PROFILER:
-      defines += ["-DPROFILE_KERNEL=1", "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536"]
+      defines += _PROFILE_DEFINES
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
   def _build(self, kern: str, target: str, defines: Strs, extra_objs: Strs, opt: str, trisc: bool, extra_includes: Strs | None = None,

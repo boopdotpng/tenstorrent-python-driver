@@ -5,7 +5,7 @@ from pathlib import Path
 from defs import *
 from codegen import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import USE_USB_DISPATCH, align_down, align_up, generate_jal_instruction, noc_xy
+from helpers import USE_USB_DISPATCH, PROFILER, align_down, align_up, generate_jal_instruction, noc_xy
 from dram import DramAllocator
 
 CoreSpec = int | Literal["all"]
@@ -137,9 +137,6 @@ class CommonDevice:
   }
 
   def _cores_needing_firmware(self, cores: list[Core]) -> list[Core]:
-    """Probe cores and return those that need firmware upload.
-    A core is 'ready' if BRISC is out of reset and the tile is idle (RUN_MSG_DONE).
-    Cores running stale CQ firmware or held in reset are returned for re-upload."""
     if not cores: return cores
     # Quick check: if the first core needs firmware, all likely do (cold boot)
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
@@ -444,7 +441,6 @@ class CommonDevice:
 
 
 class DeviceBase(CommonDevice):
-  """Shared infrastructure for both dispatch modes: core planning, kernel packing, payload prep."""
 
   def __init__(self, device: int = 0, enable_sysmem: bool = False, init_core_plans: bool = True):
     super().__init__(device=device)
@@ -457,6 +453,34 @@ class DeviceBase(CommonDevice):
 
   def queue(self, program: Program):
     self._exec_list.append(program)
+
+  def _profile_programs_info(self) -> list[dict]:
+    if not PROFILER:
+      return []
+    info = []
+    idx = 0
+    for program in self._exec_list:
+      if not getattr(program, "profile", True):
+        continue
+      plan = self._resolve_core_plan(program.cores)
+      info.append({
+        "cores": plan.cores,
+        "sources": getattr(program, "sources", {}),
+        "name": getattr(program, "name", None),
+        "index": idx,
+      })
+      idx += 1
+    return info
+
+  def _finish_run(self, profile_data: dict | None = None):
+    if profile_data is not None:
+      self.last_profile = profile_data
+      self._exec_list.clear()
+      import profiler_ui
+      profiler_ui.serve(profile_data)
+      return self.last_profile
+    self._exec_list.clear()
+    return self.last_profile
 
   def profiler_freq_mhz(self) -> int:
     try:
