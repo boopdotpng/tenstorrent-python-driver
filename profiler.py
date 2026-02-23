@@ -1,8 +1,7 @@
 """Device kernel profiler — reads wall-clock markers from L1 after kernel execution."""
-import os
 import re
 import struct
-from defs import TensixL1, CoreList, Dram
+from defs import TensixL1, Dram
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
@@ -122,19 +121,6 @@ def read_core(win, core):
     })
   return result
 
-def read_and_report(device, cores: CoreList, freq_mhz: int = 1000, max_cores: int = 0):
-  """Read profiler from all cores and print aggregate report."""
-  from tlb import TLBConfig, TLBMode
-  l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-
-  profiles = []
-  for core in cores:
-    l1_cfg.start = l1_cfg.end = core
-    device.win.configure(l1_cfg)
-    profiles.append(read_core(device.win, core))
-
-  _print_report(profiles, freq_mhz, max_cores)
-
 def _cycles_us(cycles, freq_mhz):
   return cycles / freq_mhz if cycles else None
 
@@ -228,7 +214,6 @@ def _core_total_cycles(profile):
 def print_data_summary(data):
   programs = data.get("programs", [])
   print(f"Profiler collected {len(programs)} program(s)")
-  row_debug = os.environ.get("TT_PROFILER_ROW_DEBUG", "0") == "1"
   for prog in programs:
     totals = [p.get("total_cycles", 0) for p in prog.get("profiles", {}).values() if p.get("total_cycles", 0) > 0]
     prof_count = len(prog.get("profiles", {}))
@@ -241,17 +226,6 @@ def print_data_summary(data):
       f"  program {prog.get('index')} ({prog.get('name') or 'unnamed'}): "
       f"{prof_count} core(s), min/avg/max = {mn}/{avg:.1f}/{mx} cycles"
     )
-    if row_debug:
-      by_y = {}
-      for key, p in prog.get("profiles", {}).items():
-        _, y = (int(v) for v in key.split(",", 1))
-        s = by_y.setdefault(y, [0, 0])
-        s[0] += 1
-        if p.get("total_cycles", 0) > 0:
-          s[1] += 1
-      for y in sorted(by_y):
-        total, nz = by_y[y]
-        print(f"    y={y}: {nz}/{total} cores with cycles")
 
 def _risc_to_json(r):
   """Convert a RISC profile dict to JSON-serializable form."""
@@ -457,8 +431,6 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
   needed = set()
   for info in programs_info:
     needed.update(info["cores"])
-  debug_dump = os.environ.get("TT_PROFILER_DEBUG_DUMP", "0") == "1"
-  dumped = False
 
   for core in sorted(needed):
     flat_id = core_flat_ids[core]
@@ -473,32 +445,6 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
       base = page_id * page_size + slot + risc * 65536
       raw = dram_raw[base : base + host_end * 4]
       words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
-      if debug_dump and not dumped:
-        print(f"TT_PROFILER_DEBUG core={core} flat_id={flat_id} risc={risc} host_end={host_end} words={len(words)}")
-        print(f"  ctrl_base=0x{ctrl_base:06x}")
-        print("  ctrl[0:32]=" + " ".join(f"{v:08x}" for v in ctrl[:32]))
-        l1_prof_words = struct.unpack("<64I", bytes(device.win.uc[TensixL1.PROFILER_BUFFERS : TensixL1.PROFILER_BUFFERS + 64 * 4]))
-        print("  l1_prof_risc0[0:64]=" + " ".join(f"{v:08x}" for v in l1_prof_words))
-        sig = struct.pack("<4I", core[0], core[1], flat_id, core_count_per_dram)
-        l1_raw = bytes(device.win.uc[0:TensixL1.SIZE])
-        found = []
-        pos = l1_raw.find(sig)
-        while pos != -1 and len(found) < 4:
-          base = pos - (14 * 4)
-          if base >= 0 and base + 128 <= len(l1_raw):
-            cvec = struct.unpack("<32I", l1_raw[base:base + 128])
-            found.append((base, cvec))
-          pos = l1_raw.find(sig, pos + 1)
-        if found:
-          for base, cvec in found:
-            print(f"  possible_ctrl_base=0x{base:06x}")
-            print("    " + " ".join(f"{v:08x}" for v in cvec[:20]))
-        else:
-          print("  possible_ctrl_base=not found")
-        for i in range(0, min(len(words), 96), 4):
-          row = words[i:i+4]
-          print(f"  [{i:03d}] " + " ".join(f"{w:08x}" for w in row))
-        dumped = True
       for prog_id, r in _parse_risc_words(words, flat_id, risc, program_ids).items():
         by_program.setdefault(prog_id, []).append(r)
 

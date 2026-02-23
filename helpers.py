@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
 PROFILER = os.environ.get("TT_PROFILER") == "1"
-PROFILER_UI = os.environ.get("TT_PROFILER_UI", "1") == "1"
-TIMING = bool(int(os.getenv("TIMING", "0")))
 HiReloc = tuple[int, int]
 LoReloc = tuple[int, int, int]
 

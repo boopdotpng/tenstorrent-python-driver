@@ -2,7 +2,7 @@ import ctypes, fcntl, mmap, struct, time
 from typing import Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_up, noc_xy, PROFILER, PROFILER_UI
+from helpers import _IO, align_up, noc_xy, PROFILER
 from codegen import compile_cq_kernels
 from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS, _CorePayload
 
@@ -520,11 +520,7 @@ class FastDevice(DeviceBase):
 
     self._cq.enqueue_host_event(self._event_id)
     self._cq.flush()
-    try:
-      self._cq.wait_host_event(self._event_id, timeout_s=10.0)
-    except TimeoutError:
-      self._dump_debug(last_cores or self.dispatchable_cores)
-      raise
+    self._cq.wait_host_event(self._event_id, timeout_s=10.0)
     if PROFILER and programs_snapshot:
       import profiler
       freq_mhz = self.profiler_freq_mhz()
@@ -547,30 +543,10 @@ class FastDevice(DeviceBase):
         dispatch_cores=[self.prefetch_core, self.dispatch_core])
       self.last_profile = data
       self._event_id += 1
-      if PROFILER_UI:
-        import profiler_ui
-        profiler_ui.serve(data)
-      else:
-        profiler.print_data_summary(data)
+      import profiler_ui
+      profiler_ui.serve(data)
       return self.last_profile
     else:
       self._exec_list.clear()
     self._event_id += 1
     return self.last_profile
-
-  def _dump_debug(self, cores: CoreList):
-    win = self.win
-    l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-    for x, y in (cores[:3] + cores[-1:]):
-      l1_cfg.start = l1_cfg.end = (x, y)
-      win.configure(l1_cfg)
-      go_val = win.read32(TensixL1.GO_MSG)
-      mode_val = win.uc[TensixL1.LAUNCH + 42]
-      print(f"  core ({x},{y}): GO_MSG=0x{go_val:08x} signal=0x{(go_val>>24)&0xff:02x} mode={mode_val}")
-    dx, dy = self.dispatch_core
-    s48_base = 0xFFB70000
-    tlb_base = s48_base & ~((1 << 21) - 1)
-    dcfg = TLBConfig(addr=tlb_base, start=(dx, dy), end=(dx, dy), noc=0, mcast=False, mode=TLBMode.STRICT)
-    self._cq.dispatch_win.configure(dcfg)
-    avail = self._cq.dispatch_win.read32(s48_base - tlb_base + 297 * 4)
-    print(f"  dispatch ({dx},{dy}): stream48 AVAILABLE=0x{avail:08x}")

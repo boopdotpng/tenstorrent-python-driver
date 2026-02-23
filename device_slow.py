@@ -2,7 +2,7 @@ import time
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from device import DeviceBase, Program, AddrPayload, Rect
-from helpers import PROFILER, PROFILER_UI
+from helpers import PROFILER
 
 class SlowDevice(DeviceBase):
   def __init__(self, device: int = 0, enable_sysmem: bool = False, init_core_plans: bool = True):
@@ -79,11 +79,8 @@ class SlowDevice(DeviceBase):
       data = profiler.collect(self, programs_info, dispatch_mode="slow", freq_mhz=self.profiler_freq_mhz())
       self.last_profile = data
       self._exec_list.clear()
-      if PROFILER_UI:
-        import profiler_ui
-        profiler_ui.serve(data)
-      else:
-        profiler.print_data_summary(data)
+      import profiler_ui
+      profiler_ui.serve(data)
       return self.last_profile
     self._exec_list.clear()
     return self.last_profile

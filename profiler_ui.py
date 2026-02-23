@@ -31,11 +31,11 @@ def serve(data: dict, port: int = 8000):
   global _data_json
   _data_json = json.dumps(data)
   server = HTTPServer(("", port), _Handler)
-  print(f"\n  Profiler UI: http://localhost:{port}\n")
+  print(f"open profiler @ http://localhost:{port}")
   try:
     server.serve_forever()
   except KeyboardInterrupt:
-    print()
+    pass
   finally:
     server.server_close()
 

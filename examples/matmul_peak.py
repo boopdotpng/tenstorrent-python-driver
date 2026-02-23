@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""Peak matmul benchmark with 2D multicast — 4-role dataflow split.
+"""Peak matmul benchmark with 2D multicast and optional fp32 accumulation.
 
 Roles follow TTNN-style partitioning with per-role kernels on disjoint core sets:
 - NCRISC (NOC0): in0 sender, in0 receiver
 - BRISC (NOC1): in1 sender+writer, in1 receiver+writer
 """
 from __future__ import annotations
-import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
+
+import os
+import sys
 import time
+from pathlib import Path
+
 import numpy as np
-from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
-from device import Device, Program, DataflowLaunch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from codegen import CkernelConfig, Compiler, DataFormat, MathFidelity
+from device import DataflowLaunch, Device, Program
 from dram import DType
 
 # Matrix dimensions tuned for 10x11 core grid
 M, K, N = 5120, 4096, 5632
 Mt, Kt, Nt = M // 32, K // 32, N // 32
 TILE_BYTES = 32 * 32 * 2
+TILE_BYTES_F32 = 32 * 32 * 4
+L1_DATA_BYTES_AVAILABLE = 0x180000 - 0x037000
 
 NUM_ROWS, NUM_COLS = 10, 11
 PER_CORE_M = Mt // NUM_ROWS
@@ -45,6 +54,22 @@ NUM_SEMS = 4
 
 WARMUP_ITERS = 2
 TIMED_ITERS = 5
+
+F32_ACC = os.environ.get("F32_ACC") == "1"
+IO_MODE = "f16" if os.environ.get("F16") == "1" else "bf16"
+IO_DATA_FORMAT = DataFormat.Float16 if IO_MODE == "f16" else DataFormat.Float16_b
+IO_DTYPE = DType.float16 if IO_MODE == "f16" else DType.bfloat16
+CB24_TILE_BYTES = TILE_BYTES_F32 if F32_ACC else TILE_BYTES
+
+L1_DATA_BYTES_NEEDED = (
+  (CB0_PAGES * TILE_BYTES)
+  + (CB1_PAGES * TILE_BYTES)
+  + max(CB16_PAGES * TILE_BYTES, CB24_PAGES * CB24_TILE_BYTES)
+)
+if L1_DATA_BYTES_NEEDED > L1_DATA_BYTES_AVAILABLE:
+  raise SystemExit(
+    f"L1 CB config exceeds data-buffer budget: need {L1_DATA_BYTES_NEEDED} bytes, have {L1_DATA_BYTES_AVAILABLE}"
+  )
 
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
 K_READER_SENDER = f"""
@@ -91,7 +116,7 @@ void kernel_main() {{
   *(in0_recv_sem_ptr) = VALID;
 
   const InterleavedAddrGenFast<true> in0_gen = {{
-    .bank_base_address = in0_addr, .page_size = tile_bytes, .data_format = DataFormat::Float16_b,
+    .bank_base_address = in0_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
 
   uint32_t in0_current_block_start = in0_start_tile_id;
@@ -141,7 +166,7 @@ void kernel_main() {{
 """
 
 # -- Reader kernel (NCRISC/NOC0): in0 receiver --
-K_READER_RECV = f"""
+K_READER_RECV = """
 #include <cstdint>
 #include "tools/profiler/kernel_profiler.hpp"
 
@@ -221,10 +246,10 @@ void kernel_main() {{
   *(in1_recv_sem_ptr) = VALID;
 
   const InterleavedAddrGenFast<true> in1_gen = {{
-    .bank_base_address = in1_addr, .page_size = tile_bytes, .data_format = DataFormat::Float16_b,
+    .bank_base_address = in1_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
   const InterleavedAddrGenFast<true> out_gen = {{
-    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::Float16_b,
+    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
 
   // === in1 block loop ===
@@ -323,7 +348,7 @@ void kernel_main() {{
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
   const uint32_t tile_bytes = get_tile_size(cb_in1);
   const InterleavedAddrGenFast<true> out_gen = {{
-    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::Float16_b,
+    .bank_base_address = out_addr, .page_size = tile_bytes, .data_format = DataFormat::{IO_DATA_FORMAT.name},
   }};
 
   volatile tt_l1_ptr uint32_t* in1_recv_sem_ptr =
@@ -368,11 +393,30 @@ void kernel_main() {{
 }}
 """
 
+K_COMPUTE_F32_DEFINE = "#define FP32_DEST_ACC_EN 1\n" if F32_ACC else ""
+K_COMPUTE_PACK_INCLUDE = '#include "compute_kernel_api/pack.h"\n' if F32_ACC else ""
+K_COMPUTE_RELOAD_INIT = (
+  "copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_1, tt::CBIndex::c_24);"
+  if F32_ACC
+  else "copy_tile_to_dst_init_short(tt::CBIndex::c_24);"
+)
+K_COMPUTE_MM_SHORT = (
+  """mm_block_init_short_with_dt(
+            tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_24,
+            transpose, out_subblock_w, out_subblock_h, in0_block_w);"""
+  if F32_ACC
+  else """mm_block_init_short(
+            tt::CBIndex::c_0, tt::CBIndex::c_1,
+            transpose, out_subblock_w, out_subblock_h, in0_block_w);"""
+)
+K_COMPUTE_PACK_CB16 = "PACK((pack_reconfig_data_format(tt::CBIndex::c_16)));" if F32_ACC else ""
+K_COMPUTE_PACK_CB24 = "PACK((pack_reconfig_data_format(tt::CBIndex::c_24)));" if F32_ACC else ""
+
 K_COMPUTE = f"""
 #include <cstdint>
-#define PACKER_L1_ACC 1
+{K_COMPUTE_F32_DEFINE}#define PACKER_L1_ACC 1
 #include "compute_kernel_api/matmul.h"
-#include "compute_kernel_api/tile_move_copy.h"
+{K_COMPUTE_PACK_INCLUDE}#include "compute_kernel_api/tile_move_copy.h"
 #include "tools/profiler/kernel_profiler.hpp"
 
 namespace NAMESPACE {{
@@ -416,7 +460,7 @@ void MAIN {{
         tile_regs_acquire();
 
         if (enable_reload) {{
-          copy_tile_to_dst_init_short(tt::CBIndex::c_24);
+          {K_COMPUTE_RELOAD_INIT}
           cb_wait_front(tt::CBIndex::c_24, out_subblock_num_tiles);
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
@@ -424,9 +468,7 @@ void MAIN {{
           }}
           cb_pop_front(tt::CBIndex::c_24, out_subblock_num_tiles);
 
-          mm_block_init_short(
-            tt::CBIndex::c_0, tt::CBIndex::c_1,
-            transpose, out_subblock_w, out_subblock_h, in0_block_w);
+          {K_COMPUTE_MM_SHORT}
         }}
 
         #pragma GCC unroll 0
@@ -444,6 +486,7 @@ void MAIN {{
         if (last_out) {{
           cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
           tile_regs_wait();
+          {K_COMPUTE_PACK_CB16}
           PACK((llk_pack_reconfig_l1_acc(0)));
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
@@ -459,6 +502,7 @@ void MAIN {{
           cb_reserve_back(tt::CBIndex::c_24, out_subblock_num_tiles);
           tile_regs_wait();
           if (block == 0) {{
+            {K_COMPUTE_PACK_CB24}
             PACK((llk_pack_reconfig_l1_acc(0)));
           }} else if (block == 1) {{
             PACK((llk_pack_reconfig_l1_acc(1)));
@@ -511,19 +555,26 @@ def _mcast_rect_args(x_list: list[int], y: int):
     return (0, 0, 0, 0, 0)
   return (min(x_list), y, max(x_list), y, len(x_list))
 
-def _f16_to_bf16_bytes(x: np.ndarray) -> bytes:
-  # Convert f16 values to f32 first, then truncate mantissa to bf16 encoding.
-  u32 = np.ascontiguousarray(x, dtype=np.float16).astype(np.float32).view(np.uint32)
+
+def _f16_to_device_bytes(x: np.ndarray) -> bytes:
+  x16 = np.ascontiguousarray(x, dtype=np.float16)
+  if IO_MODE == "f16":
+    return x16.tobytes()
+  u32 = x16.astype(np.float32).view(np.uint32)
   return (u32 >> 16).astype(np.uint16).tobytes()
 
-def _bf16_bytes_to_f32(data: bytes, shape: tuple[int, ...]) -> np.ndarray:
+
+def _device_bytes_to_f32(data: bytes, shape: tuple[int, ...]) -> np.ndarray:
+  if IO_MODE == "f16":
+    return np.frombuffer(data, dtype=np.float16).astype(np.float32).reshape(shape)
   u16 = np.frombuffer(data, dtype=np.uint16)
   u32 = (u16.astype(np.uint32) << 16)
   return u32.view(np.float32).reshape(shape)
 
+
 def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes):
   c_ref = a @ b
-  c_got = _bf16_bytes_to_f32(c_bytes, (M, N))
+  c_got = _device_bytes_to_f32(c_bytes, (M, N))
   ref_flat = c_ref.reshape(-1)
   got_flat = c_got.reshape(-1)
   finite_mask = np.isfinite(got_flat)
@@ -539,15 +590,27 @@ def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes):
 
 
 def main():
-  print(f"Matmul Peak (4-role split): C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] (bf16, HiFi2)")
+  print(
+    f"Matmul Peak (4-role split): C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] "
+    f"({IO_MODE} io, {'fp32' if F32_ACC else 'mixed'} accum, HiFi2)"
+  )
   print(f"  Mt={Mt} Kt={Kt} Nt={Nt} grid={NUM_ROWS}x{NUM_COLS}")
   print(f"  per_core_M={PER_CORE_M} per_core_N={PER_CORE_N} in0_block_w={IN0_BLOCK_W} num_blocks={NUM_BLOCKS}")
   print(f"  subblock: {OUT_SUBBLOCK_H}h x {OUT_SUBBLOCK_W}w = {OUT_SUBBLOCK_NUM_TILES} tiles")
+  print(f"  env switches: F16={'1' if IO_MODE == 'f16' else '0'} F32_ACC={'1' if F32_ACC else '0'}")
+
+  cfg_kwargs = {}
+  if F32_ACC:
+    cfg_kwargs = {
+      "cb_data_formats": ((24, DataFormat.Float32),),
+      "dst_accum_mode": True,
+    }
 
   cfg = CkernelConfig(
-    input_format=DataFormat.Float16_b,
-    output_format=DataFormat.Float16_b,
+    input_format=IO_DATA_FORMAT,
+    output_format=IO_DATA_FORMAT,
     math_fidelity=MathFidelity.HiFi2,
+    **cfg_kwargs,
   )
   compiler = Compiler(cfg)
   reader_sender = compiler.compile_dataflow(K_READER_SENDER, processor="ncrisc")
@@ -574,19 +637,19 @@ def main():
     rng_b = np.random.default_rng(123)
     a_src = rng_a.uniform(-0.5, 0.5, size=(M, K)).astype(np.float16)
     b_src = rng_b.uniform(-0.5, 0.5, size=(K, N)).astype(np.float16)
-    a_bytes = _f16_to_bf16_bytes(a_src)
-    b_bytes = _f16_to_bf16_bytes(b_src)
-    a_ref = _bf16_bytes_to_f32(a_bytes, (M, K))
-    b_ref = _bf16_bytes_to_f32(b_bytes, (K, N))
+    a_bytes = _f16_to_device_bytes(a_src)
+    b_bytes = _f16_to_device_bytes(b_src)
+    a_ref = _device_bytes_to_f32(a_bytes, (M, K))
+    b_ref = _device_bytes_to_f32(b_bytes, (K, N))
 
     a_buf = device.dram.alloc_write(
-      a_bytes, name="A", page_size=TILE_BYTES, dtype=DType.bfloat16, shape=(M, K)
+      a_bytes, name="A", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(M, K)
     )
     b_buf = device.dram.alloc_write(
-      b_bytes, name="B", page_size=TILE_BYTES, dtype=DType.bfloat16, shape=(K, N)
+      b_bytes, name="B", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(K, N)
     )
     c_buf = device.dram.alloc(
-      TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES, dtype=DType.bfloat16, shape=(M, N)
+      TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(M, N)
     )
 
     core_to_rc = {grid[r][c]: (r, c) for r in range(NUM_ROWS) for c in range(NUM_COLS)}
@@ -596,16 +659,14 @@ def main():
     interior = [grid[r][c] for r in range(1, NUM_ROWS) for c in range(1, NUM_COLS)]
 
     def reader_args(role_idx: int, core_xy: tuple[int, int], num_cores: int) -> list[int]:
-      row_idx, col_idx = core_to_rc[core_xy]
+      row_idx, _ = core_to_rc[core_xy]
       y = core_xy[1]
 
-      # in0 mcast: sender at col 0, west and east receiver rects
       sender_x = cols[0]
       recv_west = [c for c in west_cols if c != sender_x]
       recv_east = list(east_cols)
       w_sx, w_sy, w_ex, w_ey, w_nd = _mcast_rect_args(recv_west, y)
       e_sx, e_sy, e_ex, e_ey, e_nd = _mcast_rect_args(recv_east, y)
-      # NOC0 mcast: start=min, end=max (no reversal needed)
 
       sender_xy = grid[row_idx][0]
       return [
@@ -620,10 +681,8 @@ def main():
     def writer_args(role_idx: int, core_xy: tuple[int, int], num_cores: int) -> list[int]:
       row_idx, col_idx = core_to_rc[core_xy]
       x = core_xy[0]
-      # in1 mcast: sender at row 0, receivers at rows 1..N-1
       recv_ys = rows[1:]
       if recv_ys:
-        # NOC1 mcast: start=max, end=min (reversed for NOC1 scan direction)
         i1_sx, i1_sy = x, max(recv_ys)
         i1_ex, i1_ey = x, min(recv_ys)
         i1_nd = len(recv_ys)
@@ -680,7 +739,7 @@ def main():
         0:  (CB0_PAGES, TILE_BYTES),
         1:  (CB1_PAGES, TILE_BYTES),
         16: (CB16_PAGES, TILE_BYTES),
-        24: (CB24_PAGES, TILE_BYTES),
+        24: (CB24_PAGES, CB24_TILE_BYTES),
       },
       name="matmul_peak",
       sources={
@@ -710,12 +769,13 @@ def main():
     flops = 2.0 * M * N * K
     tflops_wall = flops / elapsed_wall / 1e12
     print(f"\nAvg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
-    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS (HiFi2 bf16, {NUM_ROWS * NUM_COLS} cores)")
+    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS (HiFi2, {NUM_ROWS * NUM_COLS} cores)")
     c_rm = device.dram.read(c_buf)
     _validate_matmul(a_ref, b_ref, c_rm)
 
   finally:
     device.close()
+
 
 if __name__ == "__main__":
   main()
