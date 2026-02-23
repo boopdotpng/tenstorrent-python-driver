@@ -2,7 +2,7 @@ import time
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from device import DeviceBase, Program, AddrPayload, Rect
-from helpers import PROFILER
+from helpers import PROFILER, PROFILER_UI
 
 class SlowDevice(DeviceBase):
   def __init__(self, device: int = 0, enable_sysmem: bool = False, init_core_plans: bool = True):
@@ -44,7 +44,7 @@ class SlowDevice(DeviceBase):
     mcast_cfg = TLBConfig(addr=0, noc=0, mcast=True, mode=TLBMode.STRICT)
     win = self.win
     self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.GO_MSG, reset_blob)])
-    if PROFILER:
+    if PROFILER and program.profile:
       self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.PROFILER_CONTROL, b"\0" * 128)])
 
     payloads = self._prepare_core_payloads(program, cores, launch_roles, DevMsgs.DISPATCH_MODE_HOST)
@@ -62,23 +62,28 @@ class SlowDevice(DeviceBase):
   def run(self):
     self.last_profile = None
     programs_info = []
-    for i, p in enumerate(self._exec_list):
+    prof_idx = 0
+    for p in self._exec_list:
       self._run_single(p)
-      if PROFILER:
+      if PROFILER and p.profile:
         plan = self._resolve_core_plan(p.cores)
         programs_info.append({
           "cores": plan.cores,
           "sources": getattr(p, "sources", {}),
           "name": getattr(p, "name", None),
-          "index": i,
+          "index": prof_idx,
         })
+        prof_idx += 1
     if PROFILER and programs_info:
-      import profiler, profiler_ui
-      data = profiler.collect(self, programs_info, dispatch_mode="slow")
+      import profiler
+      data = profiler.collect(self, programs_info, dispatch_mode="slow", freq_mhz=self.profiler_freq_mhz())
       self.last_profile = data
       self._exec_list.clear()
-      self.close()
-      profiler_ui.serve(data)
+      if PROFILER_UI:
+        import profiler_ui
+        profiler_ui.serve(data)
+      else:
+        profiler.print_data_summary(data)
       return self.last_profile
     self._exec_list.clear()
     return self.last_profile

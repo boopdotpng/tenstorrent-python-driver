@@ -49,6 +49,7 @@ TIMED_ITERS = 5
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
 K_READER_SENDER = f"""
 #include <cstdint>
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {{
   uint32_t in0_addr              = get_arg_val<uint32_t>(0);
@@ -95,6 +96,7 @@ void kernel_main() {{
 
   uint32_t in0_current_block_start = in0_start_tile_id;
   for (uint32_t block = 0; block < num_blocks; block++) {{
+    DeviceZoneScopedN("reader_in0_block");
     cb_reserve_back(cb_in0, in0_block_num_tiles);
 
     uint32_t l1_addr = get_write_ptr(cb_in0);
@@ -141,6 +143,7 @@ void kernel_main() {{
 # -- Reader kernel (NCRISC/NOC0): in0 receiver --
 K_READER_RECV = f"""
 #include <cstdint>
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {{
   uint32_t in0_block_num_tiles   = get_arg_val<uint32_t>(7);
@@ -155,6 +158,7 @@ void kernel_main() {{
     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(in0_recv_sem_addr);
 
   for (uint32_t block = 0; block < num_blocks; block++) {{
+    DeviceZoneScopedN("reader_in0_recv_wait");
     cb_reserve_back(cb_in0, in0_block_num_tiles);
     noc_semaphore_set(in0_recv_sem_ptr, INVALID);
     uint64_t sender_sem_noc = get_noc_addr(in0_sender_noc_x, in0_sender_noc_y, in0_sender_sem_addr);
@@ -168,6 +172,7 @@ void kernel_main() {{
 # -- Writer kernel (BRISC/NOC1): in1 sender + output writer --
 K_WRITER_SENDER = f"""
 #include <cstdint>
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {{
   uint32_t in1_addr              = get_arg_val<uint32_t>(0);
@@ -225,6 +230,7 @@ void kernel_main() {{
   // === in1 block loop ===
   uint32_t in1_current_block_start = in1_start_tile_id;
   for (uint32_t block = 0; block < num_blocks; block++) {{
+    DeviceZoneScopedN("writer_in1_block");
     cb_reserve_back(cb_in1, in1_block_num_tiles);
 
     uint32_t l1_addr = get_write_ptr(cb_in1);
@@ -263,9 +269,13 @@ void kernel_main() {{
   for (uint32_t sbh = 0; sbh < out_num_sb_h; sbh++) {{
     uint32_t sbw_start = sbh_start;
     for (uint32_t sbw = 0; sbw < out_num_sb_w; sbw++) {{
-      cb_wait_front(cb_out, out_sb_tile_count);
+      {{
+        DeviceZoneScopedN("writer_output_wait_front");
+        cb_wait_front(cb_out, out_sb_tile_count);
+      }}
       uint32_t l1_addr = get_read_ptr(cb_out);
       uint32_t row_start = sbw_start;
+      DeviceZoneScopedN("writer_output_store");
       for (uint32_t h = 0; h < out_subblock_h; h++) {{
         uint32_t tile_id = row_start;
         for (uint32_t w = 0; w < out_subblock_w; w++) {{
@@ -287,6 +297,7 @@ void kernel_main() {{
 # -- Writer kernel (BRISC/NOC1): in1 receiver + output writer --
 K_WRITER_RECV = f"""
 #include <cstdint>
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {{
   uint32_t in1_block_num_tiles   = get_arg_val<uint32_t>(7);
@@ -319,6 +330,7 @@ void kernel_main() {{
     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(in1_recv_sem_addr);
 
   for (uint32_t block = 0; block < num_blocks; block++) {{
+    DeviceZoneScopedN("writer_in1_recv_wait");
     cb_reserve_back(cb_in1, in1_block_num_tiles);
     noc_semaphore_set(in1_recv_sem_ptr, INVALID);
     uint64_t sender_sem_noc = get_noc_addr(in1_sender_noc_x, in1_sender_noc_y, in1_sender_sem_addr);
@@ -331,9 +343,13 @@ void kernel_main() {{
   for (uint32_t sbh = 0; sbh < out_num_sb_h; sbh++) {{
     uint32_t sbw_start = sbh_start;
     for (uint32_t sbw = 0; sbw < out_num_sb_w; sbw++) {{
-      cb_wait_front(cb_out, out_sb_tile_count);
+      {{
+        DeviceZoneScopedN("writer_recv_output_wait_front");
+        cb_wait_front(cb_out, out_sb_tile_count);
+      }}
       uint32_t l1_addr = get_read_ptr(cb_out);
       uint32_t row_start = sbw_start;
+      DeviceZoneScopedN("writer_recv_output_store");
       for (uint32_t h = 0; h < out_subblock_h; h++) {{
         uint32_t tile_id = row_start;
         for (uint32_t w = 0; w < out_subblock_w; w++) {{
@@ -357,6 +373,7 @@ K_COMPUTE = f"""
 #define PACKER_L1_ACC 1
 #include "compute_kernel_api/matmul.h"
 #include "compute_kernel_api/tile_move_copy.h"
+#include "tools/profiler/kernel_profiler.hpp"
 
 namespace NAMESPACE {{
 void MAIN {{
@@ -414,6 +431,7 @@ void MAIN {{
 
         #pragma GCC unroll 0
         for (uint32_t inner = 0; inner < in0_block_w; inner++) {{
+          DeviceZoneScopedN("compute_matmul_inner");
           const uint32_t in0_tile_index = (uint32_t)(in0_index_subblock_offset + (int)inner);
           const uint32_t in1_tile_index = (uint32_t)(in1_index_subblock_offset + (int)(inner * in1_per_core_w));
 
@@ -664,14 +682,24 @@ def main():
         16: (CB16_PAGES, TILE_BYTES),
         24: (CB24_PAGES, TILE_BYTES),
       },
+      name="matmul_peak",
+      sources={
+        "reader_sender": K_READER_SENDER,
+        "reader_recv": K_READER_RECV,
+        "writer_sender": K_WRITER_SENDER,
+        "writer_recv": K_WRITER_RECV,
+        "compute": K_COMPUTE,
+      },
     )
 
     print(f"\nWarmup ({WARMUP_ITERS} iters)...")
+    program.profile = False
     for _ in range(WARMUP_ITERS):
       device.queue(program)
     device.run()
 
     print(f"Timing ({TIMED_ITERS} iters)...")
+    program.profile = True
     for _ in range(TIMED_ITERS):
       device.queue(program)
     t0 = time.perf_counter()

@@ -51,6 +51,7 @@ class Program:
   cb_config: dict[int, tuple[int, int]] | None = None  # {cb_id: (num_pages, page_size)}
   sources: dict[str, str] = field(default_factory=dict)  # {"reader": src, "compute": src, ...}
   name: str | None = None
+  profile: bool = True
 
 @dataclass(frozen=True)
 class _LaunchRole:
@@ -456,6 +457,12 @@ class DeviceBase(CommonDevice):
 
   def queue(self, program: Program):
     self._exec_list.append(program)
+
+  def profiler_freq_mhz(self) -> int:
+    try:
+      return int(self._read_arc_telem_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK))
+    except Exception:
+      return 1000
 
   def resolve_cores(self, cores: CoreSpec = "all") -> CoreList:
     return list(self._resolve_core_plan(cores).cores)

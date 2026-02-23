@@ -27,7 +27,7 @@ class _Handler(BaseHTTPRequestHandler):
 
   def log_message(self, *_): pass
 
-def serve(data: dict, port: int = 8884):
+def serve(data: dict, port: int = 8000):
   global _data_json
   _data_json = json.dumps(data)
   server = HTTPServer(("", port), _Handler)
@@ -54,6 +54,10 @@ body{background:#111;color:#ccc;font:13px/1.4 'SF Mono',Menlo,monospace;display:
 #sidebar h3{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
 #prog-list{display:flex;flex-direction:column;gap:4px;overflow-y:auto;max-height:40vh;flex-shrink:1}
 .note{margin-top:8px;color:#9a9a9a;font-size:10px;line-height:1.35}
+.toggle{display:flex;align-items:center;gap:6px;color:#b8b8b8;font-size:11px;margin-top:6px}
+.toggle input{accent-color:#70ad47}
+.legend{margin-top:8px;color:#aaa;font-size:10px;line-height:1.35}
+.chip{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 .dispatch-badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;margin-top:4px}
 .dispatch-badge.fast{background:#2a2a4a;color:#88f}
 .dispatch-badge.slow{background:#4a3a1a;color:#fa4}
@@ -67,7 +71,7 @@ body{background:#111;color:#ccc;font:13px/1.4 'SF Mono',Menlo,monospace;display:
 .cell rect{transition:stroke .1s,stroke-width .1s}
 .cell.active rect:hover{stroke:#fff;stroke-width:2}
 .cell.active rect.selected{stroke:#4af;stroke-width:2}
-.cell text{pointer-events:none;font-family:'SF Mono',Menlo,monospace;font-size:11px;font-weight:600;fill:rgba(0,0,0,.7)}
+.cell text{pointer-events:none;font-family:'SF Mono',Menlo,monospace;font-size:10px;font-weight:600;fill:rgba(0,0,0,.75)}
 #dock{background:#1a1a1a;border-top:1px solid #333;height:0;overflow:hidden;transition:height .15s ease;flex-shrink:0}
 #dock.open{height:220px;overflow-y:auto}
 #dock-inner{padding:10px 16px;display:flex;gap:16px;align-items:start}
@@ -96,13 +100,12 @@ pre.src code{font-size:11px;line-height:1.35;padding:8px!important;display:block
 .zone-tag{font-size:9px;padding:1px 5px;border-radius:2px;margin-left:8px;font-family:'SF Mono',Menlo,monospace;vertical-align:middle}
 </style></head>
 <body>
-<div id="sidebar"><h3>Programs</h3><div id="dispatch-line"></div><div id="prog-list"></div><div id="limit-note" class="note"></div></div>
+<div id="sidebar"><h3>Programs</h3><div id="dispatch-line"></div><div id="prog-list"></div><div id="dram-note" class="note"></div><div id="dram-legend" class="legend"></div><div id="limit-note" class="note"></div></div>
 <div id="center">
   <div id="top-bar">
-    <span class="stat">Cores: <b id="st-cores">-</b></span>
     <span class="stat">Max: <b id="st-max">-</b></span>
     <span class="stat">Min: <b id="st-min">-</b></span>
-    <span class="stat">Avg: <b id="st-avg">-</b></span>
+    <span class="stat">Mean ± Std.dev: <b id="st-std">-</b></span>
   </div>
   <div id="grid-wrap"><svg id="grid-svg"></svg></div>
   <div id="dock"><div id="dock-inner">
@@ -129,10 +132,27 @@ function init(){
 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
 function fmtUs(cycles){ return cycles!=null ? (cycles/D.freq_mhz).toFixed(2)+'us' : '-' }
 function fmtCyc(v){ return v!=null ? v.toLocaleString() : '-' }
+function fmtCellTime(cycles){
+  if (cycles==null) return '';
+  const us = cycles / D.freq_mhz;
+  if (us >= 1000) return (us / 1000).toFixed(2) + 'ms';
+  if (us >= 100) return us.toFixed(0) + 'us';
+  if (us >= 10) return us.toFixed(1) + 'us';
+  return us.toFixed(2) + 'us';
+}
 
 // --- sidebar ---
 function buildSidebar(){
   d3.select('#dispatch-line').html(`<span class="dispatch-badge ${D.dispatch_mode}">${D.dispatch_mode} dispatch</span>`);
+  if (D.harvested_dram_bank != null) {
+    d3.select('#dram-note').text(`DRAM bank ${D.harvested_dram_bank} is fused off on this device.`);
+  } else {
+    d3.select('#dram-note').text('');
+  }
+  d3.select('#dram-legend').html(
+    `<div><span class="chip" style="background:#2d6e9f"></span>DRAM tile</div>` +
+    `<div><span class="chip" style="background:#3a3a3a"></span>Fused-off DRAM tile</div>`
+  );
   const btns = d3.select('#prog-list').selectAll('button').data(D.programs);
   btns.enter().append('button').attr('class','prog-btn')
     .on('click', (_,d)=> selectProgram(D.programs.indexOf(d)))
@@ -159,22 +179,26 @@ function buildGrid(){
   const prog = D.programs[selProg];
   const coreSet = new Set(prog.cores.map(c=>`${c[0]},${c[1]}`));
   const dispSet = new Set(D.dispatch_cores.map(c=>`${c[0]},${c[1]}`));
+  const dramMap = new Map((D.dram_tiles || []).map(t => [`${t.x},${t.y}`, t]));
   const allX = [...new Set(D.grid_x)].sort((a,b)=>a-b);
   const gy = D.grid_y;
+  const PAD_L = 28, PAD_T = 18;
 
   const vals = Object.values(prog.profiles).map(p=>p.total_cycles).filter(v=>v>0);
   const [mn,mx] = vals.length ? d3.extent(vals) : [0,1];
   const color = d3.scaleSequential(d3.interpolateRdYlGn).domain([mx, mn]);
 
   const w = allX.length*(CELL+GAP)-GAP, h = gy.length*(CELL+GAP)-GAP;
-  svg.attr('width',w).attr('height',h);
+  svg.attr('width',w + PAD_L).attr('height',h + PAD_T);
+  const plot = svg.selectAll('g.plot').data([0]);
+  plot.enter().append('g').attr('class','plot').merge(plot).attr('transform', `translate(${PAD_L},${PAD_T})`);
 
   const cells = [];
   for (const [yi,y] of gy.entries())
     for (const [xi,x] of allX.entries())
       cells.push({x, y, xi, yi, key:`${x},${y}`});
 
-  const groups = svg.selectAll('g.cell').data(cells, d=>d.key);
+  const groups = svg.select('g.plot').selectAll('g.cell').data(cells, d=>d.key);
   const enter = groups.enter().append('g').attr('class','cell');
   enter.append('rect').attr('width',CELL).attr('height',CELL).attr('rx',3);
   enter.append('title');
@@ -186,6 +210,9 @@ function buildGrid(){
   merged.each(function(d) {
     const g = d3.select(this);
     const isCore = coreSet.has(d.key), isDisp = dispSet.has(d.key);
+    const dram = dramMap.get(d.key);
+    const isDram = !!dram;
+    const isDramValid = isDram && !!dram.valid;
     const p = isCore ? prog.profiles[d.key] : null;
     const hasCycles = p && p.total_cycles > 0;
 
@@ -194,25 +221,49 @@ function buildGrid(){
     rect.classed('selected', false);
     if (isDisp) {
       rect.attr('fill','#282828').attr('stroke','#333').attr('stroke-width',1).attr('stroke-dasharray','4,3');
+    } else if (isDram && !isDramValid) {
+      rect.attr('fill','#3a3a3a').attr('stroke','#666').attr('stroke-width',1).attr('stroke-dasharray','2,2');
+    } else if (isDram) {
+      rect.attr('fill','#2d6e9f').attr('stroke','#234f72').attr('stroke-width',1).attr('stroke-dasharray',null);
     } else if (!isCore) {
       rect.attr('fill','#1a1a1a').attr('stroke','none').attr('stroke-dasharray',null);
     } else if (hasCycles) {
-      rect.attr('fill', color(p.total_cycles)).attr('stroke','none').attr('stroke-dasharray',null);
+      rect.attr('fill', color(p.total_cycles)).attr('stroke','#1d1d1d').attr('stroke-width',1).attr('stroke-dasharray',null);
     } else {
-      rect.attr('fill','#2a2a2a').attr('stroke','none').attr('stroke-dasharray',null);
+      rect.attr('fill','#2a2a2a').attr('stroke','#666').attr('stroke-width',1).attr('stroke-dasharray',null);
     }
 
-    const usVal = hasCycles ? (p.total_cycles/D.freq_mhz).toFixed(1) : '';
-    g.select('text').text(usVal.length<=4 ? usVal : '');
+    const tLabel = hasCycles ? fmtCellTime(p.total_cycles) : '';
+    const cellLabel = isDram ? `d${dram.bank}` : (tLabel.length<=7 ? tLabel : '');
+    g.select('text').text(cellLabel);
     g.select('title').text(
       isDisp ? `(${d.x},${d.y}) reserved by fast dispatch` :
+      isDram && !isDramValid ? `(${d.x},${d.y}) DRAM bank ${dram.bank} (fused off)` :
+      isDram ? `(${d.x},${d.y}) DRAM bank ${dram.bank}` :
       !isCore ? `(${d.x},${d.y}) inactive` :
-      hasCycles ? `(${d.x},${d.y}) ${usVal}us` :
+      hasCycles ? `(${d.x},${d.y}) ${fmtCellTime(p.total_cycles)}` :
       `(${d.x},${d.y}) no data`
     );
     g.on('click', isCore && !isDisp ? ()=>selectCore(d.key) : ()=>clearSelection());
   });
   groups.exit().remove();
+
+  const xlab = svg.selectAll('text.xlab').data(allX, d=>d);
+  xlab.enter().append('text').attr('class','xlab').attr('text-anchor','middle').attr('fill','#777').style('font-size','10px')
+    .merge(xlab)
+    .attr('x', (_, i)=> PAD_L + i*(CELL+GAP) + CELL/2)
+    .attr('y', 12)
+    .text(d=>d);
+  xlab.exit().remove();
+
+  const ylab = svg.selectAll('text.ylab').data(gy, d=>d);
+  ylab.enter().append('text').attr('class','ylab').attr('text-anchor','end').attr('fill','#777').style('font-size','10px')
+    .merge(ylab)
+    .attr('x', PAD_L - 6)
+    .attr('y', (_, i)=> PAD_T + i*(CELL+GAP) + CELL/2 + 3)
+    .text(d=>d);
+  ylab.exit().remove();
+
   svg.on('click', e=>{ if(e.target===svg.node()) clearSelection() });
 }
 
@@ -221,12 +272,14 @@ function selectCore(key){
   d3.selectAll('.cell rect').classed('selected', false);
   d3.selectAll('.cell').filter(d=>d.key===key).select('rect').classed('selected', true);
   showDock(key);
+  showSources();
 }
 
 function clearSelection(){
   selCore = null;
   d3.selectAll('.cell rect').classed('selected', false);
   d3.select('#dock').classed('open', false);
+  showSources();
 }
 
 // --- bottom dock (per-core RISC + zone tables) ---
@@ -250,7 +303,7 @@ function sourceOrder(prog){
 
 function getZoneData(key){
   const prog = D.programs[selProg], p = prog.profiles[key];
-  if(!p) return [];
+  if(!p) return {zones:[]};
   const zones = [];
   for (const r of p.riscs) {
     const starts={}, ends={}, totals={};
@@ -264,17 +317,18 @@ function getZoneData(key){
     for (const hash of allHashes) {
       let dur = 0;
       const s = starts[hash]||[], e = ends[hash]||[];
+      const n = Math.min(s.length, e.length);
       if (s.length && e.length) {
-        // Zip all start/end pairs and sum (fix: was only using first pair)
-        const n = Math.min(s.length, e.length);
+        // Zip all start/end pairs and sum.
         for (let i = 0; i < n; i++) if (e[i] > s[i]) dur += e[i] - s[i];
       }
-      // type=2 TOTAL markers: firmware pre-accumulated cycle count
-      if (totals[hash]) dur += totals[hash];
+      // type=2 TOTAL markers are pre-accumulated counts; only use when no start/end pairs exist.
+      if (!n && totals[hash]) dur += totals[hash];
       if (!dur) continue;
-      const zn = D.zone_names[hash];
+      const hashKey = String(hash);
+      const zn = D.zone_names[hashKey];
       const name = zn ? zn.name : `0x${(+hash).toString(16)}`;
-      const existing = zones.find(z=>z.name===name);
+      const existing = zones.find(z=>z.name===name && z.risc===r.name);
       if (existing) existing.dur += dur;
       else zones.push({name, hash, dur, risc: r.name});
     }
@@ -283,17 +337,18 @@ function getZoneData(key){
   const order = sourceOrder(prog);
   zones.sort((a,b) => (order[a.name]??999) - (order[b.name]??999));
   zones.forEach((z,i) => z.color = ZONE_COLORS[i % ZONE_COLORS.length]);
-  return zones;
+  return {zones};
 }
 
 function getZoneAvgs(){
   // Compute avg duration per zone name across all cores in the current program
   const prog = D.programs[selProg], sums={}, counts={};
   for (const [key, p] of Object.entries(prog.profiles)) {
-    const zones = getZoneData(key);
+    const zones = getZoneData(key).zones;
     for (const z of zones) {
-      sums[z.name] = (sums[z.name]||0) + z.dur;
-      counts[z.name] = (counts[z.name]||0) + 1;
+      const k = `${z.name}|${z.risc}`;
+      sums[k] = (sums[k]||0) + z.dur;
+      counts[k] = (counts[k]||0) + 1;
     }
   }
   const avgs = {};
@@ -304,10 +359,21 @@ function getZoneAvgs(){
 function showDock(key){
   const prog = D.programs[selProg], p = prog.profiles[key];
   if(!p){ d3.select('#dock').classed('open',false); return }
+  const riscOrder = { BRISC: 0, TRISC0: 1, TRISC1: 2, TRISC2: 3, NCRISC: 4 };
+  const riscs = [...p.riscs].sort((a, b) => (riscOrder[a.name] ?? 99) - (riscOrder[b.name] ?? 99));
+  const riscKernelCycles = riscs
+    .map(r => (r.kern_start!=null && r.kern_end!=null && r.kern_end>r.kern_start) ? (r.kern_end-r.kern_start) : 0)
+    .filter(v => v > 0);
+  const serialKernelCycles = riscKernelCycles.reduce((a,b)=>a+b, 0);
+  const wallKernelCycles = p.total_cycles || 0;
+  const overlapCycles = Math.max(0, serialKernelCycles - wallKernelCycles);
+  const overlapPct = serialKernelCycles > 0 ? (100 * overlapCycles / serialKernelCycles) : 0;
 
   // RISC table
-  let h = `<table class="prof"><tr><th>RISC</th><th>FW</th><th>Kernel</th></tr>`;
-  for (const r of p.riscs) {
+  let h = `<div style="color:#aaa;font-size:11px;margin-bottom:4px">Core wall time: <b style="color:#fff">${fmtUs(wallKernelCycles)}</b> (${fmtCyc(wallKernelCycles)} cycles)</div>`;
+  h += `<div style="color:#888;font-size:10px;margin-bottom:6px">Estimated overlap: ${fmtUs(overlapCycles)} (${overlapPct.toFixed(1)}%)</div>`;
+  h += `<table class="prof"><tr><th>RISC</th><th>FW</th><th>Kernel</th></tr>`;
+  for (const r of riscs) {
     const fw = (r.fw_start!=null && r.fw_end!=null) ? r.fw_end-r.fw_start : null;
     const kern = (r.kern_start!=null && r.kern_end!=null) ? r.kern_end-r.kern_start : null;
     h += `<tr><td>${r.name}</td><td>${fmtUs(fw)}</td><td>${fmtUs(kern)}</td></tr>`;
@@ -315,14 +381,16 @@ function showDock(key){
   h += '</table>';
 
   // Zone table with cross-core avg
-  const zones = getZoneData(key);
+  const zoneData = getZoneData(key);
+  const zones = zoneData.zones;
   if (zones.length) {
     const avgs = getZoneAvgs();
-    h += `<table class="prof"><tr><th>Zone</th><th>Time</th><th>Cycles</th></tr>`;
+    h += `<table class="prof"><tr><th>Zone</th><th>RISC</th><th>Time</th><th>Cycles</th></tr>`;
     for (const z of zones) {
-      const avg = avgs[z.name];
+      const zoneKey = `${z.name}|${z.risc}`;
+      const avg = avgs[zoneKey];
       const avgHint = avg ? `<span class="zone-avg">avg ${fmtUs(avg)}</span>` : '';
-      h += `<tr><td><span class="zone-dot" style="background:${z.color}"></span>${esc(z.name)}</td><td>${fmtUs(z.dur)}${avgHint}</td><td>${fmtCyc(z.dur)}</td></tr>`;
+      h += `<tr><td><span class="zone-dot" style="background:${z.color}"></span>${esc(z.name)}</td><td>${z.risc}</td><td>${fmtUs(z.dur)}${avgHint}</td><td>${fmtCyc(z.dur)}</td></tr>`;
     }
     h += '</table>';
   }
@@ -382,6 +450,18 @@ function showSources(){
   const ordered = ['reader','compute','writer'];
   const all = [...ordered.filter(k=>prog.sources[k]), ...Object.keys(prog.sources).filter(k=>!ordered.includes(k))];
   const colors = getZoneColors();
+  const zoneByName = {};
+  if (selCore && prog.profiles && prog.profiles[selCore]) {
+    const rows = getZoneData(selCore).zones;
+    for (const z of rows) {
+      const cur = zoneByName[z.name];
+      if (!cur) zoneByName[z.name] = {dur: z.dur, riscs: [z.risc]};
+      else {
+        cur.dur += z.dur;
+        if (!cur.riscs.includes(z.risc)) cur.riscs.push(z.risc);
+      }
+    }
+  }
 
   let h = '';
   for (const label of all)
@@ -412,7 +492,9 @@ function showSources(){
       // Replace DeviceZoneScopedN declaration lines with a clean tag
       if (declMap[i]) {
         const zc = colors[declMap[i]] || '#888';
-        const tag = `<span class="zone-tag" style="background:${zc}30;color:${zc}">&#9654; ${declMap[i]}</span>`;
+        const stat = zoneByName[declMap[i]];
+        const suffix = stat ? `  ${fmtCyc(stat.dur)} cyc` : '';
+        const tag = `<span class="zone-tag" style="background:${zc}30;color:${zc}">&#9654; ${declMap[i]}${suffix}</span>`;
         return `<span class="src-line" style="${style}">${tag}</span>`;
       }
       return `<span class="src-line" style="${style}">${line}</span>`;
@@ -425,10 +507,19 @@ function updateStats(){
   const prog = D.programs[selProg];
   const vals = Object.values(prog.profiles).map(p=>p.total_cycles).filter(v=>v>0);
   const fmt = v=>(v/D.freq_mhz).toFixed(2)+'us';
-  d3.select('#st-cores').text(prog.cores.length);
   d3.select('#st-max').text(vals.length ? fmt(d3.max(vals)) : '-');
   d3.select('#st-min').text(vals.length ? fmt(d3.min(vals)) : '-');
-  d3.select('#st-avg').text(vals.length ? fmt(d3.mean(vals)) : '-');
+  if (!vals.length) {
+    d3.select('#st-std').text('-');
+    return;
+  }
+  const mean = d3.mean(vals);
+  const varPop = d3.mean(vals.map(v => {
+    const d = v - mean;
+    return d * d;
+  }));
+  const std = Math.sqrt(varPop);
+  d3.select('#st-std').text(`${fmt(mean)} ± ${fmt(std)}`);
 }
 </script>
 </body></html>"""

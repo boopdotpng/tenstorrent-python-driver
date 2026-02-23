@@ -204,9 +204,9 @@ class DramAllocator:
   def alloc(self, size: int, name: str | None = None, page_size: int | None = None, dtype: DType | None = None,
             shape: Shape | None = None) -> DramBuffer:
     num_banks = len(self.bank_tiles)
-    page_size = min(
-      self.max_page_size, page_size or align_up((size + num_banks - 1) // num_banks, DRAM_ALIGNMENT)
-    )
+    # Honor explicit page_size requests (used by profiler DRAM layout); only cap auto-derived page sizes.
+    if page_size is None:
+      page_size = min(self.max_page_size, align_up((size + num_banks - 1) // num_banks, DRAM_ALIGNMENT))
     page_size = align_up(page_size, DRAM_ALIGNMENT)
     addr = self.next
     pages = (size + page_size - 1) // page_size
@@ -275,6 +275,7 @@ class DramAllocator:
       dataflow=[DataflowLaunch(cores=cores, reader=kernel, reader_rt_args=reader_args, writer_rt_args=[])],
       compute=None, compute_rt_args=[], cbs=[0],
       tile_size=buf.page_size, num_pages=2, cores=len(cores),
+      profile=False,
     ))
     self._device.run()
 

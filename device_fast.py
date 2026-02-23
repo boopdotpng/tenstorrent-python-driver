@@ -2,7 +2,7 @@ import ctypes, fcntl, mmap, struct, time
 from typing import Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_up, noc_xy, PROFILER
+from helpers import _IO, align_up, noc_xy, PROFILER, PROFILER_UI
 from codegen import compile_cq_kernels
 from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS, _CorePayload
 
@@ -476,25 +476,28 @@ class FastDevice(DeviceBase):
       ctrl[16] = self._profiler_flat_ids[core]
       ctrl[17] = self._profiler_core_count_per_dram
       blobs.append(struct.pack("<32I", *ctrl))
-    self._cq.enqueue_write_packed(cores=cores, addr=TensixL1.PROFILER_CONTROL, data=blobs)
+    for addr in (TensixL1.PROFILER_CONTROL, TensixL1.PROFILER_CONTROL_ALT):
+      self._cq.enqueue_write_packed(cores=cores, addr=addr, data=blobs)
 
   def _enqueue_profiler_reset_for_program(self, plan):
-    self._cq.enqueue_write_packed_large(
-      plan.mcast_dests, TensixL1.PROFILER_CONTROL + 5 * 4, b"\0" * (5 * 4)
-    )
-    self._cq.enqueue_write_packed_large(
-      plan.mcast_dests, TensixL1.PROFILER_CONTROL + 19 * 4, b"\0" * 4
-    )
+    for base in (TensixL1.PROFILER_CONTROL, TensixL1.PROFILER_CONTROL_ALT):
+      self._cq.enqueue_write_packed_large(
+        plan.mcast_dests, base + 5 * 4, b"\0" * (5 * 4)
+      )
+      self._cq.enqueue_write_packed_large(
+        plan.mcast_dests, base + 19 * 4, b"\0" * 4
+      )
 
   def run(self):
     if not self._exec_list: return
 
     self.last_profile = None
-    programs_snapshot = list(self._exec_list) if PROFILER else None
+    programs_snapshot = [p for p in self._exec_list if getattr(p, "profile", True)] if PROFILER else []
     if PROFILER:
       self._enqueue_profiler_init()
     prev_id = None
     last_cores = None
+    prof_idx = 0
     for i, program in enumerate(self._exec_list):
       plan = self._resolve_core_plan(program.cores)
       payloads = self._build_payloads(program, plan)
@@ -503,12 +506,14 @@ class FastDevice(DeviceBase):
         patched = []
         for p in payloads:
           lm = LaunchMsg.from_buffer_copy(p.launch_blob)
-          lm.kernel_config.host_assigned_id = i + 1
+          lm.kernel_config.host_assigned_id = (prof_idx + 1) if getattr(program, "profile", True) else 0
           patched.append(_CorePayload(
             core=p.core, rta=p.rta, launch_blob=as_bytes(lm),
             shared_addr=p.shared_addr, shared_blob=p.shared_blob,
           ))
         payloads = patched
+        if getattr(program, "profile", True):
+          prof_idx += 1
       self._enqueue_program(plan, payloads, skip_upload=(id(program) == prev_id and not PROFILER))
       prev_id = id(program)
       last_cores = plan.cores
@@ -521,7 +526,8 @@ class FastDevice(DeviceBase):
       self._dump_debug(last_cores or self.dispatchable_cores)
       raise
     if PROFILER and programs_snapshot:
-      import profiler, profiler_ui
+      import profiler
+      freq_mhz = self.profiler_freq_mhz()
       programs_info = []
       for i, prog in enumerate(programs_snapshot):
         plan = self._resolve_core_plan(prog.cores)
@@ -537,11 +543,15 @@ class FastDevice(DeviceBase):
         core_flat_ids=self._profiler_flat_ids,
         dram_buf=self._profiler_dram_buf,
         core_count_per_dram=self._profiler_core_count_per_dram,
+        freq_mhz=freq_mhz,
         dispatch_cores=[self.prefetch_core, self.dispatch_core])
       self.last_profile = data
       self._event_id += 1
-      self.close()
-      profiler_ui.serve(data)
+      if PROFILER_UI:
+        import profiler_ui
+        profiler_ui.serve(data)
+      else:
+        profiler.print_data_summary(data)
       return self.last_profile
     else:
       self._exec_list.clear()

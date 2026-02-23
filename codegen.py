@@ -3,7 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-import hashlib, shutil, subprocess, tempfile
+import hashlib, re, shutil, subprocess, tempfile
 
 _DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
 _REPO = Path(__file__).resolve().parent
@@ -129,17 +129,28 @@ def _run(exe: Path, args: list[str], cwd: Path):
   if r.returncode != 0:
     raise RuntimeError(f"{exe.name} failed:\n{r.stderr.decode()}")
   if PROFILER:
+    pragma_re = re.compile(r"#pragma message:\s*['\"]?(.+?)['\"]?\s*$")
     for line in r.stderr.decode(errors="replace").splitlines():
-      if "KERNEL_PROFILER" in line and "#pragma message:" in line:
-        # Format: "...#pragma message: name,file,line,KERNEL_PROFILER"
-        try:
-          msg = line.split("#pragma message:", 1)[1].strip().strip('"')
-          parts = msg.split(",")
-          if len(parts) >= 4 and parts[-1].strip() == "KERNEL_PROFILER":
-            name, fpath, lineno = parts[0].strip(), parts[1].strip(), int(parts[2].strip())
-            _zone_map[_hash16(name)] = (name, fpath, lineno)
-        except (ValueError, IndexError):
-          pass
+      if "KERNEL_PROFILER" not in line or "#pragma message:" not in line:
+        continue
+      m = pragma_re.search(line)
+      if not m:
+        continue
+      # Format: "name,file,line,KERNEL_PROFILER". Name may contain commas, so parse from the right.
+      msg = m.group(1).strip()
+      if not msg.endswith("KERNEL_PROFILER"):
+        continue
+      parts = msg.rsplit(",", 3)
+      if len(parts) != 4:
+        continue
+      name, fpath, lineno_s, tag = (p.strip() for p in parts)
+      if tag != "KERNEL_PROFILER":
+        continue
+      try:
+        lineno = int(lineno_s)
+      except ValueError:
+        continue
+      _zone_map[_hash16(msg)] = (name, fpath, lineno)
 
 def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
                              prepare: PrepareFn = None):

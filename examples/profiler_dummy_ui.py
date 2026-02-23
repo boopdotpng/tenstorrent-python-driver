@@ -66,16 +66,19 @@ def make_core(x, y, base_cycles, jitter=200):
   fw_dur = 1600 + j()
   kern_dur = base_cycles + j()
   kern_start = fw_dur + 80
+  riscs = [
+    make_risc("BRISC",  80,  fw_dur,      kern_start, kern_dur, make_read_zones(kern_start, kern_dur, 50)),
+    make_risc("NCRISC", 100, fw_dur - 200, kern_start, kern_dur + j()//2, make_write_zones(kern_start, kern_dur, 50)),
+    make_risc("TRISC0", 100, 800 + j()//4, kern_start, kern_dur - 200 + j()//2, make_compute_zones(kern_start, kern_dur, 50)),
+    make_risc("TRISC1", 95,  820 + j()//4, kern_start, kern_dur - 150 + j()//2, make_zones(kern_start, kern_dur, 50)),
+    make_risc("TRISC2", 95,  810 + j()//4, kern_start, kern_dur - 180 + j()//2),
+  ]
+  # Keep UI heatmap/stat metric consistent with live profiler: max kernel time across RISCs.
+  total_cycles = max(r["kern_end"] - r["kern_start"] for r in riscs)
   return {
     "core": [x, y], "dropped": 0, "done": 1,
-    "total_cycles": kern_dur,
-    "riscs": [
-      make_risc("BRISC",  80,  fw_dur,      kern_start, kern_dur, make_read_zones(kern_start, kern_dur, 50)),
-      make_risc("NCRISC", 100, fw_dur - 200, kern_start, kern_dur + j()//2, make_write_zones(kern_start, kern_dur, 50)),
-      make_risc("TRISC0", 100, 800 + j()//4, kern_start, kern_dur - 200 + j()//2, make_compute_zones(kern_start, kern_dur, 50)),
-      make_risc("TRISC1", 95,  820 + j()//4, kern_start, kern_dur - 150 + j()//2, make_zones(kern_start, kern_dur, 50)),
-      make_risc("TRISC2", 95,  810 + j()//4, kern_start, kern_dur - 180 + j()//2),
-    ],
+    "total_cycles": total_cycles,
+    "riscs": riscs,
   }
 
 def main():
@@ -227,7 +230,7 @@ def main():
       },
     ],
   }
-  profiler_ui.serve(data, port=8884)
+  profiler_ui.serve(data, port=8000)
 
 
 if __name__ == "__main__":

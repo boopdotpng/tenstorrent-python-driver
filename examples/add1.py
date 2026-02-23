@@ -31,6 +31,7 @@ void kernel_main() {
 
 K_WRITER = r"""
 #include <cstdint>
+#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
   uint32_t out_addr = get_arg_val<uint32_t>(0);
@@ -44,9 +45,15 @@ void kernel_main() {
     .data_format = DataFormat::Float16_b,
   };
   for (uint32_t i = 0; i < n_tiles; ++i) {
-    cb_wait_front(cb_out0, 1);
-    noc_async_write_tile(tile_offset + i, out0, get_read_ptr(cb_out0));
-    noc_async_write_barrier();
+    {
+      DeviceZoneScopedN("writer_wait_front");
+      cb_wait_front(cb_out0, 1);
+    }
+    {
+      DeviceZoneScopedN("writer_dram_write");
+      noc_async_write_tile(tile_offset + i, out0, get_read_ptr(cb_out0));
+      noc_async_write_barrier();
+    }
     cb_pop_front(cb_out0, 1);
   }
 }
@@ -57,6 +64,7 @@ K_COMPUTE = r"""
 #include "compute_kernel_api/common.h"
 #include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "tools/profiler/kernel_profiler.hpp"
 #ifdef TRISC_MATH
   #include "sfpi.h"
 #endif
@@ -68,6 +76,7 @@ void MAIN {
   for (uint32_t i = 0; i < n_tiles; ++i) {
     tile_regs_acquire();
     cb_wait_front(tt::CBIndex::c_0, 1);
+    DeviceZoneScopedN("sfpu_add1");
     copy_tile(tt::CBIndex::c_0, 0, 0);
 #ifdef TRISC_MATH
     const sfpi::vFloat scalar = 1.0f;
@@ -150,6 +159,7 @@ def main():
       cbs=[0, 16],
       tile_size=tile_size_bytes,
       num_pages=2,
+      sources={"reader": K_READER, "compute": K_COMPUTE, "writer": K_WRITER},
       name="add1",
     )
     device.queue(program)

@@ -34,9 +34,12 @@ class TensixL1:
   TRISC2_BASE = 0x006640
   DATA_BUFFER_SPACE_BASE = 0x037000
 
-  # Profiler region (inside mailboxes_t, offset 0x9D0 from MAILBOX_BASE)
-  PROFILER_CONTROL = 0x000A30       # 32 × u32 = 128 bytes
-  PROFILER_BUFFERS = 0x000AB0       # 5 × 512 × u32 = 10240 bytes (one per RISC)
+  # Profiler region (inside mailboxes_t)
+  PROFILER_CONTROL = 0x000960       # 32 × u32 = 128 bytes
+  PROFILER_BUFFERS = 0x0009E0       # 5 × 512 × u32 = 10240 bytes (one per RISC)
+  # Compatibility alias observed with alternate mailbox packing in some firmware variants.
+  PROFILER_CONTROL_ALT = 0x0009C0
+  PROFILER_BUFFERS_ALT = 0x000A40
   PROFILER_BUF_STRIDE = 2048        # bytes per RISC data buffer
 
   BRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x0082B0

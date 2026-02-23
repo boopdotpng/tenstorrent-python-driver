@@ -1,7 +1,8 @@
 """Device kernel profiler — reads wall-clock markers from L1 after kernel execution."""
+import os
 import re
 import struct
-from defs import TensixL1, CoreList
+from defs import TensixL1, CoreList, Dram
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
@@ -21,12 +22,50 @@ _CUSTOM_START = 12    # Optional markers begin here
 _HOST_BUF_END = 0
 _HOST_BUF_WORDS_PER_RISC = 65536 // 4
 _ZONE_RE = re.compile(r'DeviceZoneScopedN\s*\(\s*"([^"]+)"')
+_PKT_ZONE_START = 0
+_PKT_ZONE_END = 1
+_PKT_ZONE_TOTAL = 2
+_PKT_TS_DATA = 3
+_PKT_TS_EVENT = 4
+_PKT_TS_DATA_16B = 5
+
+def _read_ctrl_and_buffer_base(win):
+  raw0 = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
+  raw1 = bytes(win.uc[TensixL1.PROFILER_CONTROL_ALT : TensixL1.PROFILER_CONTROL_ALT + 128])
+  c0 = struct.unpack("<32I", raw0)
+  c1 = struct.unpack("<32I", raw1)
+
+  def score(ctrl):
+    return (
+      sum(ctrl[_HOST_BUF_END : _HOST_BUF_END + 5]) +
+      sum(ctrl[_DEVICE_BUF_END : _DEVICE_BUF_END + 5]) +
+      int(ctrl[_DONE] != 0)
+    )
+
+  s0, s1 = score(c0), score(c1)
+  primary = c1 if s1 > s0 else c0
+  primary_buf = TensixL1.PROFILER_BUFFERS_ALT if s1 > s0 else TensixL1.PROFILER_BUFFERS
+  primary_ctrl_base = TensixL1.PROFILER_CONTROL_ALT if s1 > s0 else TensixL1.PROFILER_CONTROL
+
+  # Firmware/mailbox packing can differ by core; merge end pointers so fast DRAM decode
+  # does not drop cores when one control base is stale/zero for that core.
+  merged = list(primary)
+  for i in range(_HOST_BUF_END, _HOST_BUF_END + 5):
+    merged[i] = max(c0[i], c1[i])
+  for i in range(_DEVICE_BUF_END, _DEVICE_BUF_END + 5):
+    merged[i] = max(c0[i], c1[i])
+  merged[_DROPPED] = c0[_DROPPED] | c1[_DROPPED]
+  merged[_DONE] = max(c0[_DONE], c1[_DONE])
+  return tuple(merged), primary_buf, primary_ctrl_base
 
 def _hash16(s: str) -> int:
   h = 0x811C9DC5
   for c in s.encode():
     h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
   return (h >> 16) ^ (h & 0xFFFF)
+
+def _hash_profiler_msg(name: str, fpath: str, lineno: int) -> int:
+  return _hash16(f"{name},{fpath},{lineno},KERNEL_PROFILER")
 
 def _parse_ts(w0, w1):
   """Extract 44-bit wall-clock timestamp from a profiler marker pair."""
@@ -38,22 +77,25 @@ def _parse_marker(w0, w1):
   """Parse a marker into (zone_hash, packet_type, timestamp) or None."""
   if not (w0 & 0x80000000): return None
   timer_id = (w0 >> 12) & 0x7FFFF
-  hi12 = w0 & 0xFFF
-  ts = (hi12 << 32) | w1
   zone_hash = timer_id & 0xFFFF
   ptype = (timer_id >> 16) & 0x7  # 0=START, 1=END, 2=TOTAL
+  # ZONE_TOTAL writes accumulated cycle count in low 32 bits (not a 44-bit timestamp).
+  if ptype == _PKT_ZONE_TOTAL:
+    ts = w1
+  else:
+    hi12 = w0 & 0xFFF
+    ts = (hi12 << 32) | w1
   return zone_hash, ptype, ts
 
 def read_core(win, core):
   """Read profiler data for one core via a TLB window. Returns dict with per-RISC timing."""
-  ctrl_raw = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
-  ctrl = struct.unpack("<32I", ctrl_raw)
+  ctrl, buf_base, _ = _read_ctrl_and_buffer_base(win)
 
   result = {"core": core, "dropped": ctrl[_DROPPED], "done": ctrl[_DONE], "riscs": []}
 
   for risc in range(5):
     end_idx = ctrl[_DEVICE_BUF_END + risc]
-    buf_addr = TensixL1.PROFILER_BUFFERS + risc * TensixL1.PROFILER_BUF_STRIDE
+    buf_addr = buf_base + risc * TensixL1.PROFILER_BUF_STRIDE
     buf_raw = bytes(win.uc[buf_addr : buf_addr + TensixL1.PROFILER_BUF_STRIDE])
     words = struct.unpack(f"<{len(buf_raw) // 4}I", buf_raw)
 
@@ -169,12 +211,47 @@ def _print_report(profiles, freq_mhz, max_cores):
   print(f"{'=' * 72}\n")
 
 def _core_total_cycles(profile):
-  """Total kernel cycles across all RISCs (max of per-RISC kernel durations)."""
+  """Kernel-only core wall time across RISCs: latest kernel end - earliest kernel start."""
+  starts, ends = [], []
   best = 0
   for r in profile["riscs"]:
-    if r["kern_start"] and r["kern_end"]:
-      best = max(best, r["kern_end"] - r["kern_start"])
+    ks, ke = r.get("kern_start"), r.get("kern_end")
+    if ks is None or ke is None or ke <= ks:
+      continue
+    starts.append(ks)
+    ends.append(ke)
+    best = max(best, ke - ks)
+  if starts and ends:
+    return max(0, max(ends) - min(starts))
   return best
+
+def print_data_summary(data):
+  programs = data.get("programs", [])
+  print(f"Profiler collected {len(programs)} program(s)")
+  row_debug = os.environ.get("TT_PROFILER_ROW_DEBUG", "0") == "1"
+  for prog in programs:
+    totals = [p.get("total_cycles", 0) for p in prog.get("profiles", {}).values() if p.get("total_cycles", 0) > 0]
+    prof_count = len(prog.get("profiles", {}))
+    if not totals:
+      print(f"  program {prog.get('index')} ({prog.get('name') or 'unnamed'}): {prof_count} core(s), no cycles")
+      continue
+    mn, mx = min(totals), max(totals)
+    avg = sum(totals) / len(totals)
+    print(
+      f"  program {prog.get('index')} ({prog.get('name') or 'unnamed'}): "
+      f"{prof_count} core(s), min/avg/max = {mn}/{avg:.1f}/{mx} cycles"
+    )
+    if row_debug:
+      by_y = {}
+      for key, p in prog.get("profiles", {}).items():
+        _, y = (int(v) for v in key.split(",", 1))
+        s = by_y.setdefault(y, [0, 0])
+        s[0] += 1
+        if p.get("total_cycles", 0) > 0:
+          s[1] += 1
+      for y in sorted(by_y):
+        total, nz = by_y[y]
+        print(f"    y={y}: {nz}/{total} cores with cycles")
 
 def _risc_to_json(r):
   """Convert a RISC profile dict to JSON-serializable form."""
@@ -204,8 +281,13 @@ def _zone_names_from_sources(programs_info):
         if not m:
           continue
         name = m.group(1)
-        h = _hash16(name)
-        key = str(h)
+        # Compiler emits user kernel zones from generated kernel_includes.hpp.
+        for fpath in ("./kernel_includes.hpp", "kernel_includes.hpp", label):
+          key = str(_hash_profiler_msg(name, fpath, lineno))
+          if key not in zone_names:
+            zone_names[key] = {"name": name, "file": fpath, "line": lineno}
+        # Keep name-only hash as a weak fallback for legacy/debug variants.
+        key = str(_hash16(name))
         if key not in zone_names:
           zone_names[key] = {"name": name, "file": label, "line": lineno}
   return zone_names
@@ -225,22 +307,30 @@ def _build_zone_names(programs_info, used_hashes):
   return zone_names
 
 def _parse_risc_words(words, flat_id, risc_id, program_ids):
-  """Split concatenated DRAM profiler stream into per-program RISC entries."""
+  """Parse per-RISC profiler DRAM stream as concatenated runs."""
   n = len(words)
   if n < _CUSTOM_START:
     return {}
-  encoded_core = ((flat_id & 0xFF) << 3) | (risc_id & 0x7)
+  # Stream format (per run): [ID_HH, ID_HL]=[0,0], [ID_LH, ID_LL], then markers.
+  starts = []
+  def _valid_run_header(s):
+    if s + _CUSTOM_START > n:
+      return False
+    if words[s + 3] not in program_ids:
+      return False
+    # Guaranteed markers must be valid marker pairs (start/end zones).
+    for m in (_GUARANTEED_1_H, _GUARANTEED_2_H, _GUARANTEED_3_H, _GUARANTEED_4_H):
+      w0 = words[s + m]
+      if not (w0 & 0x80000000):
+        return False
+      ptype = ((w0 >> 12) & 0x7FFFF) >> 16
+      if ptype not in (_PKT_ZONE_START, _PKT_ZONE_END):
+        return False
+    return True
 
-  def is_chunk_start(i):
-    if i + (_CUSTOM_START - 1) >= n:
-      return False
-    if words[i + 3] not in program_ids:
-      return False
-    if (words[i + 2] & 0x7FF) != encoded_core:
-      return False
-    return all((words[i + j] & 0x80000000) != 0 for j in (_GUARANTEED_1_H, _GUARANTEED_2_H, _GUARANTEED_3_H, _GUARANTEED_4_H))
-
-  starts = [i for i in range(0, n, 4) if is_chunk_start(i)]
+  for i in range(0, n - 3, 2):
+    if words[i] == 0 and words[i + 1] == 0 and _valid_run_header(i):
+      starts.append(i)
   if not starts:
     return {}
 
@@ -249,24 +339,52 @@ def _parse_risc_words(words, flat_id, risc_id, program_ids):
     end = starts[idx + 1] if idx + 1 < len(starts) else n
     if end - start < _CUSTOM_START:
       continue
-    chunk = words[start:end]
-    fw_start = _parse_ts(chunk[_GUARANTEED_1_H], chunk[_GUARANTEED_1_H + 1])
-    fw_end = _parse_ts(chunk[_GUARANTEED_2_H], chunk[_GUARANTEED_2_H + 1])
-    kern_start = _parse_ts(chunk[_GUARANTEED_3_H], chunk[_GUARANTEED_3_H + 1])
-    kern_end = _parse_ts(chunk[_GUARANTEED_4_H], chunk[_GUARANTEED_4_H + 1])
+    prog_id = words[start + 3]
+
+    fw_start = _parse_ts(words[start + _GUARANTEED_1_H], words[start + _GUARANTEED_1_H + 1])
+    fw_end = _parse_ts(words[start + _GUARANTEED_2_H], words[start + _GUARANTEED_2_H + 1])
+    kern_start = _parse_ts(words[start + _GUARANTEED_3_H], words[start + _GUARANTEED_3_H + 1])
+    kern_end = _parse_ts(words[start + _GUARANTEED_4_H], words[start + _GUARANTEED_4_H + 1])
+
     custom = []
-    i = _CUSTOM_START
-    while i + 1 < len(chunk):
-      m = _parse_marker(chunk[i], chunk[i + 1])
-      if m: custom.append(m)
-      i += 2
-    out[chunk[3]] = {
+    i = start + _CUSTOM_START
+    while i + 1 < end:
+      w0, w1 = words[i], words[i + 1]
+      if w0 == 0 and w1 == 0:
+        break
+      if not (w0 & 0x80000000):
+        i += 2
+        continue
+
+      timer_id = (w0 >> 12) & 0x7FFFF
+      ptype = (timer_id >> 16) & 0x7
+      if ptype in (_PKT_ZONE_START, _PKT_ZONE_END, _PKT_ZONE_TOTAL):
+        ts = w1 if ptype == _PKT_ZONE_TOTAL else ((w0 & 0xFFF) << 32) | w1
+        custom.append((timer_id & 0xFFFF, ptype, ts))
+
+      if ptype == _PKT_TS_DATA:
+        i += 4
+      elif ptype == _PKT_TS_DATA_16B:
+        i += 6
+      else:
+        i += 2
+
+    candidate = {
       "name": RISC_NAMES[risc_id],
       "fw_start": fw_start, "fw_end": fw_end,
       "kern_start": kern_start, "kern_end": kern_end,
       "custom": custom,
-      "end_idx": len(chunk),
+      "end_idx": end - start,
     }
+    prev = out.get(prog_id)
+    if prev is None:
+      out[prog_id] = candidate
+      continue
+    prev_valid = prev["kern_start"] is not None and prev["kern_end"] is not None and prev["kern_end"] > prev["kern_start"]
+    cand_valid = candidate["kern_start"] is not None and candidate["kern_end"] is not None and candidate["kern_end"] > candidate["kern_start"]
+    # Keep earliest plausible run; only replace if existing run looks invalid.
+    if (not prev_valid) and cand_valid:
+      out[prog_id] = candidate
   return out
 
 def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, freq_mhz=1000):
@@ -297,15 +415,30 @@ def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, fr
     })
 
   zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
+  dram_tiles = [
+    {
+      "bank": bank,
+      "x": Dram.BANK_X[bank],
+      "y": y,
+      "valid": bank != device.harvested_dram,
+    }
+    for bank in range(Dram.BANK_COUNT)
+    for y in Dram.BANK_TILE_YS[bank]
+  ]
+  # Keep a blank spacer column (x=8) left of right DRAM column (x=9) to match BH NoC layout.
+  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles} | {8})
+  grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
 
   return {
     "dispatch_mode": dispatch_mode,
     "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
     "freq_mhz": freq_mhz,
-    "grid_x": list(TileGrid.TENSIX_X),
-    "grid_y": list(range(TileGrid.TENSIX_Y[0], TileGrid.TENSIX_Y[1] + 1)),
+    "grid_x": grid_x,
+    "grid_y": grid_y,
     "programs": programs,
     "zone_names": zone_names,
+    "dram_tiles": dram_tiles,
+    "harvested_dram_bank": device.harvested_dram,
   }
 
 def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count_per_dram, freq_mhz=1000, dispatch_cores=None):
@@ -314,7 +447,8 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
   from device import TileGrid
 
   l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-  dram_raw = device.dram.read(dram_buf)
+  # Avoid re-entering Device.run() while already inside profiler collection.
+  dram_raw = device.dram._read_slow(dram_buf)
   page_size = dram_buf.page_size
   program_ids = {info["index"] + 1 for info in programs_info}
   by_index = {info["index"]: {"index": info["index"], "name": info.get("name"), "cores": [list(c) for c in info["cores"]], "profiles": {}, "sources": info.get("sources", {})}
@@ -323,13 +457,14 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
   needed = set()
   for info in programs_info:
     needed.update(info["cores"])
+  debug_dump = os.environ.get("TT_PROFILER_DEBUG_DUMP", "0") == "1"
+  dumped = False
 
   for core in sorted(needed):
     flat_id = core_flat_ids[core]
     l1_cfg.start = l1_cfg.end = core
     device.win.configure(l1_cfg)
-    ctrl_raw = bytes(device.win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
-    ctrl = struct.unpack("<32I", ctrl_raw)
+    ctrl, _, ctrl_base = _read_ctrl_and_buffer_base(device.win)
     page_id = flat_id // core_count_per_dram
     slot = (flat_id % core_count_per_dram) * 5 * 65536
     by_program = {}
@@ -338,6 +473,32 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
       base = page_id * page_size + slot + risc * 65536
       raw = dram_raw[base : base + host_end * 4]
       words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
+      if debug_dump and not dumped:
+        print(f"TT_PROFILER_DEBUG core={core} flat_id={flat_id} risc={risc} host_end={host_end} words={len(words)}")
+        print(f"  ctrl_base=0x{ctrl_base:06x}")
+        print("  ctrl[0:32]=" + " ".join(f"{v:08x}" for v in ctrl[:32]))
+        l1_prof_words = struct.unpack("<64I", bytes(device.win.uc[TensixL1.PROFILER_BUFFERS : TensixL1.PROFILER_BUFFERS + 64 * 4]))
+        print("  l1_prof_risc0[0:64]=" + " ".join(f"{v:08x}" for v in l1_prof_words))
+        sig = struct.pack("<4I", core[0], core[1], flat_id, core_count_per_dram)
+        l1_raw = bytes(device.win.uc[0:TensixL1.SIZE])
+        found = []
+        pos = l1_raw.find(sig)
+        while pos != -1 and len(found) < 4:
+          base = pos - (14 * 4)
+          if base >= 0 and base + 128 <= len(l1_raw):
+            cvec = struct.unpack("<32I", l1_raw[base:base + 128])
+            found.append((base, cvec))
+          pos = l1_raw.find(sig, pos + 1)
+        if found:
+          for base, cvec in found:
+            print(f"  possible_ctrl_base=0x{base:06x}")
+            print("    " + " ".join(f"{v:08x}" for v in cvec[:20]))
+        else:
+          print("  possible_ctrl_base=not found")
+        for i in range(0, min(len(words), 96), 4):
+          row = words[i:i+4]
+          print(f"  [{i:03d}] " + " ".join(f"{w:08x}" for w in row))
+        dumped = True
       for prog_id, r in _parse_risc_words(words, flat_id, risc, program_ids).items():
         by_program.setdefault(prog_id, []).append(r)
 
@@ -358,12 +519,27 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
 
   programs = [by_index[i] for i in sorted(by_index)]
   zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
+  dram_tiles = [
+    {
+      "bank": bank,
+      "x": Dram.BANK_X[bank],
+      "y": y,
+      "valid": bank != device.harvested_dram,
+    }
+    for bank in range(Dram.BANK_COUNT)
+    for y in Dram.BANK_TILE_YS[bank]
+  ]
+  # Keep a blank spacer column (x=8) left of right DRAM column (x=9) to match BH NoC layout.
+  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles} | {8})
+  grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
   return {
     "dispatch_mode": "fast",
     "dispatch_cores": [list(c) for c in (dispatch_cores or [])],
     "freq_mhz": freq_mhz,
-    "grid_x": list(TileGrid.TENSIX_X),
-    "grid_y": list(range(TileGrid.TENSIX_Y[0], TileGrid.TENSIX_Y[1] + 1)),
+    "grid_x": grid_x,
+    "grid_y": grid_y,
     "programs": programs,
     "zone_names": zone_names,
+    "dram_tiles": dram_tiles,
+    "harvested_dram_bank": device.harvested_dram,
   }
