@@ -17,10 +17,10 @@ ARCH="$(uname -m)"
 
 case "$OS-$ARCH" in
   Darwin-arm64)
-    URL="https://github.com/boopdotpng/blackhole-py/releases/download/v0.3.0/tt-metal-deps-darwin-arm64.tar.gz"
+    URL="https://github.com/boopdotpng/blackhole-py/releases/download/v0.4.0/tt-metal-deps-darwin-arm64.tar.gz"
     ;;
   Linux-x86_64)
-    URL="https://github.com/boopdotpng/blackhole-py/releases/download/v0.2.0/tt-metal-deps.tar.gz"
+    URL="https://github.com/boopdotpng/blackhole-py/releases/download/v0.4.0/tt-metal-deps.tar.gz"
     ;;
   *)
     echo "Unsupported platform: $OS $ARCH" >&2
