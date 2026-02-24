@@ -297,12 +297,7 @@ void process_dispatch_s_wait_cmd() {
         distributed_dispatcher);
     uint32_t stream = cmd->wait.stream;
     uint32_t index = stream - first_stream_used;
-    volatile uint32_t* worker_sem =
-        (volatile uint32_t*)STREAM_REG_ADDR(stream, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
-
-    // Wait for workers to complete
-    while (stream_wrap_gt(cmd->wait.count, *worker_sem)) {
-    }
+    wait_for_workers(cmd->wait.count, stream);
     // Send updated worker count to dispatch_d and wait for updated count to get picked up by NOC before clearing the
     // counter. dispatch_d will clear it's own counter
     update_worker_completion_count_on_dispatch_d<true>();
@@ -325,13 +320,8 @@ FORCE_INLINE
 void set_go_signal_noc_data() {
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
     uint32_t num_words = cmd->set_go_signal_noc_data.num_words;
-    ASSERT(num_words <= max_num_go_signal_noc_data_entries);
-    volatile tt_l1_ptr uint32_t* data_ptr =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cmd_ptr + sizeof(CQDispatchCmd));
-    for (uint32_t i = 0; i < num_words; ++i) {
-        go_signal_noc_data[i] = *(data_ptr++);
-    }
-    cmd_ptr = round_up_pow2((uint32_t)data_ptr, L1_ALIGNMENT);
+    cmd_ptr = copy_words_to_l1_and_advance(
+        cmd_ptr + sizeof(CQDispatchCmd), num_words, max_num_go_signal_noc_data_entries, go_signal_noc_data);
 }
 
 void kernel_main() {
@@ -341,15 +331,7 @@ void kernel_main() {
     dispatch_s_wr_reg_cmd_buf_init();
     dispatch_s_atomic_cmd_buf_init();
     if constexpr (distributed_dispatcher) {
-        for (size_t i = 0; i < max_num_worker_sems; i++) {
-            uint32_t index = i + first_stream_used;
-
-            NOC_STREAM_WRITE_REG(
-                index,
-                STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE_REG_INDEX,
-                -NOC_STREAM_READ_REG(index, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX)
-                    << REMOTE_DEST_BUF_WORDS_FREE_INC);
-        }
+        reset_worker_completion_stream_counts<first_stream_used, max_num_worker_sems>();
     }
 
     cmd_ptr = cb_base;

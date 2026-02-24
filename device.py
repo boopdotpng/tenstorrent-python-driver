@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Callable, Literal
 from pathlib import Path
 from defs import *
-from codegen import CompiledKernel, compile_firmware
+from compiler import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import USE_USB_DISPATCH, PROFILER, align_down, align_up, generate_jal_instruction, noc_xy
 from dram import DramAllocator
@@ -481,7 +481,7 @@ class DeviceBase(CommonDevice):
         import profiler
         profiler.print_data_summary(profile_data)
         return self.last_profile
-      import profiler_ui
+      from profiler import ui as profiler_ui
       profiler_ui.serve(profile_data)
       return self.last_profile
     self._exec_list.clear()

@@ -3,7 +3,7 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 _data_json = ""
-_HTML = (Path(__file__).with_name("profiler_ui.html")).read_text()
+_HTML = (Path(__file__).with_name("ui.html")).read_text()
 
 class _Handler(BaseHTTPRequestHandler):
   def do_GET(self):

@@ -3,7 +3,7 @@ from typing import Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import _IO, align_up, noc_xy, PROFILER
-from codegen import compile_cq_kernels
+from compiler import compile_cq_kernels
 from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS, _CorePayload
 
 class _FastCQ:

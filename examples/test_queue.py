@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import random, struct
-from codegen import Compiler, DataFormat, CkernelConfig, MathFidelity
+from compiler import Compiler, DataFormat, CkernelConfig, MathFidelity
 from device import Device, Program, DataflowLaunch
 from dram import DType
 

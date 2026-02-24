@@ -949,13 +949,8 @@ FORCE_INLINE
 void set_go_signal_noc_data() {
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
     uint32_t num_words = cmd->set_go_signal_noc_data.num_words;
-    ASSERT(num_words <= max_num_go_signal_noc_data_entries);
-    volatile tt_l1_ptr uint32_t* data_ptr =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cmd_ptr + sizeof(CQDispatchCmd));
-    for (uint32_t i = 0; i < num_words; ++i) {
-        go_signal_noc_data[i] = *(data_ptr++);
-    }
-    cmd_ptr = round_up_pow2((uint32_t)data_ptr, L1_ALIGNMENT);
+    cmd_ptr = copy_words_to_l1_and_advance(
+        cmd_ptr + sizeof(CQDispatchCmd), num_words, max_num_go_signal_noc_data_entries, go_signal_noc_data);
 }
 
 [[noreturn]] FORCE_INLINE void process_invalid_cmd(const char* dispatcher_name, uint32_t local_cmd_ptr) {
@@ -1172,15 +1167,7 @@ void kernel_main() {
         noc_local_state_init(upstream_noc_index);
     }
 
-    for (size_t i = 0; i < max_num_worker_sems; i++) {
-        uint32_t index = i + first_stream_used;
-
-        NOC_STREAM_WRITE_REG(
-            index,
-            STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE_REG_INDEX,
-            -NOC_STREAM_READ_REG(index, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX)
-                << REMOTE_DEST_BUF_WORDS_FREE_INC);
-    }
+    reset_worker_completion_stream_counts<first_stream_used, max_num_worker_sems>();
 
     static_assert(is_d_variant || split_dispatch_page_preamble_size == 0);
 

@@ -59,6 +59,28 @@ uint32_t wrap_gt(uint32_t a, uint32_t b) {
     return diff > 0;
 }
 
+template <uint32_t first_stream, uint32_t num_worker_streams>
+FORCE_INLINE void reset_worker_completion_stream_counts() {
+    for (uint32_t i = 0; i < num_worker_streams; ++i) {
+        uint32_t stream = i + first_stream;
+        NOC_STREAM_WRITE_REG(
+            stream,
+            STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE_REG_INDEX,
+            -NOC_STREAM_READ_REG(stream, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX) << REMOTE_DEST_BUF_WORDS_FREE_INC);
+    }
+}
+
+FORCE_INLINE uint32_t copy_words_to_l1_and_advance(
+    uint32_t src_words_ptr, uint32_t num_words, uint32_t max_words, uint32_t* dst_words_ptr) {
+    ASSERT(num_words <= max_words);
+    volatile tt_l1_ptr uint32_t* src_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src_words_ptr);
+    for (uint32_t i = 0; i < num_words; ++i) {
+        dst_words_ptr[i] = *src_ptr;
+        ++src_ptr;
+    }
+    return round_up_pow2((uint32_t)src_ptr, L1_ALIGNMENT);
+}
+
 template <
     enum CQNocFlags flags,
     enum CQNocWait wait = CQ_NOC_WAIT,

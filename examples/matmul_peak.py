@@ -6,7 +6,7 @@ import time
 
 import numpy as np
 
-from codegen import CkernelConfig, Compiler, DataFormat, MathFidelity
+from compiler import CkernelConfig, Compiler, DataFormat, MathFidelity
 from device import DataflowLaunch, Device, Program
 from dram import DType
 

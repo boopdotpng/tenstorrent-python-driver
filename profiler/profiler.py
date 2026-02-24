@@ -233,7 +233,7 @@ def _zone_names_from_sources(programs_info):
   return zone_names
 
 def _build_zone_names(programs_info, used_hashes):
-  from codegen import get_zone_map
+  from compiler import get_zone_map
 
   zone_names = _zone_names_from_sources(programs_info)
   compile_map = get_zone_map()
