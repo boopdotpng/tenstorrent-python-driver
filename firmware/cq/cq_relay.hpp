@@ -8,7 +8,6 @@
 #include "api/dataflow/dataflow_api.h"
 #include "cq_common.hpp"
 #include "internal/risc_attribs.h"
-#include "api/debug/waypoint.h"
 #include "noc/noc_parameters.h"
 
 #if !defined(FD_CORE_TYPE)
@@ -24,9 +23,7 @@ public:
 
   template <uint8_t noc_index, uint8_t downstream_cmd_buf>
   FORCE_INLINE void init(uint64_t downstream_noc_addr) {
-    WAYPOINT("FMCW");
     init_write_state_only<noc_index, downstream_cmd_buf>(downstream_noc_addr);
-    WAYPOINT("FMCD");
   }
 
   template <uint8_t noc_index, uint8_t downstream_cmd_buf>

@@ -12,8 +12,6 @@
 //    and instead need a unicast for the go signal
 
 #include "cq_fixed_config.hpp"
-#include "api/debug/assert.h"
-#include "api/debug/dprint.h"
 #include "cq_commands.hpp"
 #include "cq_common.hpp"
 
@@ -56,15 +54,6 @@ static uint32_t num_pages_acquired = 0;
 static uint32_t num_mcasts_sent[max_num_worker_sems] = {0};
 static uint32_t cmd_ptr;
 
-extern "C" {
-// These variables are used by triage to help report dispatcher state.
-volatile uint32_t last_wait_count = 0;
-volatile uint32_t last_wait_stream = 0;
-constexpr uint32_t stream_addr0 = STREAM_REG_ADDR(0, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
-constexpr uint32_t stream_addr1 = STREAM_REG_ADDR(1, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
-constexpr uint32_t stream_width = MEM_WORD_ADDR_WIDTH;
-}
-
 // When dispatch_d and dispatch_s run on separate cores, dispatch_s gets the go signal update from workers.
 // dispatch_s is responsible for sending the latest worker completion count to dispatch_d.
 // To minimize the number of writes from dispatch_s to dispatch_d, locally track dispatch_d's copy.
@@ -101,9 +90,6 @@ void dispatch_s_noc_semaphore_inc(uint64_t addr, uint32_t incr, uint8_t noc_id) 
     // dispatch_s specific atomic inc API, which will use DISPATCH_S_ATOMIC_CMD_BUF to ensure that
     // ncrisc and brisc don't clobber each other's resources when dispatch_s and dispatch_d are on
     // the same tensix core
-    WAYPOINT("NSIW");
-    DEBUG_SANITIZE_NOC_ADDR(noc_id, addr, 4);
-    DEBUG_INSERT_DELAY(TransactionAtomic);
     noc_fast_atomic_increment(
         noc_id,
         DISPATCH_S_ATOMIC_CMD_BUF,
@@ -113,13 +99,10 @@ void dispatch_s_noc_semaphore_inc(uint64_t addr, uint32_t incr, uint8_t noc_id) 
         31 /*wrap*/,
         false /*linked*/,
         false /*posted*/);
-    WAYPOINT("NSID");
 }
 
 FORCE_INLINE
 void dispatch_s_noc_inline_dw_write(uint64_t addr, uint32_t val, uint8_t noc_id, uint8_t be = 0xF) {
-    WAYPOINT("NWIW");
-    DEBUG_SANITIZE_NOC_ADDR(noc_id, addr, 4);
     // Workaround for BH inline writes does not apply here because this writes to a stream register.
     // See comment in `noc_get_interim_inline_value_addr` for more details.
     noc_fast_write_dw_inline<noc_mode>(
@@ -132,7 +115,6 @@ void dispatch_s_noc_inline_dw_write(uint64_t addr, uint32_t val, uint8_t noc_id,
         false,  // mcast
         false   // posted
     );
-    WAYPOINT("NWID");
 }
 
 FORCE_INLINE
@@ -147,14 +129,10 @@ uint32_t stream_wrap_gt(uint32_t a, uint32_t b) {
 
 FORCE_INLINE
 void wait_for_workers(uint32_t wait_count, uint32_t wait_stream) {
-    WAYPOINT("WCW");
-    last_wait_count = wait_count;
-    last_wait_stream = wait_stream;
     volatile uint32_t* worker_sem =
         (volatile uint32_t*)STREAM_REG_ADDR(wait_stream, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
     while (stream_wrap_gt(wait_count, *worker_sem)) {
     }
-    WAYPOINT("WCD");
 }
 
 template <bool flush_write = false>
@@ -187,16 +165,12 @@ FORCE_INLINE void cb_acquire_pages_dispatch_s(uint32_t n) {
     volatile tt_l1_ptr uint32_t* sem_addr =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore<fd_core_type>(sem_id));
 
-    WAYPOINT("DAPW");
-    uint32_t heartbeat = 0;
     // Stall until the number of pages already acquired + the number that need to be acquired is greater
     // than the number available
     while (wrap_gt(num_pages_acquired + n, *sem_addr)) {
         invalidate_l1_cache();
         update_worker_completion_count_on_dispatch_d();
-        CQ_HEARTBEAT_NOOP(heartbeat);
     }
-    WAYPOINT("DAPD");
     num_pages_acquired += n;
 }
 
@@ -214,7 +188,6 @@ void process_go_signal_mcast_cmd() {
     volatile tt_l1_ptr uint32_t* sync_sem_addr =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dispatch_s_sync_sem_base_addr + sync_index * L1_ALIGNMENT);
 
-    WAYPOINT("DCW");
     // Wait for notification from dispatch_d, signalling that it's safe to send the go signal
     uint32_t& mcasts_sent = num_mcasts_sent[sync_index];
     while (wrap_ge(mcasts_sent, *sync_sem_addr)) {
@@ -292,9 +265,6 @@ void process_dispatch_s_wait_cmd() {
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
     // Limited Usage of Wait CMD: dispatch_s should get a wait command only if it's not on the
     // same core as dispatch_d and is used to clear the worker count
-    ASSERT(
-        (cmd->wait.flags == (CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM)) &&
-        distributed_dispatcher);
     uint32_t stream = cmd->wait.stream;
     uint32_t index = stream - first_stream_used;
     wait_for_workers(cmd->wait.count, stream);
@@ -312,7 +282,6 @@ FORCE_INLINE
 void set_num_worker_sems() {
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
     num_worker_sems = cmd->set_num_worker_sems.num_worker_sems;
-    ASSERT(num_worker_sems <= max_num_worker_sems);
     cmd_ptr += sizeof(CQDispatchCmd);
 }
 
@@ -326,7 +295,6 @@ void set_go_signal_noc_data() {
 
 void kernel_main() {
     set_l1_data_cache<true>();
-    DPRINT << "dispatch_s : start" << ENDL();
     // Initialize customized command buffers.
     dispatch_s_wr_reg_cmd_buf_init();
     dispatch_s_atomic_cmd_buf_init();
@@ -338,21 +306,18 @@ void kernel_main() {
     bool done = false;
     uint32_t total_pages_acquired = 0;
     while (!done) {
-        DeviceZoneScopedN("CQ-DISPATCH-SUBORDINATE");
         cb_acquire_pages_dispatch_s<my_noc_xy, my_dispatch_cb_sem_id>(1);
 
         volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
-        DeviceTimestampedData("process_cmd_d_dispatch_subordinate", (uint32_t)cmd->base.cmd_id);
         switch (cmd->base.cmd_id) {
             case CQ_DISPATCH_CMD_SEND_GO_SIGNAL: process_go_signal_mcast_cmd(); break;
             case CQ_DISPATCH_SET_NUM_WORKER_SEMS: set_num_worker_sems(); break;
             case CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA: set_go_signal_noc_data(); break;
             case CQ_DISPATCH_CMD_WAIT: process_dispatch_s_wait_cmd(); break;
             case CQ_DISPATCH_CMD_TERMINATE: done = true; break;
-            default: DPRINT << "dispatcher_s invalid command" << ENDL(); ASSERT(0);
+            default: __builtin_unreachable();
         }
         // Dispatch s only supports single page commands for now
-        ASSERT(cmd_ptr <= ((uint32_t)cmd + cb_page_size));
         cmd_ptr = round_up_pow2(cmd_ptr, cb_page_size);
         // Release a single page to prefetcher. Assumption is that all dispatch_s commands fit inside a single page for
         // now.
@@ -364,6 +329,5 @@ void kernel_main() {
     }
     // Confirm expected number of pages, spinning here is a leak
     cb_wait_all_pages<my_dispatch_cb_sem_id>(total_pages_acquired);
-    DPRINT << "dispatch_s : done" << ENDL();
     set_l1_data_cache<false>();
 }

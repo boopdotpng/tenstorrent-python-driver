@@ -182,12 +182,12 @@ _FW_TARGETS = [
    ["-mcpu=tt-bh-tensix"], "-O3", []),
 ]
 
-_fw_cache_by_mode: dict[bool, dict[str, CompiledFirmware]] = {}
+_fw_cache: dict[str, CompiledFirmware] | None = None
 
 def compile_firmware() -> dict[str, CompiledFirmware]:
-  mode = PROFILER
-  if mode in _fw_cache_by_mode:
-    return _fw_cache_by_mode[mode]
+  global _fw_cache
+  if _fw_cache is not None:
+    return _fw_cache
   _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
   cc = _SFPI / "riscv-tt-elf-g++"
@@ -197,8 +197,6 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
   ]
-  if PROFILER:
-    common_defines += _PROFILE_DEFINES
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
   fw_src_dir = _REPO / "firmware"
@@ -209,7 +207,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     ld = ld_dir / f"firmware_{target}.ld"
     assert ld.is_file(), f"missing linker script: {ld}"
     src = fw_src_dir / src_name
-    cache_target = f"{target}_firmware" + ("_prof" if PROFILER else "")
+    cache_target = f"{target}_firmware"
     key = _source_target_cache_key(src.read_text(), cache_target)
     elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
     compile_args = [
@@ -231,7 +229,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     text_base = segs[0].paddr
     result[target] = CompiledFirmware(elf_path=elf, segments=segs, text_base=text_base)
 
-  _fw_cache_by_mode[mode] = result
+  _fw_cache = result
   return result
 
 class Compiler:
@@ -259,7 +257,7 @@ class Compiler:
 
   def _compile_dataflow(self, src: str, target: str, noc_index: int, extra_defines: Strs | None = None,
                         extra_includes: Strs | None = None,
-                        xip_relocate: bool = False) -> CompiledKernel:
+                        xip_relocate: bool = False, profiler: bool = True) -> CompiledKernel:
     defines = [
       *_KERNEL_DEFINES,
       f"-DCOMPILE_FOR_{target.upper()}",
@@ -267,7 +265,7 @@ class Compiler:
       f"-DNOC_INDEX={noc_index}", "-DNOC_MODE=0",
       *(extra_defines or []),
     ]
-    if PROFILER:
+    if PROFILER and profiler:
       defines += _PROFILE_DEFINES
     extra_objs = [str(_DEPS / "lib/blackhole/noc.o")] if target == "brisc" else []
     return self._build(
@@ -275,7 +273,7 @@ class Compiler:
       extra_includes=extra_includes, xip_relocate=xip_relocate
     )
 
-  def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
+  def _compile_trisc(self, src: str, trisc_id: int, profiler: bool = True) -> CompiledKernel:
     stage = ("unpack", "math", "pack")[trisc_id]
     defines = [
       *_KERNEL_DEFINES,
@@ -283,7 +281,7 @@ class Compiler:
       f"-DPROCESSOR_INDEX={trisc_id + 2}",
       f"-DUCK_CHLKC_{stage.upper()}", f"-DNAMESPACE=chlkc_{stage}",
     ]
-    if PROFILER:
+    if PROFILER and profiler:
       defines += _PROFILE_DEFINES
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
@@ -421,13 +419,13 @@ def compile_cq_kernels() -> CompiledCQKernels:
   return CompiledCQKernels(
     prefetch_brisc=compiler._compile_dataflow(source_tag + _CQ_PREFETCH_SRC, "brisc", noc_index=0,
       extra_includes=_CQ_INC,
-      xip_relocate=True),
+      xip_relocate=True, profiler=False),
     dispatch_brisc=compiler._compile_dataflow(source_tag + _CQ_DISPATCH_SRC, "brisc", noc_index=1,
       extra_includes=_CQ_INC,
-      xip_relocate=True),
+      xip_relocate=True, profiler=False),
     dispatch_s_ncrisc=compiler._compile_dataflow(source_tag + _CQ_DISPATCH_S_SRC, "ncrisc", noc_index=1,
       extra_includes=_CQ_INC,
-      xip_relocate=True),
+      xip_relocate=True, profiler=False),
   )
 
 def _tile_size(fmt: int) -> int:

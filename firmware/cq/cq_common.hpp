@@ -8,12 +8,7 @@
 #include "internal/risc_attribs.h"
 #include "api/dataflow/dataflow_api.h"
 
-#include "internal/debug/sanitize.h"
-#include "api/debug/assert.h"
 #include <limits>
-
-// P100A build does not use idle-erisc early-exit/heartbeat hooks.
-#define CQ_HEARTBEAT_NOOP(...) do { } while (0)
 
 // The command queue read interface controls reads from the issue region, host owns the issue region write interface
 // Commands and data to send to device are pushed into the issue region
@@ -72,7 +67,6 @@ FORCE_INLINE void reset_worker_completion_stream_counts() {
 
 FORCE_INLINE uint32_t copy_words_to_l1_and_advance(
     uint32_t src_words_ptr, uint32_t num_words, uint32_t max_words, uint32_t* dst_words_ptr) {
-    ASSERT(num_words <= max_words);
     volatile tt_l1_ptr uint32_t* src_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src_words_ptr);
     for (uint32_t i = 0; i < num_words; ++i) {
         dst_words_ptr[i] = *src_ptr;
@@ -90,16 +84,13 @@ template <
 FORCE_INLINE void cq_noc_async_write_with_state(
     uint32_t src_addr, uint64_t dst_addr, uint32_t size = 0, uint32_t ndests = 1, uint8_t noc = noc_index) {
     if constexpr (wait) {
-        WAYPOINT("CNSW");
         while (!noc_cmd_buf_ready(noc, cmd_buf));
-        WAYPOINT("CNSD");
     }
 
     noc_write_with_state<DM_DEDICATED_NOC, cmd_buf, flags, CQ_NOC_send, CQ_NOC_wait, false>(
         noc, src_addr, dst_addr, size, ndests);
 
     if constexpr (send) {
-        DEBUG_SANITIZE_NOC_WRITE_TRANSACTION_FROM_STATE(noc, cmd_buf);
         noc_write_with_state<DM_DEDICATED_NOC, cmd_buf, CQ_NOC_sndl, send, CQ_NOC_wait, update_counters>(
             noc, src_addr, dst_addr, size, ndests);
     }
@@ -120,14 +111,11 @@ FORCE_INLINE void cq_noc_async_wwrite_with_state(
     uint32_t ndests = 1,
     uint8_t noc = noc_index) {
     if constexpr (wait) {
-        WAYPOINT("CNSW");
         while (!noc_cmd_buf_ready(noc, cmd_buf));
-        WAYPOINT("CNSD");
     }
     noc_wwrite_with_state<DM_DEDICATED_NOC, cmd_buf, flags, CQ_NOC_send, CQ_NOC_wait, false>(
         noc, src_addr, dst_noc_addr, dst_addr, size, ndests);
     if constexpr (send) {
-        DEBUG_SANITIZE_NOC_WRITE_TRANSACTION_FROM_STATE(noc, cmd_buf);
         noc_wwrite_with_state<DM_DEDICATED_NOC, cmd_buf, CQ_NOC_sndl, send, CQ_NOC_wait, update_counters>(
             noc, src_addr, dst_noc_addr, dst_addr, size, ndests);
     }
@@ -168,18 +156,11 @@ inline uint32_t cq_noc_async_write_with_state_any_len(
 template <enum CQNocFlags flags, bool mcast = false, bool linked = false, uint32_t cmd_buf = NCRISC_WR_CMD_BUF>
 FORCE_INLINE void cq_noc_async_write_init_state(
     uint32_t src_addr, uint64_t dst_addr, uint32_t size = 0, uint8_t noc = noc_index) {
-    WAYPOINT("CNIW");
-    uint32_t heartbeat = 0;
-    while (!noc_cmd_buf_ready(noc, cmd_buf)) {
-        CQ_HEARTBEAT_NOOP(heartbeat);
-    }
-    WAYPOINT("CNID");
+    while (!noc_cmd_buf_ready(noc, cmd_buf));
 
     constexpr enum CQNocCmdFlags cmd_flags = static_cast<enum CQNocCmdFlags>(
         (mcast ? CQ_NOC_CMD_FLAG_MCAST : 0x0) | (linked ? CQ_NOC_CMD_FLAG_LINKED : 0x0));
     constexpr uint32_t vc = mcast ? NOC_DISPATCH_MULTICAST_WRITE_VC : NOC_UNICAST_WRITE_VC;
-
-    DEBUG_SANITIZE_NO_LINKED_TRANSACTION(noc, mcast ? DEBUG_SANITIZE_NOC_MULTICAST : DEBUG_SANITIZE_NOC_UNICAST);
 
     noc_write_init_state<cmd_buf, cmd_flags>(noc, vc);
     cq_noc_async_write_with_state<flags, CQ_NOC_wait, CQ_NOC_send, cmd_buf>(src_addr, dst_addr, size);
@@ -189,18 +170,11 @@ FORCE_INLINE void cq_noc_async_write_init_state(
 template <enum CQNocFlags flags, bool mcast = false, bool linked = false, uint32_t cmd_buf = NCRISC_WR_CMD_BUF>
 FORCE_INLINE void cq_noc_async_wwrite_init_state(
     uint32_t src_addr, uint32_t dst_noc_addr, uint64_t dst_addr, uint32_t size = 0, uint8_t noc = noc_index) {
-    WAYPOINT("CNIW");
-    uint32_t heartbeat = 0;
-    while (!noc_cmd_buf_ready(noc, cmd_buf)) {
-        CQ_HEARTBEAT_NOOP(heartbeat);
-    }
-    WAYPOINT("CNID");
+    while (!noc_cmd_buf_ready(noc, cmd_buf));
 
     constexpr enum CQNocCmdFlags cmd_flags = static_cast<enum CQNocCmdFlags>(
         (mcast ? CQ_NOC_CMD_FLAG_MCAST : 0x0) | (linked ? CQ_NOC_CMD_FLAG_LINKED : 0x0));
     constexpr uint32_t vc = mcast ? NOC_DISPATCH_MULTICAST_WRITE_VC : NOC_UNICAST_WRITE_VC;
-
-    DEBUG_SANITIZE_NO_LINKED_TRANSACTION(noc, mcast ? DEBUG_SANITIZE_NOC_MULTICAST : DEBUG_SANITIZE_NOC_UNICAST);
 
     noc_write_init_state<cmd_buf, cmd_flags>(noc, vc);
     cq_noc_async_wwrite_with_state<flags, CQ_NOC_wait, CQ_NOC_send, cmd_buf>(
@@ -241,11 +215,9 @@ FORCE_INLINE void cb_wait_all_pages(uint32_t n) {
     // Mask that off to avoid a race between the sem count and terminate
     n &= 0x7fffffff;
 
-    WAYPOINT("TAPW");
     do {
         invalidate_l1_cache();
     } while ((*sem_addr & 0x7fffffff) != n);  // mask off terminate bit
-    WAYPOINT("TAPD");
 }
 
 template <
@@ -265,15 +237,11 @@ public:
         // Ensure last sem_inc has landed
         noc_async_atomic_barrier();
 
-        WAYPOINT("DAPW");
         // Use a wrapping compare here to compare distance
         // Required for trace which steals downstream credits and may make the value negative
-        uint32_t heartbeat = 0;
         do {
             invalidate_l1_cache();
-            CQ_HEARTBEAT_NOOP(heartbeat);
         } while (wrap_gt(n, additional_count + *sem_addr));
-        WAYPOINT("DAPD");
         additional_count -= n;
     }
 
@@ -287,48 +255,18 @@ public:
         // Mask that off to avoid a race between the sem count and terminate
         n &= 0x7fffffff;
 
-        WAYPOINT("TAPW");
         do {
             invalidate_l1_cache();
         } while (((additional_count + *sem_addr) & 0x7fffffff) != n);  // mask off terminate bit
-        WAYPOINT("TAPD");
     }
 
     // Inform the consumer that n pages are available.
     FORCE_INLINE void release_pages(uint32_t n, uint32_t writer_ptr = 0, bool round_to_page_size = false) {
-#if ASSERT_ENABLED
-        if constexpr (buffer_page_size != 0) {
-            constexpr uint32_t buffer_size = buffer_end - buffer_base;
-            if constexpr (buffer_size != 0) {
-                if (n != 0) {
-                    // In the middle of writing a command, the writer pointer may not be aligned to the page size, but
-                    // must always be past the number of pages released.
-                    uint32_t adjusted_writer_ptr =
-                        round_to_page_size ? (writer_ptr - (writer_ptr - buffer_base) % buffer_page_size) : writer_ptr;
-                    uint64_t bytes = n * buffer_page_size;
-                    uint32_t expected = watch_released_ptr_ + bytes;
-                    if (expected > buffer_end) {
-                        expected -= buffer_size;
-                    }
-                    // It's possible the writer_ptr wrapped and the expected pointer is at the very end of the buffer so
-                    // it hasn't wrapped yet.
-                    ASSERT((adjusted_writer_ptr == expected) || ((expected == buffer_end) && (adjusted_writer_ptr == buffer_base)));
-                    watch_released_ptr_ = expected;
-                }
-            }
-        }
-#endif
         noc_semaphore_inc(
             get_noc_addr_helper(downstream_noc_xy, get_semaphore<fd_core_type>(downstream_sem_id)), n, noc_idx);
     }
 
     uint32_t additional_count{0};
-
-#if ASSERT_ENABLED
-private:
-    // Pointer to the end of the last released page. Used for watcher assertions.
-    uint32_t watch_released_ptr_{buffer_base};
-#endif
 };
 
 // CBReader
@@ -360,11 +298,9 @@ public:
         // Mask that off to avoid a race between the sem count and terminate
         to_wait_for &= 0x7fffffff;
 
-        WAYPOINT("TAPW");
         do {
             invalidate_l1_cache();
         } while ((*sem_addr & 0x7fffffff) != to_wait_for);  // mask off terminate bit
-        WAYPOINT("TAPD");
     }
 
     // Return available space (in bytes) after data_ptr. This data will always be contiguous in memory and will never
@@ -397,13 +333,9 @@ protected:
             reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore<fd_core_type>(my_sem_id));
 
         if (local_count_ == upstream_count_) {
-            WAYPOINT("UAPW");
-            uint32_t heartbeat = 0;
             do {
                 invalidate_l1_cache();
-                CQ_HEARTBEAT_NOOP(heartbeat, 0);
             } while ((upstream_count_ = *sem_addr) == local_count_);
-            WAYPOINT("UAPD");
         }
 
         // Set a fence to limit how much is processed at once
@@ -505,11 +437,9 @@ private:
         // allows time for writes from that block to complete. Note: this is incorrect if writes can be sent out of
         // order. We should use transaction IDs instead in that case.
         if (released_prev_block_) {
-            WAYPOINT("CBRW");
             while (!wrap_ge(
                 NOC_STATUS_READ_REG(noc_index, NIU_MST_NONPOSTED_WR_REQ_SENT), this->block_noc_writes_to_clear_));
             ReleasePolicy::template release<noc_idx, noc_xy, sem_id>(cb_pages_per_block);
-            WAYPOINT("CBRD");
         } else {
             released_prev_block_ = true;
         }
@@ -571,7 +501,6 @@ public:
             cmd_ptr = cb_base;
             if (this->cb_fence_ == cb_end) {
                 // We hit the nail on the head, wrap the fence
-                ASSERT(length == 0);
                 this->cb_fence_ = cb_base;
                 // TODO eliminate usage of block_next_start_addr_ in this CB reader. rd_block_idx_ will point to the
                 // last block, not the first block, so the limit calculation in acquire_pages will be incorrect. We
@@ -591,8 +520,6 @@ template <uint32_t l1_to_local_cache_copy_chunk, uint32_t l1_cache_elements_roun
 FORCE_INLINE void careful_copy_from_l1_to_local_cache(
     volatile uint32_t tt_l1_ptr* l1_ptr, uint32_t count, uint32_t* l1_cache) {
     uint32_t n = 0;
-    ASSERT(l1_to_local_cache_copy_chunk == 6);
-    ASSERT(count <= l1_cache_elements_rounded);
     while (n < count) {
         uint32_t v0 = l1_ptr[n + 0];
         uint32_t v1 = l1_ptr[n + 1];

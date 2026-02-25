@@ -13,8 +13,6 @@
 #include "cq_fixed_config.hpp"
 #include "api/dataflow/dataflow_api.h"
 #include "internal/dataflow/dataflow_api_addrgen.h"
-#include "api/debug/assert.h"
-#include "api/debug/dprint.h"
 #include "cq_commands.hpp"
 #include "cq_common.hpp"
 #include "cq_relay.hpp"
@@ -145,13 +143,6 @@ constexpr uint32_t l1_cache_elements_rounded =
     ((l1_cache_elements + l1_to_local_cache_copy_chunk - 1) / l1_to_local_cache_copy_chunk) *
     l1_to_local_cache_copy_chunk;
 
-extern "C" {
-// These variables are used by triage to help report dispatcher state.
-volatile uint32_t last_wait_count = 0;
-volatile uint32_t last_wait_stream = 0;
-volatile uint32_t last_event;
-}
-
 static uint32_t go_signal_noc_data[max_num_go_signal_noc_data_entries];
 
 FORCE_INLINE volatile uint32_t* get_cq_completion_read_ptr() {
@@ -164,7 +155,6 @@ FORCE_INLINE volatile uint32_t* get_cq_completion_write_ptr() {
 
 FORCE_INLINE
 void completion_queue_reserve_back(uint32_t num_pages) {
-    WAYPOINT("QRBW");
     // Transfer pages are aligned
     uint32_t data_size_16B = num_pages * completion_queue_page_size_16B;
     uint32_t completion_rd_ptr_and_toggle;
@@ -185,8 +175,6 @@ void completion_queue_reserve_back(uint32_t num_pages) {
                 ? completion_rd_ptr - cq_write_interface.completion_fifo_wr_ptr
                 : (completion_queue_size_16B - (cq_write_interface.completion_fifo_wr_ptr - completion_rd_ptr));
     } while (data_size_16B > available_space);
-
-    WAYPOINT("QRBD");
 }
 
 // This fn expects NOC coords to be preprogrammed
@@ -226,13 +214,9 @@ void process_write_host_h() {
     // pages much simpler since we are always sending writing full pages (except for last page)
     uint64_t wlength = cmd->write_linear_host.length;
     bool is_event = cmd->write_linear_host.is_event;
-    // DPRINT << "process_write_host_h: " << length << ENDL();
     uint32_t data_ptr = cmd_ptr;
     cq_noc_async_write_init_state<CQ_NOC_sNdl>(0, pcie_noc_xy, 0);
     constexpr uint32_t max_batch_size = ~(dispatch_cb_page_size - 1);
-    if (is_event) {
-        last_event = ((uint32_t*)(data_ptr + sizeof(CQDispatchCmd)))[0];
-    }
     while (wlength != 0) {
         uint32_t length = (wlength > max_batch_size) ? max_batch_size : static_cast<uint32_t>(wlength);
         wlength -= length;
@@ -298,12 +282,6 @@ template <uint32_t preamble_size>
 void relay_to_next_cb(uint32_t data_ptr, uint64_t wlength) {
     static_assert(preamble_size == 0, "Dispatcher preamble size must be 0. This is not supported anymore with Fabric");
 
-    // DPRINT << "relay_to_next_cb: " << data_ptr << " " << dispatch_cb_reader.cb_fence << " " << wlength << ENDL();
-
-    // First page should be valid since it has the command
-    ASSERT(data_ptr <= dispatch_cb_end - dispatch_cb_page_size);
-    ASSERT(dispatch_cb_page_size <= dispatch_cb_reader.available_bytes(data_ptr));
-
     // regular write, inline writes, and atomic writes use different cmd bufs, so we can init state for each
     // TODO: Add support for stateful atomics. We can preserve state once cb_acquire_pages is changed to a free running
     // counter so we would only need to inc atomics downstream
@@ -315,8 +293,6 @@ void relay_to_next_cb(uint32_t data_ptr, uint64_t wlength) {
         uint32_t length = (wlength > max_batch_size) ? max_batch_size : static_cast<uint32_t>(wlength);
         wlength -= length;
         while (length > 0) {
-            ASSERT(downstream_cb_end > downstream_cb_data_ptr);
-
             dispatch_h_cb_writer.acquire_pages(1);
 
             uint32_t xfer_size;
@@ -336,7 +312,6 @@ void relay_to_next_cb(uint32_t data_ptr, uint64_t wlength) {
                     get_noc_addr_helper(downstream_noc_xy, downstream_cb_data_ptr),
                     xfer_size + preamble_size + not_end_of_cmd);
                 downstream_cb_data_ptr += preamble_size;
-                ASSERT(downstream_cb_data_ptr < downstream_cb_end);
             }
             // Get a page if needed
             if (xfer_size > dispatch_cb_reader.available_bytes(data_ptr)) {
@@ -415,8 +390,6 @@ void process_write_linear(uint32_t num_mcast_dests) {
     uint64_t dst_addr = cmd->write_linear.addr + write_offset[write_offset_index];
     uint64_t length = cmd->write_linear.length;
     uint32_t data_ptr = cmd_ptr + sizeof(CQDispatchCmdLarge);
-    // DPRINT << "process_write_linear noc_xy:0x" << HEX() << dst_noc << ", write_offset:" << write_offset_index << ",
-    // dst_addr:0x" << dst_addr << ", length:0x" << length << ", data_ptr:0x" << data_ptr << DEC() << ENDL();
     if (multicast) {
         cq_noc_async_wwrite_init_state<CQ_NOC_sNDl, true>(0, dst_noc, dst_addr);
     } else {
@@ -459,9 +432,6 @@ void process_write_paged() {
     uint32_t write_length = pages * page_size;
     auto addr_gen = TensorAccessor(tensor_accessor::make_interleaved_dspec<is_dram>(), base_addr, page_size);
     uint32_t dst_addr_offset = 0;  // Offset into page.
-
-    // DPRINT << "process_write_paged - pages: " << pages << " page_size: " << page_size
-    //        << " dispatch_cb_page_size: " << dispatch_cb_page_size << ENDL();
 
     while (write_length != 0) {
         // Transfer size is min(remaining_length, data_available_in_cb)
@@ -509,7 +479,6 @@ void process_write_packed(uint32_t flags, uint32_t* l1_cache) {
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
 
     uint32_t count = cmd->write_packed.count;
-    ASSERT(count <= (mcast ? packed_write_max_multicast_sub_cmds : packed_write_max_unicast_sub_cmds));
     constexpr uint32_t sub_cmd_size = sizeof(WritePackedSubCmd);
     // Copying in a burst is about a 30% net gain vs reading one value per loop below
     careful_copy_from_l1_to_local_cache<l1_to_local_cache_copy_chunk, l1_cache_elements_rounded>(
@@ -521,19 +490,14 @@ void process_write_packed(uint32_t flags, uint32_t* l1_cache) {
     uint32_t write_offset_index = cmd->write_packed.write_offset_index;
     uint32_t dst_addr = cmd->write_packed.addr + write_offset[write_offset_index];
 
-    ASSERT(xfer_size <= dispatch_cb_page_size);
-
     uint32_t data_ptr = cmd_ptr + sizeof(CQDispatchCmd) + count * sizeof(WritePackedSubCmd);
     data_ptr = round_up_pow2(data_ptr, L1_ALIGNMENT);
     uint32_t stride =
         (flags & CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE) ? 0 : round_up_pow2(xfer_size, L1_ALIGNMENT);
-    ASSERT(stride != 0 || data_ptr - cmd_ptr + xfer_size <= dispatch_cb_page_size);
 
     volatile uint32_t tt_l1_ptr* l1_addr = (uint32_t*)(cmd_ptr + sizeof(CQDispatchCmd));
     cq_noc_async_write_init_state<CQ_NOC_snDL, mcast>(0, dst_addr, xfer_size);
 
-    // DPRINT << "dispatch_write_packed: " << xfer_size << " " << stride << " " << data_ptr << " " << count << " " <<
-    // dst_addr << " " << ENDL();
     uint32_t writes = 0;
     uint32_t mcasts = 0;
     auto wait_for_barrier = [&]() {
@@ -546,9 +510,6 @@ void process_write_packed(uint32_t flags, uint32_t* l1_cache) {
         mcasts = 0;
         // Workaround mcast path reservation hangs by always waiting for a write
         // barrier before doing an mcast that isn't linked to a previous mcast.
-#ifdef TRACE_WRITE_BARRIERS
-        DeviceZoneScopedN("noc_async_write_barrier");
-#endif
         noc_async_write_barrier();
     };
     WritePackedSubCmd* sub_cmd_ptr = (WritePackedSubCmd*)l1_cache;
@@ -672,9 +633,6 @@ void process_write_packed_large(uint32_t* l1_cache) {
             writes = 0;
             // Workaround mcast path reservation hangs by always waiting for a write
             // barrier before doing an mcast that isn't linked to a previous mcast.
-#ifdef TRACE_WRITE_BARRIERS
-            DeviceZoneScopedN("noc_async_write_barrier");
-#endif
             noc_async_write_barrier();
         };
 
@@ -757,11 +715,6 @@ void process_write_packed_large(uint32_t* l1_cache) {
     cmd_ptr = data_ptr;
 }
 
-static uint32_t process_debug_cmd(uint32_t cmd_ptr) {
-    volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
-    return cmd_ptr + cmd->debug.stride;
-}
-
 FORCE_INLINE
 uint32_t stream_wrap_ge(uint32_t a, uint32_t b) {
     constexpr uint32_t shift = 32 - MEM_WORD_ADDR_WIDTH;
@@ -785,35 +738,22 @@ static void process_wait() {
     uint32_t stream = cmd->wait.stream;
 
     if (barrier) {
-        // DPRINT << " DISPATCH BARRIER\n";
-#ifdef TRACE_WRITE_BARRIERS
-        DeviceZoneScopedN("noc_async_write_barrier");
-#endif
         noc_async_write_barrier();
     }
 
-    WAYPOINT("PWW");
-    uint32_t heartbeat = 0;
     if (wait_memory) {
         uint32_t addr = cmd->wait.addr;
         volatile tt_l1_ptr uint32_t* sem_addr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(addr);
-        // DPRINT << " DISPATCH WAIT " << HEX() << addr << DEC() << " count " << count << ENDL();
         do {
             invalidate_l1_cache();
-            CQ_HEARTBEAT_NOOP(heartbeat);
         } while (!wrap_ge(*sem_addr, count));
     }
     if (wait_stream) {
-        last_wait_count = count;
-        last_wait_stream = stream;
         volatile uint32_t* sem_addr = reinterpret_cast<volatile uint32_t*>(
             STREAM_REG_ADDR(stream, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX));
-        // DPRINT << " DISPATCH WAIT STREAM " << HEX() << stream << DEC() << " count " << count << ENDL();
         do {
-            CQ_HEARTBEAT_NOOP(heartbeat);
         } while (!stream_wrap_ge(*sem_addr, count));
     }
-    WAYPOINT("PWD");
 
     if (clear_stream) {
         volatile uint32_t* sem_addr = reinterpret_cast<volatile uint32_t*>(
@@ -831,13 +771,6 @@ static void process_wait() {
             upstream_noc_index);
     }
 
-    cmd_ptr += sizeof(CQDispatchCmd);
-}
-
-static void process_delay_cmd() {
-    volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
-    uint32_t count = cmd->delay.delay;
-    for (volatile uint32_t i = 0; i < count; i++);
     cmd_ptr += sizeof(CQDispatchCmd);
 }
 
@@ -869,19 +802,15 @@ void process_go_signal_mcast_cmd() {
             (uint32_t)&aligned_go_signal_storage[storage_offset], dst_noc_addr_multicast, sizeof(uint32_t));
         noc_nonposted_writes_acked[noc_index] += num_dests;
 
-        WAYPOINT("WCW");
         while (!stream_wrap_ge(
             NOC_STREAM_READ_REG(stream, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX), wait_count)) {
         }
-        WAYPOINT("WCD");
         cq_noc_async_write_with_state<CQ_NOC_sndl, CQ_NOC_wait>(0, 0, 0);
         noc_nonposted_writes_num_issued[noc_index] += 1;
     } else {
-        WAYPOINT("WCW");
         while (!stream_wrap_ge(
             NOC_STREAM_READ_REG(stream, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX), wait_count)) {
         }
-        WAYPOINT("WCD");
     }
 
     *aligned_go_signal_storage = go_signal_value;
@@ -919,10 +848,6 @@ void process_notify_dispatch_s_go_signal_cmd() {
     uint32_t wait = cmd->notify_dispatch_s_go_signal.wait;
     // write barrier to wait before sending the go signal
     if (wait) {
-        // DPRINT << " DISPATCH_S_NOTIFY BARRIER\n";
-#ifdef TRACE_WRITE_BARRIERS
-        DeviceZoneScopedN("noc_async_write_barrier");
-#endif
         noc_async_write_barrier();
     }
     uint16_t index_bitmask = cmd->notify_dispatch_s_go_signal.index_bitmask;
@@ -953,19 +878,6 @@ void set_go_signal_noc_data() {
         cmd_ptr + sizeof(CQDispatchCmd), num_words, max_num_go_signal_noc_data_entries, go_signal_noc_data);
 }
 
-[[noreturn]] FORCE_INLINE void process_invalid_cmd(const char* dispatcher_name, uint32_t local_cmd_ptr) {
-    DPRINT << dispatcher_name << " invalid command:" << local_cmd_ptr << " "
-           << dispatch_cb_reader.available_bytes(local_cmd_ptr) << " " << dispatch_cb_base << " " << dispatch_cb_end
-           << " "
-           << "xx" << ENDL();
-    DPRINT << HEX() << *(uint32_t*)local_cmd_ptr << ENDL();
-    DPRINT << HEX() << *((uint32_t*)local_cmd_ptr + 1) << ENDL();
-    DPRINT << HEX() << *((uint32_t*)local_cmd_ptr + 2) << ENDL();
-    DPRINT << HEX() << *((uint32_t*)local_cmd_ptr + 3) << ENDL();
-    WAYPOINT("!CMD");
-    ASSERT(0);
-    __builtin_unreachable();
-}
 
 FORCE_INLINE void process_write_linear_h_by_variant() {
     if (is_h_variant) {
@@ -1001,12 +913,7 @@ FORCE_INLINE void process_exec_buf_end_by_variant() {
 
 FORCE_INLINE void process_set_write_offset_cmd(uint32_t& local_cmd_ptr) {
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)local_cmd_ptr;
-    // DPRINT << "write offset: " << cmd->set_write_offset.offset0 << " " << cmd->set_write_offset.offset1 << " "
-    //        << cmd->set_write_offset.offset2 << " host id " << cmd->set_write_offset.program_host_id << ENDL();
-    DeviceTimestampedData("runtime_host_id_dispatch", cmd->set_write_offset.program_host_id);
     uint32_t offset_count = cmd->set_write_offset.offset_count;
-
-    ASSERT(offset_count <= std::size(write_offset));
     uint32_t* cmd_write_offset = (uint32_t*)(local_cmd_ptr + sizeof(CQDispatchCmd));
 
     for (uint32_t i = 0; i < offset_count; i++) {
@@ -1017,40 +924,27 @@ FORCE_INLINE void process_set_write_offset_cmd(uint32_t& local_cmd_ptr) {
 
 static inline bool process_cmd_d(uint32_t& cmd_ptr, uint32_t* l1_cache) {
     bool done = false;
-re_run_command:
+
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
-    DeviceTimestampedData("process_cmd_d_dispatch", (uint32_t)cmd->base.cmd_id);
     switch (cmd->base.cmd_id) {
         case CQ_DISPATCH_CMD_WRITE_LINEAR:
-            WAYPOINT("DWB");
-            // DPRINT << "cmd_write_linear\n";
             process_write();
-            WAYPOINT("DWD");
             break;
 
         case CQ_DISPATCH_CMD_WRITE_LINEAR_H:
-            // DPRINT << "cmd_write_linear_h\n";
             process_write_linear_h_by_variant();
             break;
 
         case CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST:
-            // DPRINT << "cmd_write_linear_h_host\n";
             process_write_linear_h_host_by_variant();
             break;
 
         case CQ_DISPATCH_CMD_WRITE_PAGED:
-            // DPRINT << "cmd_write_paged is_dram: " << (uint32_t)cmd->write_paged.is_dram << ENDL();
             process_write_paged_by_target(cmd->write_paged.is_dram);
             break;
 
         case CQ_DISPATCH_CMD_WRITE_PACKED: {
-            // DPRINT << "cmd_write_packed" << ENDL();
             uint32_t flags = cmd->write_packed.flags;
-            // Must match unpacking code in tt_metal/impl/profiler/profiler.cpp.
-            uint32_t data = ((flags & CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_TYPE_MASK) >>
-                             (CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT - 1)) |
-                            bool(flags & CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_MCAST);
-            DeviceTimestampedData("packed_data_dispatch", data);
             if (flags & CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_MCAST) {
                 process_write_packed<true, CQDispatchWritePackedMulticastSubCmd>(flags, l1_cache);
             } else {
@@ -1059,49 +953,27 @@ re_run_command:
         } break;
 
         case CQ_DISPATCH_NOTIFY_SUBORDINATE_GO_SIGNAL:
-            // DPRINT << "cmd_notify_dispatch_s_go_signal" << ENDL();
             process_notify_dispatch_s_go_signal_cmd();
             break;
 
         case CQ_DISPATCH_CMD_WRITE_PACKED_LARGE:
-            // DPRINT << "cmd_write_packed_large" << ENDL();
-            // Must match unpacking code in tt_metal/impl/profiler/profiler.cpp.
-            DeviceTimestampedData("packed_large_data_dispatch", cmd->write_packed_large.type);
             process_write_packed_large(l1_cache);
             break;
 
         case CQ_DISPATCH_CMD_WAIT:
-            // DPRINT << "cmd_wait" << ENDL();
             process_wait();
             break;
 
-        case CQ_DISPATCH_CMD_SINK: DPRINT << "cmd_sink" << ENDL(); break;
-
-        case CQ_DISPATCH_CMD_DEBUG:
-            DPRINT << "cmd_debug" << ENDL();
-            cmd_ptr = process_debug_cmd(cmd_ptr);
-            goto re_run_command;
-            break;
-
-        case CQ_DISPATCH_CMD_DELAY:
-            DPRINT << "cmd_delay" << ENDL();
-            process_delay_cmd();
-            break;
-
         case CQ_DISPATCH_CMD_EXEC_BUF_END:
-            // DPRINT << "cmd_exec_buf_end\n";
             process_exec_buf_end_by_variant();
             break;
 
         case CQ_DISPATCH_CMD_SEND_GO_SIGNAL:
-            // DPRINT << "cmd_go_send_go_signal" << ENDL();
             process_go_signal_mcast_cmd();
             break;
 
         case CQ_DISPATCH_SET_NUM_WORKER_SEMS:
-            // DPRINT << "cmd_set_num_worker_sems" << ENDL();
             // This command is only used by dispatch_s
-            ASSERT(0);
             cmd_ptr += sizeof(CQDispatchCmd);
             break;
 
@@ -1110,7 +982,6 @@ re_run_command:
         case CQ_DISPATCH_CMD_SET_WRITE_OFFSET: process_set_write_offset_cmd(cmd_ptr); break;
 
         case CQ_DISPATCH_CMD_TERMINATE:
-            // DPRINT << "dispatch terminate\n";
             if (is_d_variant && !is_h_variant) {
                 relay_to_next_cb<split_dispatch_page_preamble_size>(cmd_ptr, sizeof(CQDispatchCmd));
             }
@@ -1118,7 +989,7 @@ re_run_command:
             done = true;
             break;
 
-        default: process_invalid_cmd("dispatcher_d", cmd_ptr);
+        default: __builtin_unreachable();
     }
 
     return done;
@@ -1129,29 +1000,25 @@ static inline bool process_cmd_h(uint32_t& cmd_ptr) {
 
     volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)cmd_ptr;
 
-    DeviceTimestampedData("process_cmd_h_dispatch", (uint32_t)cmd->base.cmd_id);
     switch (cmd->base.cmd_id) {
         case CQ_DISPATCH_CMD_WRITE_LINEAR_H:
-            // DPRINT << "dispatch_h write_linear_h\n";
             process_write();
             break;
 
         case CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST:
-            // DPRINT << "dispatch_h linear_h_host\n";
             process_write_host_h();
             break;
 
         case CQ_DISPATCH_CMD_EXEC_BUF_END:
-            // DPRINT << "dispatch_h exec_buf_end\n";
             process_exec_buf_end_h();
             break;
+
         case CQ_DISPATCH_CMD_TERMINATE:
-            // DPRINT << "dispatch_h terminate\n";
             cmd_ptr += sizeof(CQDispatchCmd);
             done = true;
             break;
 
-        default: process_invalid_cmd("dispatcher_h", cmd_ptr);
+        default: __builtin_unreachable();
     }
 
     return done;
@@ -1159,7 +1026,6 @@ static inline bool process_cmd_h(uint32_t& cmd_ptr) {
 
 void kernel_main() {
     set_l1_data_cache<true>();
-    DPRINT << "dispatch_" << is_h_variant << is_d_variant << ": start" << ENDL();
 
     // Initialize local state of any additional nocs used instead of the default
     static_assert(my_noc_index != upstream_noc_index);
@@ -1189,12 +1055,8 @@ void kernel_main() {
         relay_client.init<my_noc_index, NCRISC_WR_CMD_BUF>(get_noc_addr_helper(downstream_noc_xy, 0));
     }
     bool done = false;
-    uint32_t heartbeat = 0;
     while (!done) {
         dispatch_cb_reader.wait_for_available_data_and_release_old_pages(cmd_ptr);
-
-        DeviceZoneScopedN("CQ-DISPATCH");
-        CQ_HEARTBEAT_NOOP(heartbeat);
 
         done = is_d_variant ? process_cmd_d(cmd_ptr, l1_cache) : process_cmd_h(cmd_ptr);
 
@@ -1214,6 +1076,5 @@ void kernel_main() {
     if (is_h_variant && !is_d_variant) {
         relay_client.template teardown<upstream_noc_index, upstream_noc_xy, upstream_dispatch_cb_sem_id>();
     }
-    // DPRINT << "dispatch_" << is_h_variant << is_d_variant << ": out" << ENDL();
     set_l1_data_cache<false>();
 }
