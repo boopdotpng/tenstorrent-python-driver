@@ -182,12 +182,12 @@ _FW_TARGETS = [
    ["-mcpu=tt-bh-tensix"], "-O3", []),
 ]
 
-_fw_cache: dict[str, CompiledFirmware] | None = None
+_fw_cache_by_mode: dict[bool, dict[str, CompiledFirmware]] = {}
 
 def compile_firmware() -> dict[str, CompiledFirmware]:
-  global _fw_cache
-  if _fw_cache is not None:
-    return _fw_cache
+  mode = PROFILER
+  if mode in _fw_cache_by_mode:
+    return _fw_cache_by_mode[mode]
   _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
   cc = _SFPI / "riscv-tt-elf-g++"
@@ -197,6 +197,8 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
   ]
+  if PROFILER:
+    common_defines += _PROFILE_DEFINES
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
   fw_src_dir = _REPO / "firmware"
@@ -207,7 +209,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     ld = ld_dir / f"firmware_{target}.ld"
     assert ld.is_file(), f"missing linker script: {ld}"
     src = fw_src_dir / src_name
-    cache_target = f"{target}_firmware"
+    cache_target = f"{target}_firmware" + ("_prof" if PROFILER else "")
     key = _source_target_cache_key(src.read_text(), cache_target)
     elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
     compile_args = [
@@ -229,7 +231,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     text_base = segs[0].paddr
     result[target] = CompiledFirmware(elf_path=elf, segments=segs, text_base=text_base)
 
-  _fw_cache = result
+  _fw_cache_by_mode[mode] = result
   return result
 
 class Compiler:
