@@ -188,7 +188,7 @@ _FW_TARGETS = [
    ["-mcpu=tt-bh-tensix"], "-O3", []),
 ]
 
-def compile_firmware() -> dict[str, CompiledFirmware]:
+def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
   _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
   cc = _SFPI / "riscv-tt-elf-g++"
@@ -198,7 +198,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
   ]
-  if PROFILER:
+  if profile:
     common_defines += _PROFILE_DEFINES
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
@@ -210,7 +210,7 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     ld = ld_dir / f"firmware_{target}.ld"
     assert ld.is_file(), f"missing linker script: {ld}"
     src = fw_src_dir / src_name
-    cache_target = f"{target}_firmware" + ("_prof" if PROFILER else "")
+    cache_target = f"{target}_firmware" + ("_prof" if profile else "")
     key = _source_target_cache_key(src.read_text(), cache_target)
     elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
     compile_args = [
@@ -241,7 +241,7 @@ class Compiler:
     self._ckernel = ckernel
     self._includes = ["-I.", f"-I{_CKERNEL_DEFAULTS}", *_INCLUDES]
     assert self._cc.is_file(), f"missing compiler: {self._cc}\nDownload toolchain to {_DEPS / 'sfpi-toolchain'}"
-    self._fw = compile_firmware()
+    self._fw = compile_firmware(profile=PROFILER)
 
   def compile_dataflow(self, src: str, processor: str, noc_index: int | None = None) -> CompiledKernel:
     if processor not in ("brisc", "ncrisc"):

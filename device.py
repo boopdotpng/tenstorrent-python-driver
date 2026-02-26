@@ -136,23 +136,6 @@ class CommonDevice:
     "trisc2": TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
   }
 
-  def _cores_needing_firmware(self, cores: list[Core]) -> list[Core]:
-    if not cores: return cores
-    # Quick check: if the first core needs firmware, all likely do (cold boot)
-    reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
-    cfg = TLBConfig(addr=reg_base, start=cores[0], end=cores[0], noc=0, mcast=False, mode=TLBMode.STRICT)
-    with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
-      def _core_ready(core: Core) -> bool:
-        cfg.start = cfg.end = core
-        cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
-        win.configure(cfg)
-        if win.read32(reg_off) & TensixMMIO.SOFT_RESET_BRISC: return False
-        cfg.addr, cfg.mode = 0, TLBMode.STRICT
-        win.configure(cfg)
-        return self._tile_ready(win)
-      if not _core_ready(cores[0]): return cores
-      return [c for c in cores[1:] if not _core_ready(c)]
-
   def upload_firmware(self):
     skip = self._firmware_skip_cores()
     # Always upload firmware for this process so the active runtime mode
@@ -160,7 +143,7 @@ class CommonDevice:
     cores = [core for core in self.worker_cores if core not in skip]
     if not cores: return
 
-    fw = compile_firmware()
+    fw = compile_firmware(profile=PROFILER)
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
 
     # Prepare upload spans: resolve local-mem segments to L1 scratch addresses
