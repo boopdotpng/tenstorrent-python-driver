@@ -393,8 +393,13 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
   dram_raw = device.dram._read_slow(dram_buf)
   page_size = dram_buf.page_size
   program_ids = {info["index"] + 1 for info in programs_info}
-  by_index = {info["index"]: {"index": info["index"], "name": info.get("name"), "cores": [list(c) for c in info["cores"]], "profiles": {}, "sources": info.get("sources", {})}
-              for info in programs_info}
+  by_index = {
+    info["index"]: {
+      "index": info["index"], "name": info.get("name"),
+      "cores": [list(c) for c in info["cores"]],
+      "profiles": {}, "sources": info.get("sources", {}),
+    } for info in programs_info
+  }
   debug = os.environ.get("TT_PROFILER_DEBUG") == "1"
   debug_left = 3
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import numpy as np
@@ -10,33 +11,9 @@ from compiler import CkernelConfig, Compiler, DataFormat, MathFidelity
 from device import DataflowLaunch, Device, Program
 from dram import DType
 
-# Matrix dimensions tuned for 10x11 core grid
-M, K, N = 5120, 4096, 5632
-Mt, Kt, Nt = M // 32, K // 32, N // 32
 TILE_BYTES = 32 * 32 * 2
 TILE_BYTES_F32 = 32 * 32 * 4
 L1_DATA_BYTES_AVAILABLE = 0x180000 - 0x037000
-
-NUM_ROWS, NUM_COLS = 10, 11
-PER_CORE_M = Mt // NUM_ROWS
-PER_CORE_N = Nt // NUM_COLS
-
-IN0_BLOCK_W = 2
-NUM_BLOCKS = Kt // IN0_BLOCK_W
-OUT_SUBBLOCK_H, OUT_SUBBLOCK_W = 2, 2
-OUT_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * OUT_SUBBLOCK_W
-IN0_NUM_SUBBLOCKS = PER_CORE_M // OUT_SUBBLOCK_H
-IN1_NUM_SUBBLOCKS = PER_CORE_N // OUT_SUBBLOCK_W
-IN0_BLOCK_NUM_TILES = PER_CORE_M * IN0_BLOCK_W
-IN0_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * IN0_BLOCK_W
-IN1_BLOCK_NUM_TILES = PER_CORE_N * IN0_BLOCK_W
-IN1_PER_CORE_W = PER_CORE_N
-
-CB0_PAGES = 2 * IN0_BLOCK_NUM_TILES
-CB1_PAGES = 2 * IN1_BLOCK_NUM_TILES
-CB16_PAGES = PER_CORE_M * PER_CORE_N
-CB24_PAGES = CB16_PAGES
-OUT_BLOCK_NUM_TILES = PER_CORE_M * PER_CORE_N
 
 IN0_SEND_SEM, IN0_RECV_SEM = 0, 1
 IN1_SEND_SEM, IN1_RECV_SEM = 2, 3
@@ -51,15 +28,61 @@ IO_DATA_FORMAT = DataFormat.Float16 if IO_MODE == "f16" else DataFormat.Float16_
 IO_DTYPE = DType.float16 if IO_MODE == "f16" else DType.bfloat16
 CB24_TILE_BYTES = TILE_BYTES_F32 if F32_ACC else TILE_BYTES
 
-L1_DATA_BYTES_NEEDED = (
-  (CB0_PAGES * TILE_BYTES)
-  + (CB1_PAGES * TILE_BYTES)
-  + max(CB16_PAGES * TILE_BYTES, CB24_PAGES * CB24_TILE_BYTES)
-)
-if L1_DATA_BYTES_NEEDED > L1_DATA_BYTES_AVAILABLE:
-  raise SystemExit(
-    f"L1 CB config exceeds data-buffer budget: need {L1_DATA_BYTES_NEEDED} bytes, have {L1_DATA_BYTES_AVAILABLE}"
-  )
+def ceil32(x):
+  return (x + 31) & ~31
+
+
+def _divisors(n):
+  divs = []
+  for i in range(1, int(n**0.5) + 1):
+    if n % i == 0:
+      divs.append(i)
+      if i != n // i:
+        divs.append(n // i)
+  return sorted(divs)
+
+
+def _solve_grid(Mt, Kt, Nt, max_cores, num_rows):
+  """Find best (num_cols, in0_block_w, sub_h, sub_w) for fixed num_rows.
+
+  Jointly optimizes grid columns, K-dimension block width, and subblock size
+  to maximize throughput. Score: cols*bw (balances parallelism vs sync overhead),
+  then cols (prefer more cores), then subblock area (less loop overhead).
+  """
+  pcm = Mt // num_rows
+  kt_divs = _divisors(Kt)
+  best = None  # (score_tuple, cols, bw, sh, sw)
+  for cols in _divisors(Nt):
+    pcn = Nt // cols
+    if pcn < 2 or pcn % 2 != 0:
+      continue
+    if num_rows * cols > max_cores:
+      continue
+    for sh in range(1, 9):
+      for sw in range(1, 9):
+        if sh * sw > 8:
+          continue
+        if pcm % sh != 0 or pcn % sw != 0:
+          continue
+        max_bw = 0
+        for bw in kt_divs:
+          cb0 = 2 * pcm * bw * TILE_BYTES
+          cb1 = 2 * pcn * bw * TILE_BYTES
+          cb_out = pcm * pcn * max(TILE_BYTES, CB24_TILE_BYTES)
+          if cb0 + cb1 + cb_out > L1_DATA_BYTES_AVAILABLE:
+            continue
+          if bw > max_bw:
+            max_bw = bw
+        if max_bw == 0:
+          continue
+        score = (cols * max_bw, cols, sh * sw)
+        if best is None or score > best[0]:
+          best = (score, cols, max_bw, sh, sw)
+  if best is None:
+    raise SystemExit(f"No valid grid for Mt={Mt} Kt={Kt} Nt={Nt} num_rows={num_rows}")
+  _, cols, bw, sh, sw = best
+  return num_rows, cols, bw, sh, sw
+
 
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
 K_READER_SENDER = f"""
@@ -383,50 +406,53 @@ void kernel_main() {{
 }}
 """
 
-K_COMPUTE_F32_DEFINE = "#define FP32_DEST_ACC_EN 1\n" if F32_ACC else ""
-K_COMPUTE_PACK_INCLUDE = '#include "compute_kernel_api/pack.h"\n' if F32_ACC else ""
-K_COMPUTE_RELOAD_INIT = (
-  "copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_1, tt::CBIndex::c_24);"
-  if F32_ACC
-  else "copy_tile_to_dst_init_short(tt::CBIndex::c_24);"
-)
-K_COMPUTE_MM_SHORT = (
-  """mm_block_init_short_with_dt(
+
+def _compute_kernel(p):
+  """Generate compute kernel source from blocking parameters."""
+  f32_define = "#define FP32_DEST_ACC_EN 1\n" if F32_ACC else ""
+  pack_include = '#include "compute_kernel_api/pack.h"\n' if F32_ACC else ""
+  reload_init = (
+    "copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_1, tt::CBIndex::c_24);"
+    if F32_ACC
+    else "copy_tile_to_dst_init_short(tt::CBIndex::c_24);"
+  )
+  mm_short = (
+    """mm_block_init_short_with_dt(
             tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_24,
             transpose, out_subblock_w, out_subblock_h, in0_block_w);"""
-  if F32_ACC
-  else """mm_block_init_short(
+    if F32_ACC
+    else """mm_block_init_short(
             tt::CBIndex::c_0, tt::CBIndex::c_1,
             transpose, out_subblock_w, out_subblock_h, in0_block_w);"""
-)
-K_COMPUTE_PACK_CB16 = "PACK((pack_reconfig_data_format(tt::CBIndex::c_16)));" if F32_ACC else ""
-K_COMPUTE_PACK_CB24 = "PACK((pack_reconfig_data_format(tt::CBIndex::c_24)));" if F32_ACC else ""
+  )
+  pack_cb16 = "PACK((pack_reconfig_data_format(tt::CBIndex::c_16)));" if F32_ACC else ""
+  pack_cb24 = "PACK((pack_reconfig_data_format(tt::CBIndex::c_24)));" if F32_ACC else ""
 
-K_COMPUTE = f"""
+  return f"""
 #include <cstdint>
-{K_COMPUTE_F32_DEFINE}#define PACKER_L1_ACC 1
+{f32_define}#define PACKER_L1_ACC 1
 #include "compute_kernel_api/matmul.h"
-{K_COMPUTE_PACK_INCLUDE}#include "compute_kernel_api/tile_move_copy.h"
+{pack_include}#include "compute_kernel_api/tile_move_copy.h"
 #include "tools/profiler/kernel_profiler.hpp"
 
 namespace NAMESPACE {{
 void MAIN {{
-  constexpr uint32_t in0_block_w = {IN0_BLOCK_W};
+  constexpr uint32_t in0_block_w = {p['in0_block_w']};
 
-  constexpr uint32_t in0_num_subblocks = {IN0_NUM_SUBBLOCKS};
-  constexpr uint32_t in0_block_num_tiles = {IN0_BLOCK_NUM_TILES};
-  constexpr uint32_t in0_subblock_num_tiles = {IN0_SUBBLOCK_NUM_TILES};
+  constexpr uint32_t in0_num_subblocks = {p['in0_num_subblocks']};
+  constexpr uint32_t in0_block_num_tiles = {p['in0_block_num_tiles']};
+  constexpr uint32_t in0_subblock_num_tiles = {p['in0_subblock_num_tiles']};
 
-  constexpr uint32_t in1_num_subblocks = {IN1_NUM_SUBBLOCKS};
-  constexpr uint32_t in1_block_num_tiles = {IN1_BLOCK_NUM_TILES};
-  constexpr uint32_t in1_per_core_w = {IN1_PER_CORE_W};
+  constexpr uint32_t in1_num_subblocks = {p['in1_num_subblocks']};
+  constexpr uint32_t in1_block_num_tiles = {p['in1_block_num_tiles']};
+  constexpr uint32_t in1_per_core_w = {p['in1_per_core_w']};
 
-  constexpr uint32_t num_blocks = {NUM_BLOCKS};
+  constexpr uint32_t num_blocks = {p['num_blocks']};
 
-  constexpr uint32_t out_subblock_h = {OUT_SUBBLOCK_H};
-  constexpr uint32_t out_subblock_w = {OUT_SUBBLOCK_W};
-  constexpr uint32_t out_subblock_num_tiles = {OUT_SUBBLOCK_NUM_TILES};
-  constexpr uint32_t out_block_num_tiles = {OUT_BLOCK_NUM_TILES};
+  constexpr uint32_t out_subblock_h = {p['out_subblock_h']};
+  constexpr uint32_t out_subblock_w = {p['out_subblock_w']};
+  constexpr uint32_t out_subblock_num_tiles = {p['out_subblock_num_tiles']};
+  constexpr uint32_t out_block_num_tiles = {p['out_block_num_tiles']};
 
   constexpr uint32_t transpose = 0;
 
@@ -450,7 +476,7 @@ void MAIN {{
         tile_regs_acquire();
 
         if (enable_reload) {{
-          {K_COMPUTE_RELOAD_INIT}
+          {reload_init}
           cb_wait_front(tt::CBIndex::c_24, out_subblock_num_tiles);
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
@@ -458,7 +484,7 @@ void MAIN {{
           }}
           cb_pop_front(tt::CBIndex::c_24, out_subblock_num_tiles);
 
-          {K_COMPUTE_MM_SHORT}
+          {mm_short}
         }}
 
         #pragma GCC unroll 0
@@ -476,7 +502,7 @@ void MAIN {{
         if (last_out) {{
           cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
           tile_regs_wait();
-          {K_COMPUTE_PACK_CB16}
+          {pack_cb16}
           PACK((llk_pack_reconfig_l1_acc(0)));
           #pragma GCC unroll 0
           for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {{
@@ -492,7 +518,7 @@ void MAIN {{
           cb_reserve_back(tt::CBIndex::c_24, out_subblock_num_tiles);
           tile_regs_wait();
           if (block == 0) {{
-            {K_COMPUTE_PACK_CB24}
+            {pack_cb24}
             PACK((llk_pack_reconfig_l1_acc(0)));
           }} else if (block == 1) {{
             PACK((llk_pack_reconfig_l1_acc(1)));
@@ -524,12 +550,12 @@ void MAIN {{
 """
 
 
-def _build_grid(dispatchable_cores: list[tuple[int, int]]):
+def _build_grid(dispatchable_cores: list[tuple[int, int]], num_rows: int, num_cols: int):
   xs = sorted({x for x, _ in dispatchable_cores})
   ys = sorted({y for _, y in dispatchable_cores})
   core_set = set(dispatchable_cores)
-  cols = xs[:NUM_COLS]
-  rows = ys[:NUM_ROWS]
+  cols = xs[:num_cols]
+  rows = ys[:num_rows]
   grid = []
   for y in rows:
     row = []
@@ -562,9 +588,10 @@ def _device_bytes_to_f32(data: bytes, shape: tuple[int, ...]) -> np.ndarray:
   return u32.view(np.float32).reshape(shape)
 
 
-def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes):
+def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes, M: int, N: int, Mp: int, Np: int):
   c_ref = a @ b
-  c_got = _device_bytes_to_f32(c_bytes, (M, N))
+  c_full = _device_bytes_to_f32(c_bytes, (Mp, Np))
+  c_got = c_full[:M, :N]
   ref_flat = c_ref.reshape(-1)
   got_flat = c_got.reshape(-1)
   finite_mask = np.isfinite(got_flat)
@@ -580,10 +607,82 @@ def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes):
 
 
 def main():
+  if len(sys.argv) == 4:
+    M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+  elif len(sys.argv) == 1:
+    M, K, N = 5120, 4096, 5632
+  else:
+    raise SystemExit("Usage: matmul_peak.py [M K N]")
+  if M < 1 or K < 1 or N < 1:
+    raise SystemExit("M, K, N must be positive integers")
+
+  # Pad K, N to tile boundaries; ensure Nt is even and >= 2
+  Kp, Np = ceil32(K), ceil32(N)
+  if Np < 64:
+    Np = 64
+  Kt, Nt = Kp // 32, Np // 32
+  if Nt % 2:
+    Nt += 1
+    Np = Nt * 32
+
+  device = Device()
+  max_cores = len(device.dispatchable_cores)
+
+  # Fix NUM_ROWS to all available rows so grid = full columns (clean sorted prefix).
+  # Pad Mt to be divisible by num_avail_rows with PER_CORE_M >= 2 and even.
+  sorted_cores = sorted(device.dispatchable_cores, key=lambda xy: (xy[0], xy[1]))
+  avail_ys = sorted({y for _, y in sorted_cores})
+  num_avail_rows = len(avail_ys)
+  row_unit = num_avail_rows * 2  # ensures PCM is even and >= 2
+  Mp = ceil32(M)
+  Mt = Mp // 32
+  if Mt % row_unit != 0:
+    Mt = ((Mt + row_unit - 1) // row_unit) * row_unit
+    Mp = Mt * 32
+
+  NUM_ROWS, NUM_COLS, IN0_BLOCK_W, OUT_SUBBLOCK_H, OUT_SUBBLOCK_W = _solve_grid(
+    Mt, Kt, Nt, max_cores, num_avail_rows
+  )
+  OUT_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * OUT_SUBBLOCK_W
+  NUM_BLOCKS = Kt // IN0_BLOCK_W
+  PER_CORE_M = Mt // NUM_ROWS
+  PER_CORE_N = Nt // NUM_COLS
+
+  IN0_NUM_SUBBLOCKS = PER_CORE_M // OUT_SUBBLOCK_H
+  IN1_NUM_SUBBLOCKS = PER_CORE_N // OUT_SUBBLOCK_W
+  IN0_BLOCK_NUM_TILES = PER_CORE_M * IN0_BLOCK_W
+  IN0_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * IN0_BLOCK_W
+  IN1_BLOCK_NUM_TILES = PER_CORE_N * IN0_BLOCK_W
+  IN1_PER_CORE_W = PER_CORE_N
+  OUT_BLOCK_NUM_TILES = PER_CORE_M * PER_CORE_N
+
+  CB0_PAGES = 2 * IN0_BLOCK_NUM_TILES
+  CB1_PAGES = 2 * IN1_BLOCK_NUM_TILES
+  CB16_PAGES = PER_CORE_M * PER_CORE_N
+  CB24_PAGES = CB16_PAGES
+
+  K_COMPUTE = _compute_kernel({
+    'in0_block_w': IN0_BLOCK_W,
+    'in0_num_subblocks': IN0_NUM_SUBBLOCKS,
+    'in0_block_num_tiles': IN0_BLOCK_NUM_TILES,
+    'in0_subblock_num_tiles': IN0_SUBBLOCK_NUM_TILES,
+    'in1_num_subblocks': IN1_NUM_SUBBLOCKS,
+    'in1_block_num_tiles': IN1_BLOCK_NUM_TILES,
+    'in1_per_core_w': IN1_PER_CORE_W,
+    'num_blocks': NUM_BLOCKS,
+    'out_subblock_h': OUT_SUBBLOCK_H,
+    'out_subblock_w': OUT_SUBBLOCK_W,
+    'out_subblock_num_tiles': OUT_SUBBLOCK_NUM_TILES,
+    'out_block_num_tiles': OUT_BLOCK_NUM_TILES,
+  })
+
+  padded = (M != Mp or K != Kp or N != Np)
   print(
     f"Matmul Peak (4-role split): C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] "
     f"({IO_MODE} io, {'fp32' if F32_ACC else 'mixed'} accum, HiFi2)"
   )
+  if padded:
+    print(f"  padded: A[{Mp},{Kp}] @ B[{Kp},{Np}] -> C[{Mp},{Np}]")
   print(f"  Mt={Mt} Kt={Kt} Nt={Nt} grid={NUM_ROWS}x{NUM_COLS}")
   print(f"  per_core_M={PER_CORE_M} per_core_N={PER_CORE_N} in0_block_w={IN0_BLOCK_W} num_blocks={NUM_BLOCKS}")
   print(f"  subblock: {OUT_SUBBLOCK_H}h x {OUT_SUBBLOCK_W}w = {OUT_SUBBLOCK_NUM_TILES} tiles")
@@ -609,13 +708,11 @@ def main():
   writer_recv = compiler.compile_dataflow(K_WRITER_RECV, processor="brisc")
   compute = compiler.compile_compute(K_COMPUTE)
 
-  device = Device()
-  num_cores = len(device.dispatchable_cores)
-  print(f"Device: {num_cores} dispatchable cores")
-  assert num_cores >= NUM_ROWS * NUM_COLS, f"need {NUM_ROWS * NUM_COLS} cores, have {num_cores}"
+  print(f"Device: {max_cores} dispatchable cores")
+  assert max_cores >= NUM_ROWS * NUM_COLS, f"need {NUM_ROWS * NUM_COLS} cores, have {max_cores}"
 
   try:
-    grid, cols, rows = _build_grid(device.dispatchable_cores)
+    grid, cols, rows = _build_grid(device.dispatchable_cores, NUM_ROWS, NUM_COLS)
     active_cores = [grid[r][c] for r in range(NUM_ROWS) for c in range(NUM_COLS)]
     print(f"Grid columns: {cols}")
     print(f"Grid rows: {rows}")
@@ -623,23 +720,35 @@ def main():
     west_cols = [x for x in cols if x < 8]
     east_cols = [x for x in cols if x >= 10]
 
+    # Generate input data — pad to tile boundaries if needed
     rng_a = np.random.default_rng(42)
     rng_b = np.random.default_rng(123)
     a_src = rng_a.uniform(-0.5, 0.5, size=(M, K)).astype(np.float16)
     b_src = rng_b.uniform(-0.5, 0.5, size=(K, N)).astype(np.float16)
-    a_bytes = _f16_to_device_bytes(a_src)
-    b_bytes = _f16_to_device_bytes(b_src)
-    a_ref = _device_bytes_to_f32(a_bytes, (M, K))
-    b_ref = _device_bytes_to_f32(b_bytes, (K, N))
+
+    if padded:
+      a_padded = np.zeros((Mp, Kp), dtype=np.float16)
+      a_padded[:M, :K] = a_src
+      b_padded = np.zeros((Kp, Np), dtype=np.float16)
+      b_padded[:K, :N] = b_src
+      a_bytes = _f16_to_device_bytes(a_padded)
+      b_bytes = _f16_to_device_bytes(b_padded)
+    else:
+      a_bytes = _f16_to_device_bytes(a_src)
+      b_bytes = _f16_to_device_bytes(b_src)
+
+    # Reference uses quantized original (unpadded) data
+    a_ref = _device_bytes_to_f32(_f16_to_device_bytes(a_src), (M, K))
+    b_ref = _device_bytes_to_f32(_f16_to_device_bytes(b_src), (K, N))
 
     a_buf = device.dram.alloc_write(
-      a_bytes, name="A", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(M, K)
+      a_bytes, name="A", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(Mp, Kp)
     )
     b_buf = device.dram.alloc_write(
-      b_bytes, name="B", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(K, N)
+      b_bytes, name="B", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(Kp, Np)
     )
     c_buf = device.dram.alloc(
-      TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(M, N)
+      TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(Mp, Np)
     )
 
     core_to_rc = {grid[r][c]: (r, c) for r in range(NUM_ROWS) for c in range(NUM_COLS)}
@@ -761,7 +870,7 @@ def main():
     print(f"\nAvg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
     print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS (HiFi2, {NUM_ROWS * NUM_COLS} cores)")
     c_rm = device.dram.read(c_buf)
-    _validate_matmul(a_ref, b_ref, c_rm)
+    _validate_matmul(a_ref, b_ref, c_rm, M, N, Mp, Np)
 
   finally:
     device.close()

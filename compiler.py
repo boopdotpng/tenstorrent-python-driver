@@ -101,6 +101,14 @@ _CQ_PREFETCH_SRC = (_CQ_SRC_DIR / "cq_prefetch.cpp").read_text()
 _CQ_DISPATCH_SRC = (_CQ_SRC_DIR / "cq_dispatch.cpp").read_text()
 _CQ_DISPATCH_S_SRC = (_CQ_SRC_DIR / "cq_dispatch_subordinate.cpp").read_text()
 
+def _cq_dependency_hash() -> str:
+  files = sorted(
+    path for path in _CQ_SRC_DIR.iterdir()
+    if path.suffix in (".h", ".hpp", ".c", ".cc", ".cpp")
+  )
+  payload = "".join(f"{path.name}\0{path.read_text()}\0" for path in files)
+  return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
 def _hash_default_ckernel_headers() -> str:
   h = hashlib.sha256()
   for name in (
@@ -415,8 +423,8 @@ class CompiledCQKernels:
 
 def compile_cq_kernels() -> CompiledCQKernels:
   compiler = Compiler()
-  cfg_hash = hashlib.sha256((_CQ_SRC_DIR / "cq_fixed_config.hpp").read_bytes()).hexdigest()[:16]
-  source_tag = f"// cq_fixed_config={cfg_hash}\n"
+  dep_hash = _cq_dependency_hash()
+  source_tag = f"// cq_deps={dep_hash}\n"
 
   return CompiledCQKernels(
     prefetch_brisc=compiler._compile_dataflow(source_tag + _CQ_PREFETCH_SRC, "brisc", noc_index=0,
