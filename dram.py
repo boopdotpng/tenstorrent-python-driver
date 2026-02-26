@@ -2,7 +2,6 @@ import os, mmap, fcntl, ctypes
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 from defs import (
   DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn,
   PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES, Core, DramTile,
@@ -172,12 +171,10 @@ void kernel_main() {
 }
 """
 
-@lru_cache(maxsize=1)
 def _drain_kernel():
   from compiler import Compiler
   return Compiler()._compile_dataflow(_DRAIN_KERNEL_SRC, "ncrisc", noc_index=0, profiler=False)
 
-@lru_cache(maxsize=1)
 def _fill_kernel():
   from compiler import Compiler
   return Compiler()._compile_dataflow(_FILL_KERNEL_SRC, "ncrisc", noc_index=0, profiler=False)

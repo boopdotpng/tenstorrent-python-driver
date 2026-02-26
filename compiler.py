@@ -160,8 +160,6 @@ def _run(exe: Path, args: list[str], cwd: Path):
 
 def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
                              prepare: PrepareFn = None):
-  if cache_elf.is_file():
-    return
   build = Path(tempfile.mkdtemp(prefix=tmp_prefix))
   try:
     if prepare is not None:
@@ -190,12 +188,7 @@ _FW_TARGETS = [
    ["-mcpu=tt-bh-tensix"], "-O3", []),
 ]
 
-_fw_cache_by_mode: dict[bool, dict[str, CompiledFirmware]] = {}
-
 def compile_firmware() -> dict[str, CompiledFirmware]:
-  mode = PROFILER
-  if mode in _fw_cache_by_mode:
-    return _fw_cache_by_mode[mode]
   _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
   cc = _SFPI / "riscv-tt-elf-g++"
@@ -239,7 +232,6 @@ def compile_firmware() -> dict[str, CompiledFirmware]:
     text_base = segs[0].paddr
     result[target] = CompiledFirmware(elf_path=elf, segments=segs, text_base=text_base)
 
-  _fw_cache_by_mode[mode] = result
   return result
 
 class Compiler:
@@ -319,9 +311,6 @@ class Compiler:
       },
     )
     cached_elf = _KERNEL_CACHE_DIR / f"{target}-{key[:16]}.elf"
-    if cached_elf.is_file():
-      xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
-      return CompiledKernel(xip=xip, xip_text_bytes=text_size)
     mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
            ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
     fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
