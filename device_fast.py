@@ -515,9 +515,13 @@ class FastDevice(DeviceBase):
       )
 
   def run(self):
-    if not self._exec_list: return
+    if not self._exec_list:
+      self.last_timing = None
+      return self.last_profile
 
     self.last_profile = None
+    program_count = len(self._exec_list)
+    t_run_start = time.perf_counter()
     programs_info = self._profile_programs_info()
     if PROFILER:
       self._enqueue_profiler_init()
@@ -546,12 +550,23 @@ class FastDevice(DeviceBase):
 
     self._cq.enqueue_host_event(self._event_id)
     self._cq.flush()
+    t_compute_start = time.perf_counter()
     try:
       self._cq.wait_host_event(self._event_id, timeout_s=10.0)
     except TimeoutError:
       if PROFILER and last_cores is not None:
         self._dump_profiler_timeout_state(last_cores)
       raise
+    t_end = time.perf_counter()
+    total_s = t_end - t_run_start
+    compute_s = t_end - t_compute_start
+    dispatch_s = max(0.0, total_s - compute_s)
+    self.last_timing = {
+      "programs": program_count,
+      "total_s": total_s,
+      "dispatch_s": dispatch_s,
+      "compute_s": compute_s,
+    }
     self._event_id += 1
     if programs_info:
       import profiler

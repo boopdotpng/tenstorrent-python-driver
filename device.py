@@ -8,7 +8,7 @@ from tlb import TLBConfig, TLBWindow, TLBMode
 from helpers import USE_USB_DISPATCH, PROFILER, align_down, align_up, generate_jal_instruction, noc_xy
 from dram import DramAllocator
 
-CoreSpec = int | Literal["all"]
+CoreSpec = int | CoreList | Literal["all"]
 BankPort = tuple[int, int]
 ArgGen = Callable[[int, Core, int], list[int]]
 Rect = tuple[int, int, int, int]
@@ -449,6 +449,7 @@ class DeviceBase(CommonDevice):
       self._core_plans = self._build_core_plans()
     self._exec_list: list[Program] = []
     self.last_profile: dict | None = None
+    self.last_timing: dict[str, float | int] | None = None
     self.win = TLBWindow(self.fd, TLBSize.MiB_2)
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram, device=self, enable_sysmem=enable_sysmem)
 
@@ -520,8 +521,22 @@ class DeviceBase(CommonDevice):
   def _resolve_core_plan(self, spec: CoreSpec) -> _CorePlan:
     if spec == "all":
       return self._core_plans["all"]
+    if isinstance(spec, list):
+      if not spec:
+        raise ValueError("program.cores list must be non-empty")
+      dispatchable = set(self.dispatchable_cores)
+      bad = [core for core in spec if core not in dispatchable]
+      if bad:
+        raise ValueError(f"program.cores contains non-dispatchable cores: {bad[:4]}")
+      selected = sorted(set(spec), key=lambda xy: (xy[0], xy[1]))
+      rects = self._core_rects(selected)
+      return _CorePlan(
+        cores=selected,
+        rects=rects,
+        mcast_dests=[self._rect_to_noc_mcast(rect) for rect in rects],
+      )
     if not isinstance(spec, int):
-      raise TypeError("program.cores must be int or 'all'")
+      raise TypeError("program.cores must be int, CoreList, or 'all'")
     if spec < 1:
       raise ValueError("program.cores must be >= 1")
     if spec > len(self.dispatchable_cores):

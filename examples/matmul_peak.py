@@ -42,46 +42,71 @@ def _divisors(n):
   return sorted(divs)
 
 
-def _solve_grid(Mt, Kt, Nt, max_cores, num_rows):
-  """Find best (num_cols, in0_block_w, sub_h, sub_w) for fixed num_rows.
+def _solve_grid(Mt_base, Kt, Nt_base, max_cores, max_rows, max_cols):
+  """Pick grid + tiling using ceil-sharded per-core work.
 
-  Jointly optimizes grid columns, K-dimension block width, and subblock size
-  to maximize throughput. Score: cols*bw (balances parallelism vs sync overhead),
-  then cols (prefer more cores), then subblock area (less loop overhead).
+  Unlike strict divisor-only planning, this allows ragged global tile counts by
+  padding Mt/Nt to rows*per_core_M and cols*per_core_N.
   """
-  pcm = Mt // num_rows
   kt_divs = _divisors(Kt)
-  best = None  # (score_tuple, cols, bw, sh, sw)
-  for cols in _divisors(Nt):
-    pcn = Nt // cols
-    if pcn < 2 or pcn % 2 != 0:
-      continue
-    if num_rows * cols > max_cores:
-      continue
-    for sh in range(1, 9):
-      for sw in range(1, 9):
-        if sh * sw > 8:
-          continue
-        if pcm % sh != 0 or pcn % sw != 0:
-          continue
-        max_bw = 0
-        for bw in kt_divs:
-          cb0 = 2 * pcm * bw * TILE_BYTES
-          cb1 = 2 * pcn * bw * TILE_BYTES
-          cb_out = pcm * pcn * max(TILE_BYTES, CB24_TILE_BYTES)
-          if cb0 + cb1 + cb_out > L1_DATA_BYTES_AVAILABLE:
+  best = None
+  best_score = None
+
+  for rows in range(1, max_rows + 1):
+    for cols in range(1, max_cols + 1):
+      active = rows * cols
+      if active > max_cores:
+        continue
+
+      pcm = (Mt_base + rows - 1) // rows
+      pcn = (Nt_base + cols - 1) // cols
+      Mt = rows * pcm
+      Nt = cols * pcn
+
+      for sh in range(1, 9):
+        for sw in range(1, 9):
+          if sh * sw > 8:
             continue
-          if bw > max_bw:
-            max_bw = bw
-        if max_bw == 0:
-          continue
-        score = (cols * max_bw, cols, sh * sw)
-        if best is None or score > best[0]:
-          best = (score, cols, max_bw, sh, sw)
+          if pcm % sh != 0 or pcn % sw != 0:
+            continue
+
+          max_bw = 0
+          for bw in kt_divs:
+            cb0 = 2 * pcm * bw * TILE_BYTES
+            cb1 = 2 * pcn * bw * TILE_BYTES
+            cb_out = pcm * pcn * max(TILE_BYTES, CB24_TILE_BYTES)
+            if cb0 + cb1 + cb_out > L1_DATA_BYTES_AVAILABLE:
+              continue
+            if bw > max_bw:
+              max_bw = bw
+
+          if max_bw == 0:
+            continue
+
+          # Throughput proxy:
+          # - reward more cores and larger K blocks
+          # - strongly penalize tiny per-core output tiles (sync/mcast overhead)
+          # - lightly penalize extra Mt/Nt padding
+          out_tiles_per_core = pcm * pcn
+          per_core_work_bias = min(out_tiles_per_core, 16)
+          pad_work = Mt * Nt
+          score = (
+            active * max_bw * per_core_work_bias * per_core_work_bias,
+            -pad_work,
+            active * max_bw,
+            sh * sw,
+            active,
+          )
+          if best is None or score > best_score:
+            best = (rows, cols, max_bw, sh, sw, Mt, Nt)
+            best_score = score
+
   if best is None:
-    raise SystemExit(f"No valid grid for Mt={Mt} Kt={Kt} Nt={Nt} num_rows={num_rows}")
-  _, cols, bw, sh, sw = best
-  return num_rows, cols, bw, sh, sw
+    raise SystemExit(
+      f"No valid grid for Mt={Mt_base} Kt={Kt} Nt={Nt_base} "
+      f"max_rows={max_rows} max_cols={max_cols}"
+    )
+  return best
 
 
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
@@ -536,11 +561,11 @@ void MAIN {{
       in0_index_subblock_offset += in0_subblock_num_tiles;
     }}
 
-    if (block < num_blocks - 2) {{
+    if (num_blocks > 2 && block < num_blocks - 2) {{
       cb_wait_front(tt::CBIndex::c_24, out_block_num_tiles);
       cb_pop_front(tt::CBIndex::c_24, out_block_num_tiles);
     }}
-    if (block == num_blocks - 2) enable_reload = true;
+    if (num_blocks >= 2 && block == num_blocks - 2) enable_reload = true;
 
     cb_pop_front(tt::CBIndex::c_0, in0_block_num_tiles);
     cb_pop_front(tt::CBIndex::c_1, in1_block_num_tiles);
@@ -606,6 +631,21 @@ def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes, M: int, N: in
     raise SystemExit(f"Validation failed: PCC={pcc:.6f}, rel_l2={rel_l2:.6f}")
 
 
+def _extract_batch_timing(timing: dict | None):
+  if not timing:
+    return None
+  try:
+    programs = int(timing.get("programs", 0))
+    total_s = float(timing.get("total_s", 0.0))
+    dispatch_s = float(timing.get("dispatch_s", 0.0))
+    compute_s = float(timing.get("compute_s", 0.0))
+  except Exception:
+    return None
+  if programs <= 0 or total_s <= 0 or compute_s <= 0:
+    return None
+  return programs, total_s, dispatch_s, compute_s
+
+
 def main():
   if len(sys.argv) == 4:
     M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
@@ -616,33 +656,25 @@ def main():
   if M < 1 or K < 1 or N < 1:
     raise SystemExit("M, K, N must be positive integers")
 
-  # Pad K, N to tile boundaries; ensure Nt is even and >= 2
+  # Pad K/N to tile boundaries for I/O buffers.
   Kp, Np = ceil32(K), ceil32(N)
-  if Np < 64:
-    Np = 64
-  Kt, Nt = Kp // 32, Np // 32
-  if Nt % 2:
-    Nt += 1
-    Np = Nt * 32
+  if Np < 32:
+    Np = 32
+  Kt, Nt_base = Kp // 32, Np // 32
 
   device = Device()
   max_cores = len(device.dispatchable_cores)
 
-  # Fix NUM_ROWS to all available rows so grid = full columns (clean sorted prefix).
-  # Pad Mt to be divisible by num_avail_rows with PER_CORE_M >= 2 and even.
+  # Planner selects a rows x cols rectangle and per-core work using ceil sharding.
   sorted_cores = sorted(device.dispatchable_cores, key=lambda xy: (xy[0], xy[1]))
+  avail_xs = sorted({x for x, _ in sorted_cores})
   avail_ys = sorted({y for _, y in sorted_cores})
-  num_avail_rows = len(avail_ys)
-  row_unit = num_avail_rows * 2  # ensures PCM is even and >= 2
-  Mp = ceil32(M)
-  Mt = Mp // 32
-  if Mt % row_unit != 0:
-    Mt = ((Mt + row_unit - 1) // row_unit) * row_unit
-    Mp = Mt * 32
-
-  NUM_ROWS, NUM_COLS, IN0_BLOCK_W, OUT_SUBBLOCK_H, OUT_SUBBLOCK_W = _solve_grid(
-    Mt, Kt, Nt, max_cores, num_avail_rows
+  Mt_base = ceil32(M) // 32
+  NUM_ROWS, NUM_COLS, IN0_BLOCK_W, OUT_SUBBLOCK_H, OUT_SUBBLOCK_W, Mt, Nt = _solve_grid(
+    Mt_base, Kt, Nt_base, max_cores, len(avail_ys), len(avail_xs)
   )
+  Mp = Mt * 32
+  Np = Nt * 32
   OUT_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * OUT_SUBBLOCK_W
   NUM_BLOCKS = Kt // IN0_BLOCK_W
   PER_CORE_M = Mt // NUM_ROWS
@@ -832,7 +864,7 @@ def main():
       cbs=[0, 1, 16, 24],
       tile_size=TILE_BYTES,
       num_pages=CB0_PAGES,
-      cores=len(active_cores),
+      cores=active_cores,
       num_sems=NUM_SEMS,
       cb_config={
         0:  (CB0_PAGES, TILE_BYTES),
@@ -866,9 +898,24 @@ def main():
     elapsed_wall = elapsed_batch / TIMED_ITERS
 
     flops = 2.0 * M * N * K
+    timing = _extract_batch_timing(device.last_timing)
+    if timing is not None:
+      programs, total_s, dispatch_s, compute_s = timing
+      elapsed_compute = compute_s / programs
+      elapsed_dispatch = dispatch_s / programs
+      elapsed_total = total_s / programs
+      tflops_compute = flops / elapsed_compute / 1e12
+      print(f"\nAvg latency (compute): {elapsed_compute * 1e3:.3f} ms")
+      print(f"Throughput (compute):  {tflops_compute:.2f} TFLOPS (HiFi2, {NUM_ROWS * NUM_COLS} cores)")
+      print(f"Avg latency (dispatch): {elapsed_dispatch * 1e3:.3f} ms")
+      print(f"Avg latency (total):    {elapsed_total * 1e3:.3f} ms")
+      if programs != TIMED_ITERS:
+        print(f"  note: runtime reported {programs} program(s) for {TIMED_ITERS} queued timed iter(s)")
+    else:
+      print("\nCompute-time metric unavailable from runtime timing.")
     tflops_wall = flops / elapsed_wall / 1e12
-    print(f"\nAvg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
-    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS (HiFi2, {NUM_ROWS * NUM_COLS} cores)")
+    print(f"Avg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
+    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS")
     c_rm = device.dram.read(c_buf)
     _validate_matmul(a_ref, b_ref, c_rm, M, N, Mp, Np)
 

@@ -27,11 +27,12 @@ class SlowDevice(DeviceBase):
           raise TimeoutError(f"timeout waiting for core ({x}, {y})")
         time.sleep(0.0002)
 
-  def _run_single(self, program: Program):
+  def _run_single(self, program: Program) -> tuple[float, float]:
     plan = self._resolve_core_plan(program.cores)
     cores = plan.cores
     if not cores:
       raise ValueError("program has no cores")
+    t_dispatch_start = time.perf_counter()
     launch_roles = self._core_launches(program, cores)
 
     reset = GoMsg()
@@ -57,12 +58,34 @@ class SlowDevice(DeviceBase):
       self._mcast_write_rects(win, mcast_cfg, self._core_rects(group_cores), [(addr, payload)])
 
     self._mcast_write_rects(win, mcast_cfg, plan.rects, [(TensixL1.GO_MSG, go_blob)])
+    t_compute_start = time.perf_counter()
     self._wait_cores_done(cores, timeout_s=10.0)
+    t_end = time.perf_counter()
+    return t_compute_start - t_dispatch_start, t_end - t_compute_start
 
   def run(self):
+    if not self._exec_list:
+      self.last_timing = None
+      return self.last_profile
     self.last_profile = None
+    program_count = len(self._exec_list)
+    t_run_start = time.perf_counter()
+    dispatch_s = 0.0
+    compute_s = 0.0
     for p in self._exec_list:
-      self._run_single(p)
+      d_s, c_s = self._run_single(p)
+      dispatch_s += d_s
+      compute_s += c_s
+    total_s = time.perf_counter() - t_run_start
+    spill_s = total_s - (dispatch_s + compute_s)
+    if spill_s > 0:
+      dispatch_s += spill_s
+    self.last_timing = {
+      "programs": program_count,
+      "total_s": total_s,
+      "dispatch_s": dispatch_s,
+      "compute_s": compute_s,
+    }
     programs_info = self._profile_programs_info()
     if programs_info:
       import profiler
