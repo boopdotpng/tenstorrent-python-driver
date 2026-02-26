@@ -12,7 +12,6 @@ _SFPI = _DEPS / "sfpi-toolchain" / "bin"
 _CACHE = _REPO / ".metal-cache"
 _FW_CACHE_DIR = _CACHE / "firmware"
 _KERNEL_CACHE_DIR = _CACHE / "kernels"
-_CKERNEL_DEFAULTS = _REPO / "firmware" / "ckernel_defaults"
 
 Strs = list[str]
 
@@ -109,19 +108,70 @@ def _cq_dependency_hash() -> str:
   payload = "".join(f"{path.name}\0{path.read_text()}\0" for path in files)
   return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
+def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
+  in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
+  formats = [in_fmt] * 16 + [out_fmt] * 16
+  for cb_id, fmt in cfg.cb_data_formats:
+    if not (0 <= cb_id < 32):
+      raise ValueError(f"cb_data_formats has invalid cb_id {cb_id}; expected 0..31")
+    formats[cb_id] = fmt.value
+
+  tile_sizes = [_tile_size(fmt) for fmt in formats]
+  arr = lambda vals: ", ".join(str(v) for v in vals)
+  arr32 = lambda v: arr([v] * 32)
+  dst_sync_mode = "DstSync::SyncFull" if cfg.dst_full_sync else "DstSync::SyncHalf"
+  b = lambda v: "true" if v else "false"
+
+  return {
+    "chlkc_unpack_data_format.h":
+      "#pragma once\n"
+      "#include <cstdint>\n"
+      f"constexpr std::int32_t unpack_src_format[32] = {{{arr(formats)}}};\n"
+      f"constexpr std::int32_t unpack_dst_format[32] = {{{arr(formats)}}};\n",
+    "chlkc_pack_data_format.h":
+      "#pragma once\n"
+      f"constexpr unsigned char pack_src_format[32] = {{{arr(formats)}}};\n"
+      f"constexpr unsigned char pack_dst_format[32] = {{{arr(formats)}}};\n",
+    "chlkc_unpack_tile_dims.h":
+      "#pragma once\n"
+      "#include <cstdint>\n"
+      f"constexpr uint8_t unpack_tile_num_faces[32] = {{{arr32(4)}}};\n"
+      f"constexpr uint8_t unpack_partial_face[32] = {{{arr32(0)}}};\n"
+      f"constexpr uint8_t unpack_tile_face_r_dim[32] = {{{arr32(16)}}};\n"
+      f"constexpr uint8_t unpack_narrow_tile[32] = {{{arr32(0)}}};\n"
+      f"constexpr uint8_t unpack_tile_r_dim[32] = {{{arr32(32)}}};\n"
+      f"constexpr uint8_t unpack_tile_c_dim[32] = {{{arr32(32)}}};\n"
+      f"constexpr uint16_t unpack_tile_size[32] = {{{arr(tile_sizes)}}};\n",
+    "chlkc_pack_tile_dims.h":
+      "#pragma once\n"
+      "#include <cstdint>\n"
+      f"constexpr uint8_t pack_tile_num_faces[32] = {{{arr32(4)}}};\n"
+      f"constexpr uint8_t pack_partial_face[32] = {{{arr32(0)}}};\n"
+      f"constexpr uint8_t pack_tile_face_r_dim[32] = {{{arr32(16)}}};\n"
+      f"constexpr uint8_t pack_narrow_tile[32] = {{{arr32(0)}}};\n"
+      f"constexpr uint8_t pack_tile_r_dim[32] = {{{arr32(32)}}};\n"
+      f"constexpr uint8_t pack_tile_c_dim[32] = {{{arr32(32)}}};\n"
+      f"constexpr uint16_t pack_tile_size[32] = {{{arr(tile_sizes)}}};\n",
+    "chlkc_dst_accum_mode.h":
+      "#pragma once\n"
+      f"constexpr bool DST_ACCUM_MODE = {b(cfg.dst_accum_mode)};\n",
+    "chlkc_dst_sync_mode.h":
+      "#pragma once\n"
+      f"#define DST_SYNC_MODE {dst_sync_mode}\n",
+    "chlkc_math_fidelity.h":
+      "#pragma once\n"
+      "#include <cstdint>\n"
+      f"constexpr std::int32_t MATH_FIDELITY = {cfg.math_fidelity.value};\n",
+    "chlkc_math_approx_mode.h":
+      "#pragma once\n"
+      f"constexpr bool APPROX = {b(cfg.approx)};\n",
+  }
+
 def _hash_default_ckernel_headers() -> str:
   h = hashlib.sha256()
-  for name in (
-    "chlkc_unpack_data_format.h",
-    "chlkc_pack_data_format.h",
-    "chlkc_unpack_tile_dims.h",
-    "chlkc_pack_tile_dims.h",
-    "chlkc_dst_accum_mode.h",
-    "chlkc_dst_sync_mode.h",
-    "chlkc_math_fidelity.h",
-    "chlkc_math_approx_mode.h",
-  ):
-    h.update((_CKERNEL_DEFAULTS / name).read_bytes())
+  headers = _render_ckernel_headers(CkernelConfig())
+  for name in sorted(headers):
+    h.update(headers[name].encode())
   return h.hexdigest()
 
 _CKERNEL_DEFAULTS_HASH = _hash_default_ckernel_headers()
@@ -239,7 +289,7 @@ class Compiler:
     self._cc = _SFPI / "riscv-tt-elf-g++"
     self._objcopy = _SFPI / "riscv-tt-elf-objcopy"
     self._ckernel = ckernel
-    self._includes = ["-I.", f"-I{_CKERNEL_DEFAULTS}", *_INCLUDES]
+    self._includes = ["-I.", *_INCLUDES]
     assert self._cc.is_file(), f"missing compiler: {self._cc}\nDownload toolchain to {_DEPS / 'sfpi-toolchain'}"
     self._fw = compile_firmware(profile=PROFILER)
 
@@ -366,42 +416,8 @@ class Compiler:
         f'#define {macro}\n#include "defines_generated.h"\n#include <kernel_includes.hpp>\n')
 
   def _write_ckernel_headers(self, build: Path):
-    cfg = self._ckernel
-    if cfg.input_format != DataFormat.Float16_b or cfg.output_format != DataFormat.Float16_b or cfg.cb_data_formats:
-      in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
-      formats = [in_fmt] * 16 + [out_fmt] * 16
-      for cb_id, fmt in cfg.cb_data_formats:
-        if not (0 <= cb_id < 32):
-          raise ValueError(f"cb_data_formats has invalid cb_id {cb_id}; expected 0..31")
-        formats[cb_id] = fmt.value
-      tile_sizes = [_tile_size(f) for f in formats]
-      arr = lambda vals: ", ".join(str(v) for v in vals)
-      arr32 = lambda v: arr([v] * 32)
-      (build / "chlkc_unpack_data_format.h").write_text(
-        f"#pragma once\nconstexpr std::int32_t unpack_src_format[32] = {{{arr(formats)}}};\n"
-        f"constexpr std::int32_t unpack_dst_format[32] = {{{arr(formats)}}};\n")
-      (build / "chlkc_pack_data_format.h").write_text(
-        f"#pragma once\nconstexpr unsigned char pack_src_format[32] = {{{arr(formats)}}};\n"
-        f"constexpr unsigned char pack_dst_format[32] = {{{arr(formats)}}};\n")
-      dims = lambda prefix: (
-        f"constexpr uint8_t {prefix}_tile_num_faces[32] = {{{arr32(4)}}};\n"
-        f"constexpr uint8_t {prefix}_partial_face[32] = {{{arr32(0)}}};\n"
-        f"constexpr uint8_t {prefix}_tile_face_r_dim[32] = {{{arr32(16)}}};\n"
-        f"constexpr uint8_t {prefix}_narrow_tile[32] = {{{arr32(0)}}};\n"
-        f"constexpr uint8_t {prefix}_tile_r_dim[32] = {{{arr32(32)}}};\n"
-        f"constexpr uint8_t {prefix}_tile_c_dim[32] = {{{arr32(32)}}};\n"
-        f"constexpr uint16_t {prefix}_tile_size[32] = {{{arr(tile_sizes)}}};\n"
-      )
-      (build / "chlkc_unpack_tile_dims.h").write_text("#pragma once\n" + dims("unpack"))
-      (build / "chlkc_pack_tile_dims.h").write_text("#pragma once\n" + dims("pack"))
-    if cfg.dst_accum_mode:
-      (build / "chlkc_dst_accum_mode.h").write_text("constexpr bool DST_ACCUM_MODE = true;\n")
-    if cfg.dst_full_sync:
-      (build / "chlkc_dst_sync_mode.h").write_text("#define DST_SYNC_MODE DstSync::SyncFull\n")
-    if cfg.math_fidelity != MathFidelity.HiFi4:
-      (build / "chlkc_math_fidelity.h").write_text(f"constexpr std::int32_t MATH_FIDELITY = {cfg.math_fidelity.value};\n")
-    if cfg.approx:
-      (build / "chlkc_math_approx_mode.h").write_text("constexpr bool APPROX = true;\n")
+    for name, content in _render_ckernel_headers(self._ckernel).items():
+      (build / name).write_text(content)
 
 
 @dataclass(frozen=True)
