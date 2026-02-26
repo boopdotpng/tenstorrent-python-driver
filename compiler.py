@@ -1,4 +1,4 @@
-from helpers import pack_xip_elf, load_pt_load, PTLoad, PROFILER, hash16
+from helpers import pack_xip_elf, iter_pt_load, PTLoad, PROFILER, hash16
 from defs import TensixL1
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,9 +9,6 @@ import hashlib, re, shutil, subprocess, tempfile
 _DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
 _REPO = Path(__file__).resolve().parent
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
-_CACHE = _REPO / ".metal-cache"
-_FW_CACHE_DIR = _CACHE / "firmware"
-_KERNEL_CACHE_DIR = _CACHE / "kernels"
 
 Strs = list[str]
 
@@ -54,7 +51,7 @@ class CompiledKernel:
 
 @dataclass(frozen=True)
 class CompiledFirmware:
-  elf_path: Path             # path to the ELF on disk (in cache dir)
+  elf_bytes: bytes           # full linked ELF bytes
   segments: list[PTLoad]     # PT_LOAD segments for upload
   text_base: int             # where .text starts in L1
 
@@ -167,14 +164,6 @@ def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
       f"constexpr bool APPROX = {b(cfg.approx)};\n",
   }
 
-def _hash_default_ckernel_headers() -> str:
-  h = hashlib.sha256()
-  headers = _render_ckernel_headers(CkernelConfig())
-  for name in sorted(headers):
-    h.update(headers[name].encode())
-  return h.hexdigest()
-
-_CKERNEL_DEFAULTS_HASH = _hash_default_ckernel_headers()
 _PROFILE_DEFINES = [
   "-DPROFILE_KERNEL=1",
   f"-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC={TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC}",
@@ -208,8 +197,7 @@ def _run(exe: Path, args: list[str], cwd: Path):
         continue
       _zone_map[hash16(msg)] = (name, fpath, lineno)
 
-def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str,
-                             prepare: PrepareFn = None):
+def _compile_and_link(cc: Path, src: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str, prepare: PrepareFn = None) -> bytes:
   build = Path(tempfile.mkdtemp(prefix=tmp_prefix))
   try:
     if prepare is not None:
@@ -217,13 +205,9 @@ def _compile_and_link_cached(cc: Path, src: Path, cache_elf: Path, compile_args:
     _run(cc, [*compile_args, "-c", "-o", "out.o", str(src)], build)
     args = link_args(build) if callable(link_args) else link_args
     _run(cc, [*args, "-o", "out.elf"], build)
-    shutil.copy2(build / "out.elf", cache_elf)
+    return (build / "out.elf").read_bytes()
   finally:
     shutil.rmtree(build, ignore_errors=True)
-
-def _source_target_cache_key(source: str, target: str, meta: dict[str, object] | None = None) -> str:
-  payload = f"{target}\0{source}".encode() if not meta else repr((target, source, tuple(sorted(meta.items())))).encode()
-  return hashlib.sha256(payload).hexdigest()
 
 _FW_TARGETS = [
   ("brisc.cc", "brisc", ["-DCOMPILE_FOR_BRISC", "-DPROCESSOR_INDEX=0", "-DNOC_INDEX=1", "-DNOC_MODE=0"],
@@ -239,8 +223,6 @@ _FW_TARGETS = [
 ]
 
 def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
-  _FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
   cc = _SFPI / "riscv-tt-elf-g++"
   assert cc.is_file(), f"missing compiler: {cc}"
 
@@ -260,27 +242,23 @@ def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
     ld = ld_dir / f"firmware_{target}.ld"
     assert ld.is_file(), f"missing linker script: {ld}"
     src = fw_src_dir / src_name
-    cache_target = f"{target}_firmware" + ("_prof" if profile else "")
-    key = _source_target_cache_key(src.read_text(), cache_target)
-    elf = _FW_CACHE_DIR / f"{cache_target}-{key[:16]}.elf"
     compile_args = [
       opt, *_CFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay",
       *common_defines, *target_defs, *_INCLUDES,
     ]
     link_objs = [str(lib / "tmu-crt0.o"), "out.o", *(str(lib / o) for o in extra), str(lib / "substitutes.o")]
     fw_link_args = [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay", f"-T{ld}", *link_objs]
-    _compile_and_link_cached(
+    elf = _compile_and_link(
       cc=cc,
       src=src,
-      cache_elf=elf,
       compile_args=compile_args,
       link_args=fw_link_args,
       tmp_prefix=f"tt-fw-{target}-",
     )
 
-    segs = load_pt_load(elf)
+    segs = list(iter_pt_load(elf))
     text_base = segs[0].paddr
-    result[target] = CompiledFirmware(elf_path=elf, segments=segs, text_base=text_base)
+    result[target] = CompiledFirmware(elf_bytes=elf, segments=segs, text_base=text_base)
 
   return result
 
@@ -339,28 +317,6 @@ class Compiler:
 
   def _build(self, kern: str, target: str, defines: Strs, extra_objs: Strs, opt: str, trisc: bool, extra_includes: Strs | None = None,
              xip_relocate: bool = False) -> CompiledKernel:
-    _KERNEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    key = _source_target_cache_key(
-      kern,
-      target,
-      meta={
-        "defines": tuple(defines),
-        "extra_objs": tuple(extra_objs),
-        "opt": opt,
-        "trisc": trisc,
-        "extra_includes": tuple(extra_includes or []),
-        "xip_relocate": xip_relocate,
-        "ckernel_input_format": self._ckernel.input_format.value,
-        "ckernel_output_format": self._ckernel.output_format.value,
-        "ckernel_cb_data_formats": tuple((cb, fmt.value) for cb, fmt in self._ckernel.cb_data_formats),
-        "ckernel_math_fidelity": self._ckernel.math_fidelity.value,
-        "ckernel_approx": self._ckernel.approx,
-        "ckernel_dst_accum_mode": self._ckernel.dst_accum_mode,
-        "ckernel_dst_full_sync": self._ckernel.dst_full_sync,
-        "ckernel_defaults_hash": _CKERNEL_DEFAULTS_HASH,
-      },
-    )
-    cached_elf = _KERNEL_CACHE_DIR / f"{target}-{key[:16]}.elf"
     mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
            ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
     fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
@@ -370,7 +326,7 @@ class Compiler:
     fw_link_elf: Path | None = None
     def _prepare(build: Path):
       nonlocal fw_link_elf
-      fw_link_elf = self._weaken_fw_symbols(build, self._fw[target].elf_path)
+      fw_link_elf = self._weaken_fw_symbols(build, self._fw[target].elf_bytes)
       (build / "kernel_includes.hpp").write_text(kern)
       self._write_ckernel_headers(build)
       if trisc:
@@ -385,21 +341,20 @@ class Compiler:
         "-Wl,--emit-relocs", f"-Wl,--just-symbols={fw_link_elf}", *objs,
       ]
 
-    _compile_and_link_cached(
+    elf = _compile_and_link(
       cc=self._cc,
       src=fw_src,
-      cache_elf=cached_elf,
       compile_args=compile_args,
       link_args=_kernel_link_args,
       tmp_prefix=f"tt-{target}-",
       prepare=_prepare,
     )
-    xip, text_size = pack_xip_elf(cached_elf, xip_relocate=xip_relocate)
+    xip, text_size = pack_xip_elf(elf, xip_relocate=xip_relocate)
     return CompiledKernel(xip=xip, xip_text_bytes=text_size)
 
-  def _weaken_fw_symbols(self, build: Path, fw: Path) -> Path:
+  def _weaken_fw_symbols(self, build: Path, fw: bytes) -> Path:
     out = build / "fw.elf"
-    out.write_bytes(fw.read_bytes())
+    out.write_bytes(fw)
     _run(self._objcopy, [
       "--localize-symbol=_start",
       "--localize-symbol=main",

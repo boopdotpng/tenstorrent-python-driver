@@ -740,17 +740,13 @@ class DeviceBase(CommonDevice):
     num_cores = len(cores)
     sem_off = self._uniform_sem_off(program, launch_roles) if program.num_sems > 0 else None
     payloads: list[_CorePayload] = []
-    shared_cache: dict[tuple, tuple[int, bytes, bytes]] = {}
     for core_idx, role in enumerate(launch_roles):
       rta_sizes, rta = self._build_rta(
         program, role.launch, core_idx, role.core, num_cores, role.role_idx, role.role_count, sem_off=sem_off)
-      key = (role.launch.reader, role.launch.writer, *rta_sizes, dispatch_mode)
-      if key not in shared_cache:
-        shared_cache[key] = self._pack_kernel_shared(
-          program, reader=role.launch.reader, writer=role.launch.writer,
-          rta_sizes=rta_sizes, dispatch_mode=dispatch_mode, sem_off=sem_off,
-        )[:3]
-      shared_off, shared_img, launch_blob = shared_cache[key]
+      shared_off, shared_img, launch_blob = self._pack_kernel_shared(
+        program, reader=role.launch.reader, writer=role.launch.writer,
+        rta_sizes=rta_sizes, dispatch_mode=dispatch_mode, sem_off=sem_off,
+      )[:3]
       payloads.append(_CorePayload(
         core=role.core,
         rta=rta,
