@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from enum import Enum
 from defs import (
   DRAM_ALIGNMENT, DRAM_BARRIER_BASE, Dram, TLBSize, PinPagesIn, PinPagesOutExtended, UnpinPagesIn,
-  PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES, Core, DramTile,
+  PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES, Core, DramTile, align_up,
 )
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_up
+from helpers import _IO
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16

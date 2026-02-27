@@ -2,7 +2,7 @@ import ctypes, fcntl, mmap, struct, time
 from typing import Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, align_up, noc_xy, PROFILER
+from helpers import _IO, noc_xy, PROFILER
 from compiler import compile_cq_kernels
 from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS, _CorePayload
 
@@ -210,6 +210,13 @@ class _FastCQ:
     dispatch.payload.wait.count = count
     self._relay_inline(as_bytes(dispatch))
 
+  def enqueue_timestamp(self, noc_xy_addr: int, addr: int):
+    dispatch = CQDispatchCmd()
+    dispatch.cmd_id = CQ_DISPATCH_CMD_TIMESTAMP
+    dispatch.payload.timestamp.noc_xy_addr = noc_xy_addr
+    dispatch.payload.timestamp.addr = addr
+    self._relay_inline(as_bytes(dispatch))
+
   def enqueue_host_event(self, event_id: int, pad1: int = 0):
     payload_data = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(FastDispatch.L1_ALIGNMENT, b"\0")
     dispatch = CQDispatchCmd()
@@ -308,6 +315,21 @@ class FastDevice(DeviceBase):
       dispatch_core=self.dispatch_core,
     )
     self._event_id = 1
+    self.last_device_timing = None
+    self._ts_bank_tiles = list(self.dram.bank_tiles)
+    self._ts_bank_count = len(self._ts_bank_tiles)
+    self._ts_slots_per_page = TIMESTAMP_PAGE_SIZE // TIMESTAMP_STRIDE
+    # Dispatch-side NOC writes to DRAM tiles with y=0 are acknowledged but do not persist.
+    self._ts_active_bank_indices = [i for i, (_, _, y) in enumerate(self._ts_bank_tiles) if y != 0]
+    if not self._ts_active_bank_indices:
+      self._ts_active_bank_indices = list(range(self._ts_bank_count))
+    ts_pages = (TIMESTAMP_MAX_SLOTS + self._ts_slots_per_page - 1) // self._ts_slots_per_page
+    ts_local_pages = (ts_pages + len(self._ts_active_bank_indices) - 1) // len(self._ts_active_bank_indices)
+    self._ts_dram = self.dram.alloc(
+      ts_local_pages * self._ts_bank_count * TIMESTAMP_PAGE_SIZE,
+      name="dispatch_timestamps",
+      page_size=TIMESTAMP_PAGE_SIZE,
+    )
     self._profiler_dram_buf = None
     self._profiler_flat_ids: dict[Core, int] = {}
     self._profiler_core_count_per_dram = 0
@@ -430,24 +452,72 @@ class FastDevice(DeviceBase):
     roles = self._core_launches(program, plan.cores)
     return self._prepare_core_payloads(program, plan.cores, roles, DevMsgs.DISPATCH_MODE_DEV)
 
-  def _enqueue_program(self, plan, payloads, skip_upload: bool):
+  def _enqueue_program_setup(self, plan, payloads, skip_upload: bool):
     cores, cq = plan.cores, self._cq
-    # Route go signals
     cq.enqueue_set_go_signal_noc_data([(y << 6) | x for x, y in cores])
-    # Reset cores
     cq.enqueue_write_packed_large(plan.mcast_dests, TensixL1.GO_MSG, self._reset_blob)
     cq.enqueue_write_packed_large(plan.mcast_dests, TensixL1.GO_MSG_INDEX, b"\0\0\0\0")
     if not skip_upload:
-      # Upload RTAs, launch messages, kernels
       self._enqueue_write_packed_groups([(p.core, p.rta) for p in payloads], TensixL1.KERNEL_CONFIG_BASE)
       self._enqueue_write_packed_groups([(p.core, p.launch_blob) for p in payloads], TensixL1.LAUNCH)
       for (addr, blob), group in self._group_by(
           [(p.core, p.shared_addr, p.shared_blob) for p in payloads]).items():
         cq.enqueue_write_packed_large(self._mcast_dests_for_cores(group), addr, blob)
-    # Dispatch
+
+  def _enqueue_program_dispatch(self, plan):
+    cores, cq = plan.cores, self._cq
     cq.enqueue_wait_stream(48, 0)
     cq.enqueue_send_go_signal(self._go_word, 48, 0, len(cores))
     cq.enqueue_wait_stream(48, len(cores))
+
+  def _ts_noc_dest(self, slot: int) -> tuple[int, int]:
+    bank_idx, local_page, within_page = self._ts_slot_layout(slot)
+    _, x, y = self._ts_bank_tiles[bank_idx]
+    return noc_xy(x, y), self._ts_dram.addr + local_page * TIMESTAMP_PAGE_SIZE + within_page
+
+  def _ts_slot_layout(self, slot: int) -> tuple[int, int, int]:
+    page = slot // self._ts_slots_per_page
+    within_page = (slot % self._ts_slots_per_page) * TIMESTAMP_STRIDE
+    active_bank_pos = page % len(self._ts_active_bank_indices)
+    bank_idx = self._ts_active_bank_indices[active_bank_pos]
+    local_page = page // len(self._ts_active_bank_indices)
+    return bank_idx, local_page, within_page
+
+  def _ts_raw_offset(self, slot: int) -> int:
+    bank_idx, local_page, within_page = self._ts_slot_layout(slot)
+    physical_page = bank_idx + local_page * self._ts_bank_count
+    return physical_page * TIMESTAMP_PAGE_SIZE + within_page
+
+  def _read_ts_from_raw(self, raw: bytes, slot: int) -> int:
+    off = self._ts_raw_offset(slot)
+    lo, hi = struct.unpack("<II", raw[off : off + 8])
+    return (hi << 32) | lo
+
+  def _print_kernel_timing_summary(self):
+    dev_timing = self.last_device_timing
+    if not dev_timing:
+      return
+    samples = dev_timing.get("programs")
+    if not samples:
+      return
+
+    rows: list[tuple[int, str, int, float]] = []
+    for i, sample in enumerate(samples):
+      if i >= len(self._exec_list):
+        break
+      prog = self._exec_list[i]
+      if not getattr(prog, "profile", True):
+        continue
+      name = prog.name or f"program_{i}"
+      rows.append((i, name, int(sample["cycles"]), float(sample["us"])))
+
+    if not rows:
+      return
+
+    freq_mhz = int(dev_timing.get("freq_mhz", 0))
+    print("Kernel timing:")
+    for i, name, cycles, us in rows:
+      print(f"  [{i}] {name}: {us:.1f} us ({cycles} cycles @ {freq_mhz} MHz)")
 
   # -- Run --
 
@@ -517,6 +587,7 @@ class FastDevice(DeviceBase):
   def run(self):
     if not self._exec_list:
       self.last_timing = None
+      self.last_device_timing = None
       return self.last_profile
 
     self.last_profile = None
@@ -544,7 +615,16 @@ class FastDevice(DeviceBase):
         payloads = patched
         if getattr(program, "profile", True):
           prof_idx += 1
-      self._enqueue_program(plan, payloads, skip_upload=(id(program) == prev_id and not PROFILER))
+      skip = False
+      self._enqueue_program_setup(plan, payloads, skip_upload=skip)
+      ts_slot = 2 * i
+      if ts_slot + 1 < TIMESTAMP_MAX_SLOTS:
+        nxy, addr = self._ts_noc_dest(ts_slot)
+        self._cq.enqueue_timestamp(nxy, addr)
+      self._enqueue_program_dispatch(plan)
+      if ts_slot + 1 < TIMESTAMP_MAX_SLOTS:
+        nxy, addr = self._ts_noc_dest(ts_slot + 1)
+        self._cq.enqueue_timestamp(nxy, addr)
       prev_id = id(program)
       last_cores = plan.cores
 
@@ -568,6 +648,27 @@ class FastDevice(DeviceBase):
       "compute_s": compute_s,
     }
     self._event_id += 1
+
+    # Read dispatch timestamps from DRAM (barrier first to flush DRAM caches)
+    ts_count = min(program_count, TIMESTAMP_MAX_SLOTS // 2)
+    if ts_count > 0:
+      freq_mhz = self.profiler_freq_mhz()
+      # Barrier on all DRAM bank tiles touched by timestamp buffer
+      ts_pages = (self._ts_dram.size + TIMESTAMP_PAGE_SIZE - 1) // TIMESTAMP_PAGE_SIZE
+      touched_tiles = [(b, x, y) for i, (b, x, y) in enumerate(self._ts_bank_tiles) if i < ts_pages]
+      self.dram.barrier(touched_tiles)
+      raw = self.dram._read_slow(self._ts_dram)
+      timings = []
+      for i in range(ts_count):
+        t_start = self._read_ts_from_raw(raw, 2 * i)
+        t_end_ts = self._read_ts_from_raw(raw, 2 * i + 1)
+        cycles = t_end_ts - t_start
+        timings.append({"cycles": cycles, "us": cycles / freq_mhz})
+      self.last_device_timing = {"freq_mhz": freq_mhz, "programs": timings}
+      self._print_kernel_timing_summary()
+    else:
+      self.last_device_timing = None
+
     if programs_info:
       import profiler
       freq_mhz = self.profiler_freq_mhz()

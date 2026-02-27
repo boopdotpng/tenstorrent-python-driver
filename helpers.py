@@ -1,5 +1,5 @@
 import os, struct
-from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC, align_up
+from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
 from dataclasses import dataclass
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
@@ -109,7 +109,7 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
     struct.pack_into("<I", data, sh_offset + rel, value & 0xFFFFFFFF)
 
   for rel_sec_idx in range(e_shnum):
-    sh_name, sh_type, _, _, sh_offset, sh_size, sh_link, sh_info, _, sh_entsize = shdr(rel_sec_idx)
+    _sh_name, sh_type, _, _, sh_offset, sh_size, sh_link, sh_info, _, sh_entsize = shdr(rel_sec_idx)
     if sh_type != 4:  # SHT_RELA
       continue
     if sh_entsize < 12 or sh_size == 0:

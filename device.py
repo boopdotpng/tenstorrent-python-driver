@@ -5,7 +5,7 @@ from pathlib import Path
 from defs import *
 from compiler import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import USE_USB_DISPATCH, PROFILER, align_down, align_up, generate_jal_instruction, noc_xy
+from helpers import USE_USB_DISPATCH, PROFILER, align_down, generate_jal_instruction, noc_xy
 from dram import DramAllocator
 
 CoreSpec = int | CoreList | Literal["all"]
@@ -774,7 +774,7 @@ from device_fast import FastDevice
 __all__ = ["Program", "DataflowLaunch", "TileGrid", "ArgGen", "SlowDevice", "FastDevice", "Device"]
 
 class Device:
-  def __new__(cls, device: int = 0):
+  def __new__(_cls, device: int = 0):
     if USE_USB_DISPATCH:
       return SlowDevice(device=device)
     try:

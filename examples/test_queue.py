@@ -284,11 +284,11 @@ def main():
       dataflow=[DataflowLaunch(
         cores=mm_cores,
         reader=mm_reader, writer=mm_writer,
-        reader_rt_args=lambda ci, xy, nc: [a_buf.addr, b_buf.addr, *mm_span(ci)],
-        writer_rt_args=lambda ci, xy, nc: [c_buf.addr, mm_span(ci)[1], mm_span(ci)[0]],
+        reader_rt_args=lambda ci, xy, _nc: [a_buf.addr, b_buf.addr, *mm_span(ci)],
+        writer_rt_args=lambda ci, xy, _nc: [c_buf.addr, mm_span(ci)[1], mm_span(ci)[0]],
       )],
       compute=mm_compute,
-      compute_rt_args=lambda ci, xy, nc: [mm_span(ci)[1]],
+      compute_rt_args=lambda ci, xy, _nc: [mm_span(ci)[1]],
       cbs=[0, 1, 16], tile_size=tile_bytes, num_pages=2, cores=active_mm,
     )
 

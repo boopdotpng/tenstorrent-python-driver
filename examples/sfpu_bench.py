@@ -11,7 +11,7 @@ Usage:
   TT_PROFILER=1 TT_PROFILER_UI=0 python3 examples/sfpu_bench.py
 """
 from __future__ import annotations
-import os, sys, random, struct
+import os, random, struct
 from collections import OrderedDict
 
 os.environ.setdefault("TT_PROFILER", "1")
@@ -307,11 +307,11 @@ def main():
           cores=cores,
           reader=reader,
           writer=writer,
-          reader_rt_args=lambda ci, cxy, nc: [src_buf.addr, ci, 1],
-          writer_rt_args=lambda ci, cxy, nc: [dst_buf.addr, ci, 1],
+          reader_rt_args=lambda ci, _cxy, _nc: [src_buf.addr, ci, 1],
+          writer_rt_args=lambda ci, _cxy, _nc: [dst_buf.addr, ci, 1],
         )],
         compute=compute,
-        compute_rt_args=lambda ci, cxy, nc: [N_REPS],
+        compute_rt_args=lambda ci, _cxy, _nc: [N_REPS],
         cbs=[0, 16],
         tile_size=tile_size,
         num_pages=2,

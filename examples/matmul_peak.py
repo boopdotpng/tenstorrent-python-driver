@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 
 import numpy as np
 
@@ -631,21 +630,6 @@ def _validate_matmul(a: np.ndarray, b: np.ndarray, c_bytes: bytes, M: int, N: in
     raise SystemExit(f"Validation failed: PCC={pcc:.6f}, rel_l2={rel_l2:.6f}")
 
 
-def _extract_batch_timing(timing: dict | None):
-  if not timing:
-    return None
-  try:
-    programs = int(timing.get("programs", 0))
-    total_s = float(timing.get("total_s", 0.0))
-    dispatch_s = float(timing.get("dispatch_s", 0.0))
-    compute_s = float(timing.get("compute_s", 0.0))
-  except Exception:
-    return None
-  if programs <= 0 or total_s <= 0 or compute_s <= 0:
-    return None
-  return programs, total_s, dispatch_s, compute_s
-
-
 def main():
   if len(sys.argv) == 4:
     M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
@@ -892,30 +876,7 @@ def main():
     program.profile = True
     for _ in range(TIMED_ITERS):
       device.queue(program)
-    t0 = time.perf_counter()
     device.run()
-    elapsed_batch = time.perf_counter() - t0
-    elapsed_wall = elapsed_batch / TIMED_ITERS
-
-    flops = 2.0 * M * N * K
-    timing = _extract_batch_timing(device.last_timing)
-    if timing is not None:
-      programs, total_s, dispatch_s, compute_s = timing
-      elapsed_compute = compute_s / programs
-      elapsed_dispatch = dispatch_s / programs
-      elapsed_total = total_s / programs
-      tflops_compute = flops / elapsed_compute / 1e12
-      print(f"\nAvg latency (compute): {elapsed_compute * 1e3:.3f} ms")
-      print(f"Throughput (compute):  {tflops_compute:.2f} TFLOPS (HiFi2, {NUM_ROWS * NUM_COLS} cores)")
-      print(f"Avg latency (dispatch): {elapsed_dispatch * 1e3:.3f} ms")
-      print(f"Avg latency (total):    {elapsed_total * 1e3:.3f} ms")
-      if programs != TIMED_ITERS:
-        print(f"  note: runtime reported {programs} program(s) for {TIMED_ITERS} queued timed iter(s)")
-    else:
-      print("\nCompute-time metric unavailable from runtime timing.")
-    tflops_wall = flops / elapsed_wall / 1e12
-    print(f"Avg latency (wall):    {elapsed_wall * 1e3:.3f} ms")
-    print(f"Throughput (wall):     {tflops_wall:.2f} TFLOPS")
     c_rm = device.dram.read(c_buf)
     _validate_matmul(a_ref, b_ref, c_rm, M, N, Mp, Np)
 

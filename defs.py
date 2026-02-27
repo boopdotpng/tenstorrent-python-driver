@@ -303,6 +303,11 @@ CQ_DISPATCH_CMD_WRITE_PACKED_LARGE = 6
 CQ_DISPATCH_CMD_WAIT = 7
 CQ_DISPATCH_CMD_SEND_GO_SIGNAL = 14
 CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA = 17
+CQ_DISPATCH_CMD_TIMESTAMP = 18
+
+TIMESTAMP_PAGE_SIZE = 64   # DRAM_ALIGNMENT, 4 timestamp slots per page at TIMESTAMP_STRIDE=16
+TIMESTAMP_STRIDE = 16      # keep 8-byte timestamp payload on 16-byte aligned destinations
+TIMESTAMP_MAX_SLOTS = 512  # max timestamps per batch (256 programs)
 
 CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE = 0x02
 CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK = 0x01
@@ -381,6 +386,10 @@ class CQDispatchSetGoSignalNocDataCmd(S):
   _pack_ = 1
   _fields_ = [("pad1", u8), ("pad2", u16), ("num_words", u32)]
 
+class CQDispatchTimestampCmd(S):
+  _pack_ = 1
+  _fields_ = [("pad1", u8), ("pad2", u16), ("noc_xy_addr", u32), ("addr", u32)]
+
 class CQDispatchCmdPayload(ctypes.Union):
   _pack_ = 1
   _fields_ = [
@@ -390,6 +399,7 @@ class CQDispatchCmdPayload(ctypes.Union):
     ("wait", CQDispatchWaitCmd),
     ("mcast", CQDispatchGoSignalMcastCmd),
     ("set_go_signal_noc_data", CQDispatchSetGoSignalNocDataCmd),
+    ("timestamp", CQDispatchTimestampCmd),
     ("raw", u8 * 15),
   ]
 

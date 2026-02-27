@@ -55,6 +55,7 @@ enum CQDispatchCmdId : uint8_t {
     CQ_DISPATCH_NOTIFY_SUBORDINATE_GO_SIGNAL = 15,
     CQ_DISPATCH_SET_NUM_WORKER_SEMS = 16,
     CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA = 17,
+    CQ_DISPATCH_CMD_TIMESTAMP = 18,
     CQ_DISPATCH_CMD_MAX_COUNT,  // for checking legal IDs
 };
 
@@ -380,6 +381,13 @@ struct CQDispatchSetGoSignalNocDataCmd {
     uint32_t num_words;
 } __attribute__((packed));
 
+struct CQDispatchTimestampCmd {
+    uint8_t pad1;
+    uint16_t pad2;
+    uint32_t noc_xy_addr;  // NOC coords of target DRAM bank tile
+    uint32_t addr;          // bank-local address to write 8 bytes
+} __attribute__((packed));
+
 struct CQDispatchCmd {
     CQDispatchBaseCmd base;
 
@@ -397,6 +405,7 @@ struct CQDispatchCmd {
         CQDispatchNotifySubordinateGoSignalCmd notify_dispatch_s_go_signal;
         CQDispatchSetNumWorkerSemsCmd set_num_worker_sems;
         CQDispatchSetGoSignalNocDataCmd set_go_signal_noc_data;
+        CQDispatchTimestampCmd timestamp;
     } __attribute__((packed));
 };
 

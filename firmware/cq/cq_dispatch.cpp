@@ -922,6 +922,28 @@ FORCE_INLINE void process_set_write_offset_cmd(uint32_t& local_cmd_ptr) {
     local_cmd_ptr += sizeof(CQDispatchCmd) + sizeof(uint32_t) * offset_count;
 }
 
+FORCE_INLINE void process_timestamp(uint32_t& local_cmd_ptr) {
+    volatile CQDispatchCmd tt_l1_ptr* cmd = (volatile CQDispatchCmd tt_l1_ptr*)local_cmd_ptr;
+    uint32_t dst_noc_xy = cmd->timestamp.noc_xy_addr;
+    uint32_t dst_addr = cmd->timestamp.addr;
+
+    // Read wall clock (reading L latches H)
+    uint32_t lo = *reinterpret_cast<volatile uint32_t tt_reg_ptr*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+    uint32_t hi = *reinterpret_cast<volatile uint32_t tt_reg_ptr*>(RISCV_DEBUG_REG_WALL_CLOCK_H);
+
+    // Write timestamp to command buffer L1 (bypass data cache via tt_l1_ptr)
+    volatile tt_l1_ptr uint32_t* scratch = (volatile tt_l1_ptr uint32_t*)local_cmd_ptr;
+    scratch[0] = lo;
+    scratch[1] = hi;
+
+    // NOC unicast write 8 bytes to DRAM
+    uint64_t dst = get_noc_addr_helper(dst_noc_xy, dst_addr);
+    noc_async_write_one_packet(local_cmd_ptr, dst, 8);
+    noc_async_write_barrier();
+
+    local_cmd_ptr += sizeof(CQDispatchCmd);
+}
+
 static inline bool process_cmd_d(uint32_t& cmd_ptr, uint32_t* l1_cache) {
     bool done = false;
 
@@ -978,6 +1000,8 @@ static inline bool process_cmd_d(uint32_t& cmd_ptr, uint32_t* l1_cache) {
             break;
 
         case CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA: set_go_signal_noc_data(); break;
+
+        case CQ_DISPATCH_CMD_TIMESTAMP: process_timestamp(cmd_ptr); break;
 
         case CQ_DISPATCH_CMD_SET_WRITE_OFFSET: process_set_write_offset_cmd(cmd_ptr); break;
 
