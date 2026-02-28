@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -26,6 +27,22 @@ IO_MODE = "f16" if os.environ.get("F16") == "1" else "bf16"
 IO_DATA_FORMAT = DataFormat.Float16 if IO_MODE == "f16" else DataFormat.Float16_b
 IO_DTYPE = DType.float16 if IO_MODE == "f16" else DType.bfloat16
 CB24_TILE_BYTES = TILE_BYTES_F32 if F32_ACC else TILE_BYTES
+_MATH_FIDELITY_MAP = {
+  "lofi": MathFidelity.LoFi,
+  "hifi2": MathFidelity.HiFi2,
+  "hifi3": MathFidelity.HiFi3,
+  "hifi4": MathFidelity.HiFi4,
+}
+MATH_FIDELITY_NAME = os.environ.get("MATH_FIDELITY", "hifi2").lower()
+if MATH_FIDELITY_NAME not in _MATH_FIDELITY_MAP:
+  valid = ", ".join(sorted(_MATH_FIDELITY_MAP))
+  raise SystemExit(f"Invalid MATH_FIDELITY={MATH_FIDELITY_NAME!r}. Expected one of: {valid}")
+MATH_FIDELITY = _MATH_FIDELITY_MAP[MATH_FIDELITY_NAME]
+BF16_SMALL_OUT_TILE_THRESHOLD = 16
+BF16_BLOCK_W_SMALL_CAP = 32
+BF16_BLOCK_W_LARGE_CAP = 64
+
+Core = tuple[int, int]
 
 def ceil32(x):
   return (x + 31) & ~31
@@ -41,71 +58,254 @@ def _divisors(n):
   return sorted(divs)
 
 
-def _solve_grid(Mt_base, Kt, Nt_base, max_cores, max_rows, max_cols):
-  """Pick grid + tiling using ceil-sharded per-core work.
+@dataclass(frozen=True)
+class CoreTopology:
+  cores: tuple[Core, ...]
+  core_set: frozenset[Core]
+  xs: tuple[int, ...]
+  ys: tuple[int, ...]
 
-  Unlike strict divisor-only planning, this allows ragged global tile counts by
-  padding Mt/Nt to rows*per_core_M and cols*per_core_N.
-  """
-  kt_divs = _divisors(Kt)
+
+@dataclass(frozen=True)
+class GridLayout:
+  rows: tuple[int, ...]
+  cols: tuple[int, ...]
+
+  @property
+  def num_rows(self) -> int:
+    return len(self.rows)
+
+  @property
+  def num_cols(self) -> int:
+    return len(self.cols)
+
+  @property
+  def active_cores(self) -> int:
+    return self.num_rows * self.num_cols
+
+
+@dataclass(frozen=True)
+class PrecisionPolicy:
+  f32_acc: bool
+  bf16_small_tile_threshold: int = BF16_SMALL_OUT_TILE_THRESHOLD
+  bf16_small_block_w_cap: int = BF16_BLOCK_W_SMALL_CAP
+  bf16_large_block_w_cap: int = BF16_BLOCK_W_LARGE_CAP
+
+  def max_block_w(self, out_tiles_per_core: int) -> int:
+    if self.f32_acc:
+      return 1 << 30
+    if out_tiles_per_core <= self.bf16_small_tile_threshold:
+      return self.bf16_small_block_w_cap
+    return self.bf16_large_block_w_cap
+
+
+@dataclass(frozen=True)
+class PlannerCandidate:
+  layout: GridLayout
+  per_core_m: int
+  per_core_n: int
+  in0_block_w: int
+  out_subblock_h: int
+  out_subblock_w: int
+  mt: int
+  nt: int
+
+  @property
+  def out_tiles_per_core(self) -> int:
+    return self.per_core_m * self.per_core_n
+
+
+@dataclass(frozen=True)
+class MatmulPlan:
+  rows: tuple[int, ...]
+  cols: tuple[int, ...]
+  mt: int
+  kt: int
+  nt: int
+  per_core_m: int
+  per_core_n: int
+  in0_block_w: int
+  out_subblock_h: int
+  out_subblock_w: int
+  out_subblock_num_tiles: int
+  num_blocks: int
+  in0_num_subblocks: int
+  in1_num_subblocks: int
+  in0_block_num_tiles: int
+  in0_subblock_num_tiles: int
+  in1_block_num_tiles: int
+  in1_per_core_w: int
+  out_block_num_tiles: int
+  cb0_pages: int
+  cb1_pages: int
+  cb16_pages: int
+  cb24_pages: int
+
+  @property
+  def num_rows(self) -> int:
+    return len(self.rows)
+
+  @property
+  def num_cols(self) -> int:
+    return len(self.cols)
+
+  @property
+  def active_core_count(self) -> int:
+    return self.num_rows * self.num_cols
+
+  def grid(self) -> list[list[Core]]:
+    return [[(x, y) for x in self.cols] for y in self.rows]
+
+  def active_cores(self) -> list[Core]:
+    return [core for row in self.grid() for core in row]
+
+  def validate_against(self, dispatchable_cores: list[Core]):
+    core_set = set(dispatchable_cores)
+    missing = [core for core in self.active_cores() if core not in core_set]
+    if missing:
+      raise ValueError(f"planner produced non-dispatchable cores: {missing[:4]}")
+
+
+def _build_topology(dispatchable_cores: list[Core]) -> CoreTopology:
+  cores = tuple(sorted(set(dispatchable_cores), key=lambda xy: (xy[0], xy[1])))
+  if not cores:
+    raise SystemExit("No dispatchable cores")
+  core_set = frozenset(cores)
+  xs = tuple(sorted({x for x, _ in cores}))
+  ys = tuple(sorted({y for _, y in cores}))
+  return CoreTopology(cores=cores, core_set=core_set, xs=xs, ys=ys)
+
+
+def _iter_layouts(topology: CoreTopology, max_cores: int):
+  ys = topology.ys
+  for start in range(len(ys)):
+    for stop in range(start + 1, len(ys) + 1):
+      rows = ys[start:stop]
+      valid_cols = [x for x in topology.xs if all((x, y) in topology.core_set for y in rows)]
+      if not valid_cols:
+        continue
+      for col_count in range(1, len(valid_cols) + 1):
+        layout = GridLayout(rows=rows, cols=tuple(valid_cols[:col_count]))
+        if layout.active_cores <= max_cores:
+          yield layout
+
+
+def _fits_l1(per_core_m: int, per_core_n: int, in0_block_w: int) -> bool:
+  cb0 = 2 * per_core_m * in0_block_w * TILE_BYTES
+  cb1 = 2 * per_core_n * in0_block_w * TILE_BYTES
+  cb_out = per_core_m * per_core_n * max(TILE_BYTES, CB24_TILE_BYTES)
+  return (cb0 + cb1 + cb_out) <= L1_DATA_BYTES_AVAILABLE
+
+
+def _iter_candidates(mt_base: int, kt: int, nt_base: int, layout: GridLayout, policy: PrecisionPolicy):
+  per_core_m = (mt_base + layout.num_rows - 1) // layout.num_rows
+  per_core_n = (nt_base + layout.num_cols - 1) // layout.num_cols
+  mt = layout.num_rows * per_core_m
+  nt = layout.num_cols * per_core_n
+  max_block_w = policy.max_block_w(per_core_m * per_core_n)
+  kt_divs = _divisors(kt)
+
+  for out_subblock_h in range(1, 9):
+    for out_subblock_w in range(1, 9):
+      if out_subblock_h * out_subblock_w > 8:
+        continue
+      if per_core_m % out_subblock_h != 0 or per_core_n % out_subblock_w != 0:
+        continue
+      for in0_block_w in kt_divs:
+        if in0_block_w > max_block_w:
+          continue
+        if not _fits_l1(per_core_m, per_core_n, in0_block_w):
+          continue
+        yield PlannerCandidate(
+          layout=layout,
+          per_core_m=per_core_m,
+          per_core_n=per_core_n,
+          in0_block_w=in0_block_w,
+          out_subblock_h=out_subblock_h,
+          out_subblock_w=out_subblock_w,
+          mt=mt,
+          nt=nt,
+        )
+
+
+def _score_candidate(c: PlannerCandidate):
+  # Throughput proxy:
+  # - reward more cores and larger K blocks
+  # - strongly penalize tiny per-core output tiles (sync/mcast overhead)
+  # - lightly penalize extra Mt/Nt padding
+  per_core_work_bias = min(c.out_tiles_per_core, 16)
+  pad_work = c.mt * c.nt
+  subblock_tiles = c.out_subblock_h * c.out_subblock_w
+  return (
+    c.layout.active_cores * c.in0_block_w * per_core_work_bias * per_core_work_bias,
+    -pad_work,
+    c.layout.active_cores * c.in0_block_w,
+    subblock_tiles,
+    c.layout.active_cores,
+  )
+
+
+def _candidate_to_plan(candidate: PlannerCandidate, kt: int) -> MatmulPlan:
+  out_subblock_num_tiles = candidate.out_subblock_h * candidate.out_subblock_w
+  num_blocks = kt // candidate.in0_block_w
+  in0_num_subblocks = candidate.per_core_m // candidate.out_subblock_h
+  in1_num_subblocks = candidate.per_core_n // candidate.out_subblock_w
+  in0_block_num_tiles = candidate.per_core_m * candidate.in0_block_w
+  in0_subblock_num_tiles = candidate.out_subblock_h * candidate.in0_block_w
+  in1_block_num_tiles = candidate.per_core_n * candidate.in0_block_w
+  in1_per_core_w = candidate.per_core_n
+  out_block_num_tiles = candidate.per_core_m * candidate.per_core_n
+  cb0_pages = 2 * in0_block_num_tiles
+  cb1_pages = 2 * in1_block_num_tiles
+  cb16_pages = out_block_num_tiles
+  cb24_pages = cb16_pages
+  return MatmulPlan(
+    rows=candidate.layout.rows,
+    cols=candidate.layout.cols,
+    mt=candidate.mt,
+    kt=kt,
+    nt=candidate.nt,
+    per_core_m=candidate.per_core_m,
+    per_core_n=candidate.per_core_n,
+    in0_block_w=candidate.in0_block_w,
+    out_subblock_h=candidate.out_subblock_h,
+    out_subblock_w=candidate.out_subblock_w,
+    out_subblock_num_tiles=out_subblock_num_tiles,
+    num_blocks=num_blocks,
+    in0_num_subblocks=in0_num_subblocks,
+    in1_num_subblocks=in1_num_subblocks,
+    in0_block_num_tiles=in0_block_num_tiles,
+    in0_subblock_num_tiles=in0_subblock_num_tiles,
+    in1_block_num_tiles=in1_block_num_tiles,
+    in1_per_core_w=in1_per_core_w,
+    out_block_num_tiles=out_block_num_tiles,
+    cb0_pages=cb0_pages,
+    cb1_pages=cb1_pages,
+    cb16_pages=cb16_pages,
+    cb24_pages=cb24_pages,
+  )
+
+
+def _plan_matmul(mt_base: int, kt: int, nt_base: int, dispatchable_cores: list[Core], policy: PrecisionPolicy | None = None):
+  topology = _build_topology(dispatchable_cores)
+  policy = policy or PrecisionPolicy(f32_acc=F32_ACC)
   best = None
   best_score = None
-
-  for rows in range(1, max_rows + 1):
-    for cols in range(1, max_cols + 1):
-      active = rows * cols
-      if active > max_cores:
-        continue
-
-      pcm = (Mt_base + rows - 1) // rows
-      pcn = (Nt_base + cols - 1) // cols
-      Mt = rows * pcm
-      Nt = cols * pcn
-
-      for sh in range(1, 9):
-        for sw in range(1, 9):
-          if sh * sw > 8:
-            continue
-          if pcm % sh != 0 or pcn % sw != 0:
-            continue
-
-          max_bw = 0
-          for bw in kt_divs:
-            cb0 = 2 * pcm * bw * TILE_BYTES
-            cb1 = 2 * pcn * bw * TILE_BYTES
-            cb_out = pcm * pcn * max(TILE_BYTES, CB24_TILE_BYTES)
-            if cb0 + cb1 + cb_out > L1_DATA_BYTES_AVAILABLE:
-              continue
-            if bw > max_bw:
-              max_bw = bw
-
-          if max_bw == 0:
-            continue
-
-          # Throughput proxy:
-          # - reward more cores and larger K blocks
-          # - strongly penalize tiny per-core output tiles (sync/mcast overhead)
-          # - lightly penalize extra Mt/Nt padding
-          out_tiles_per_core = pcm * pcn
-          per_core_work_bias = min(out_tiles_per_core, 16)
-          pad_work = Mt * Nt
-          score = (
-            active * max_bw * per_core_work_bias * per_core_work_bias,
-            -pad_work,
-            active * max_bw,
-            sh * sw,
-            active,
-          )
-          if best is None or score > best_score:
-            best = (rows, cols, max_bw, sh, sw, Mt, Nt)
-            best_score = score
+  for layout in _iter_layouts(topology, max_cores=len(topology.cores)):
+    for candidate in _iter_candidates(mt_base, kt, nt_base, layout, policy):
+      score = _score_candidate(candidate)
+      if best is None or score > best_score:
+        best = candidate
+        best_score = score
 
   if best is None:
     raise SystemExit(
-      f"No valid grid for Mt={Mt_base} Kt={Kt} Nt={Nt_base} "
-      f"max_rows={max_rows} max_cols={max_cols}"
+      f"No valid plan for Mt={mt_base} Kt={kt} Nt={nt_base} "
+      f"(dispatchable={len(topology.cores)}, xs={len(topology.xs)}, ys={len(topology.ys)})"
     )
-  return best
+  plan = _candidate_to_plan(best, kt)
+  plan.validate_against(list(topology.cores))
+  return plan
 
 
 # -- Reader kernel (NCRISC/NOC0): in0 sender --
@@ -574,22 +774,6 @@ void MAIN {{
 """
 
 
-def _build_grid(dispatchable_cores: list[tuple[int, int]], num_rows: int, num_cols: int):
-  xs = sorted({x for x, _ in dispatchable_cores})
-  ys = sorted({y for _, y in dispatchable_cores})
-  core_set = set(dispatchable_cores)
-  cols = xs[:num_cols]
-  rows = ys[:num_rows]
-  grid = []
-  for y in rows:
-    row = []
-    for x in cols:
-      assert (x, y) in core_set, f"core ({x},{y}) not in dispatchable_cores"
-      row.append((x, y))
-    grid.append(row)
-  return grid, cols, rows
-
-
 def _mcast_rect_args(x_list: list[int], y: int):
   if not x_list:
     return (0, 0, 0, 0, 0)
@@ -649,60 +833,46 @@ def main():
   device = Device()
   max_cores = len(device.dispatchable_cores)
 
-  # Planner selects a rows x cols rectangle and per-core work using ceil sharding.
-  sorted_cores = sorted(device.dispatchable_cores, key=lambda xy: (xy[0], xy[1]))
-  avail_xs = sorted({x for x, _ in sorted_cores})
-  avail_ys = sorted({y for _, y in sorted_cores})
   Mt_base = ceil32(M) // 32
-  NUM_ROWS, NUM_COLS, IN0_BLOCK_W, OUT_SUBBLOCK_H, OUT_SUBBLOCK_W, Mt, Nt = _solve_grid(
-    Mt_base, Kt, Nt_base, max_cores, len(avail_ys), len(avail_xs)
-  )
-  Mp = Mt * 32
-  Np = Nt * 32
-  OUT_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * OUT_SUBBLOCK_W
-  NUM_BLOCKS = Kt // IN0_BLOCK_W
-  PER_CORE_M = Mt // NUM_ROWS
-  PER_CORE_N = Nt // NUM_COLS
-
-  IN0_NUM_SUBBLOCKS = PER_CORE_M // OUT_SUBBLOCK_H
-  IN1_NUM_SUBBLOCKS = PER_CORE_N // OUT_SUBBLOCK_W
-  IN0_BLOCK_NUM_TILES = PER_CORE_M * IN0_BLOCK_W
-  IN0_SUBBLOCK_NUM_TILES = OUT_SUBBLOCK_H * IN0_BLOCK_W
-  IN1_BLOCK_NUM_TILES = PER_CORE_N * IN0_BLOCK_W
-  IN1_PER_CORE_W = PER_CORE_N
-  OUT_BLOCK_NUM_TILES = PER_CORE_M * PER_CORE_N
-
-  CB0_PAGES = 2 * IN0_BLOCK_NUM_TILES
-  CB1_PAGES = 2 * IN1_BLOCK_NUM_TILES
-  CB16_PAGES = PER_CORE_M * PER_CORE_N
-  CB24_PAGES = CB16_PAGES
+  plan = _plan_matmul(Mt_base, Kt, Nt_base, device.dispatchable_cores)
+  Mp = plan.mt * 32
+  Np = plan.nt * 32
 
   K_COMPUTE = _compute_kernel({
-    'in0_block_w': IN0_BLOCK_W,
-    'in0_num_subblocks': IN0_NUM_SUBBLOCKS,
-    'in0_block_num_tiles': IN0_BLOCK_NUM_TILES,
-    'in0_subblock_num_tiles': IN0_SUBBLOCK_NUM_TILES,
-    'in1_num_subblocks': IN1_NUM_SUBBLOCKS,
-    'in1_block_num_tiles': IN1_BLOCK_NUM_TILES,
-    'in1_per_core_w': IN1_PER_CORE_W,
-    'num_blocks': NUM_BLOCKS,
-    'out_subblock_h': OUT_SUBBLOCK_H,
-    'out_subblock_w': OUT_SUBBLOCK_W,
-    'out_subblock_num_tiles': OUT_SUBBLOCK_NUM_TILES,
-    'out_block_num_tiles': OUT_BLOCK_NUM_TILES,
+    'in0_block_w': plan.in0_block_w,
+    'in0_num_subblocks': plan.in0_num_subblocks,
+    'in0_block_num_tiles': plan.in0_block_num_tiles,
+    'in0_subblock_num_tiles': plan.in0_subblock_num_tiles,
+    'in1_num_subblocks': plan.in1_num_subblocks,
+    'in1_block_num_tiles': plan.in1_block_num_tiles,
+    'in1_per_core_w': plan.in1_per_core_w,
+    'num_blocks': plan.num_blocks,
+    'out_subblock_h': plan.out_subblock_h,
+    'out_subblock_w': plan.out_subblock_w,
+    'out_subblock_num_tiles': plan.out_subblock_num_tiles,
+    'out_block_num_tiles': plan.out_block_num_tiles,
   })
 
   padded = (M != Mp or K != Kp or N != Np)
   print(
     f"Matmul Peak (4-role split): C[{M},{N}] = A[{M},{K}] @ B[{K},{N}] "
-    f"({IO_MODE} io, {'fp32' if F32_ACC else 'mixed'} accum, HiFi2)"
+    f"({IO_MODE} io, {'fp32' if F32_ACC else 'mixed'} accum, {MATH_FIDELITY.name})"
   )
   if padded:
     print(f"  padded: A[{Mp},{Kp}] @ B[{Kp},{Np}] -> C[{Mp},{Np}]")
-  print(f"  Mt={Mt} Kt={Kt} Nt={Nt} grid={NUM_ROWS}x{NUM_COLS}")
-  print(f"  per_core_M={PER_CORE_M} per_core_N={PER_CORE_N} in0_block_w={IN0_BLOCK_W} num_blocks={NUM_BLOCKS}")
-  print(f"  subblock: {OUT_SUBBLOCK_H}h x {OUT_SUBBLOCK_W}w = {OUT_SUBBLOCK_NUM_TILES} tiles")
-  print(f"  env switches: F16={'1' if IO_MODE == 'f16' else '0'} F32_ACC={'1' if F32_ACC else '0'}")
+  print(f"  Mt={plan.mt} Kt={Kt} Nt={plan.nt} grid={plan.num_rows}x{plan.num_cols}")
+  print(
+    f"  per_core_M={plan.per_core_m} per_core_N={plan.per_core_n} "
+    f"in0_block_w={plan.in0_block_w} num_blocks={plan.num_blocks}"
+  )
+  print(
+    f"  subblock: {plan.out_subblock_h}h x {plan.out_subblock_w}w = "
+    f"{plan.out_subblock_num_tiles} tiles"
+  )
+  print(
+    f"  env switches: F16={'1' if IO_MODE == 'f16' else '0'} "
+    f"F32_ACC={'1' if F32_ACC else '0'} MATH_FIDELITY={MATH_FIDELITY_NAME}"
+  )
 
   cfg_kwargs = {}
   if F32_ACC:
@@ -714,7 +884,7 @@ def main():
   cfg = CkernelConfig(
     input_format=IO_DATA_FORMAT,
     output_format=IO_DATA_FORMAT,
-    math_fidelity=MathFidelity.HiFi2,
+    math_fidelity=MATH_FIDELITY,
     **cfg_kwargs,
   )
   compiler = Compiler(cfg)
@@ -725,11 +895,14 @@ def main():
   compute = compiler.compile_compute(K_COMPUTE)
 
   print(f"Device: {max_cores} dispatchable cores")
-  assert max_cores >= NUM_ROWS * NUM_COLS, f"need {NUM_ROWS * NUM_COLS} cores, have {max_cores}"
+  assert max_cores >= plan.active_core_count, f"need {plan.active_core_count} cores, have {max_cores}"
 
   try:
-    grid, cols, rows = _build_grid(device.dispatchable_cores, NUM_ROWS, NUM_COLS)
-    active_cores = [grid[r][c] for r in range(NUM_ROWS) for c in range(NUM_COLS)]
+    plan.validate_against(device.dispatchable_cores)
+    grid = plan.grid()
+    cols = list(plan.cols)
+    rows = list(plan.rows)
+    active_cores = plan.active_cores()
     print(f"Grid columns: {cols}")
     print(f"Grid rows: {rows}")
 
@@ -764,14 +937,14 @@ def main():
       b_bytes, name="B", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(Kp, Np)
     )
     c_buf = device.dram.alloc(
-      TILE_BYTES * Mt * Nt, name="C", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(Mp, Np)
+      TILE_BYTES * plan.mt * plan.nt, name="C", page_size=TILE_BYTES, dtype=IO_DTYPE, shape=(Mp, Np)
     )
 
-    core_to_rc = {grid[r][c]: (r, c) for r in range(NUM_ROWS) for c in range(NUM_COLS)}
+    core_to_rc = {grid[r][c]: (r, c) for r in range(plan.num_rows) for c in range(plan.num_cols)}
     top_left = [grid[0][0]]
-    top_row = [grid[0][c] for c in range(1, NUM_COLS)]
-    left_col = [grid[r][0] for r in range(1, NUM_ROWS)]
-    interior = [grid[r][c] for r in range(1, NUM_ROWS) for c in range(1, NUM_COLS)]
+    top_row = [grid[0][c] for c in range(1, plan.num_cols)]
+    left_col = [grid[r][0] for r in range(1, plan.num_rows)]
+    interior = [grid[r][c] for r in range(1, plan.num_rows) for c in range(1, plan.num_cols)]
 
     def reader_args(role_idx: int, core_xy: tuple[int, int], num_cores: int) -> list[int]:
       row_idx, _ = core_to_rc[core_xy]
@@ -785,8 +958,8 @@ def main():
 
       sender_xy = grid[row_idx][0]
       return [
-        a_buf.addr, row_idx * PER_CORE_M * Kt, 1, Kt, IN0_BLOCK_W,
-        IN0_BLOCK_W, PER_CORE_M, IN0_BLOCK_NUM_TILES, NUM_BLOCKS,
+        a_buf.addr, row_idx * plan.per_core_m * Kt, 1, Kt, plan.in0_block_w,
+        plan.in0_block_w, plan.per_core_m, plan.in0_block_num_tiles, plan.num_blocks,
         w_sx, w_sy, w_ex, w_ey, w_nd,
         e_sx, e_sy, e_ex, e_ey, e_nd,
         sender_xy[0], sender_xy[1],
@@ -805,18 +978,18 @@ def main():
         i1_sx = i1_sy = i1_ex = i1_ey = i1_nd = 0
 
       sender_xy = grid[0][col_idx]
-      out_start = row_idx * PER_CORE_M * Nt + col_idx * PER_CORE_N
+      out_start = row_idx * plan.per_core_m * plan.nt + col_idx * plan.per_core_n
       return [
-        b_buf.addr, col_idx * PER_CORE_N, 1, Nt, IN0_BLOCK_W * Nt,
-        PER_CORE_N, IN0_BLOCK_W, IN1_BLOCK_NUM_TILES, NUM_BLOCKS,
+        b_buf.addr, col_idx * plan.per_core_n, 1, plan.nt, plan.in0_block_w * plan.nt,
+        plan.per_core_n, plan.in0_block_w, plan.in1_block_num_tiles, plan.num_blocks,
         i1_sx, i1_sy, i1_ex, i1_ey, i1_nd,
         sender_xy[0], sender_xy[1],
         IN1_SEND_SEM, IN1_RECV_SEM,
-        c_buf.addr, out_start, 1, Nt,
-        OUT_SUBBLOCK_W, OUT_SUBBLOCK_H * Nt,
-        OUT_SUBBLOCK_W, OUT_SUBBLOCK_H,
-        OUT_SUBBLOCK_NUM_TILES,
-        IN1_NUM_SUBBLOCKS, IN0_NUM_SUBBLOCKS,
+        c_buf.addr, out_start, 1, plan.nt,
+        plan.out_subblock_w, plan.out_subblock_h * plan.nt,
+        plan.out_subblock_w, plan.out_subblock_h,
+        plan.out_subblock_num_tiles,
+        plan.in1_num_subblocks, plan.in0_num_subblocks,
       ]
 
     def compute_args(core_idx: int, core_xy: tuple[int, int], n_cores: int) -> list[int]:
@@ -847,14 +1020,14 @@ def main():
       compute_rt_args=compute_args,
       cbs=[0, 1, 16, 24],
       tile_size=TILE_BYTES,
-      num_pages=CB0_PAGES,
+      num_pages=plan.cb0_pages,
       cores=active_cores,
       num_sems=NUM_SEMS,
       cb_config={
-        0:  (CB0_PAGES, TILE_BYTES),
-        1:  (CB1_PAGES, TILE_BYTES),
-        16: (CB16_PAGES, TILE_BYTES),
-        24: (CB24_PAGES, CB24_TILE_BYTES),
+        0:  (plan.cb0_pages, TILE_BYTES),
+        1:  (plan.cb1_pages, TILE_BYTES),
+        16: (plan.cb16_pages, TILE_BYTES),
+        24: (plan.cb24_pages, CB24_TILE_BYTES),
       },
       name="matmul_peak",
       sources={
