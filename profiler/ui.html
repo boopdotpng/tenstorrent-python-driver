@@ -13,10 +13,6 @@ body{background:#111;color:#ccc;font:13px/1.4 'SF Mono',Menlo,monospace;display:
 #sidebar h3{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
 #prog-list{display:flex;flex-direction:column;gap:4px;overflow-y:auto;max-height:40vh;flex-shrink:1}
 .note{margin-top:8px;color:#9a9a9a;font-size:10px;line-height:1.35}
-.toggle{display:flex;align-items:center;gap:6px;color:#b8b8b8;font-size:11px;margin-top:6px}
-.toggle input{accent-color:#70ad47}
-.legend{margin-top:8px;color:#aaa;font-size:10px;line-height:1.35}
-.chip{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 .dispatch-badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;margin-top:4px}
 .dispatch-badge.fast{background:#2a2a4a;color:#88f}
 .dispatch-badge.slow{background:#4a3a1a;color:#fa4}
@@ -24,8 +20,8 @@ body{background:#111;color:#ccc;font:13px/1.4 'SF Mono',Menlo,monospace;display:
 .prog-btn:hover{background:#2a2a2a}
 .prog-btn.active{background:#1a3a2a;border-color:#4a8;color:#8f8}
 #center{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
-#top-bar{background:#1a1a1a;border-bottom:1px solid #333;padding:8px 16px;display:flex;align-items:center;gap:16px;font-size:12px;flex-shrink:0}
-.stat{color:#888}.stat b{color:#eee}
+#stats-box{margin-top:10px;padding:8px;background:#222;border-radius:3px;font-size:10px;line-height:1.6;color:#888}
+#stats-box b{color:#ccc}
 #grid-wrap{flex:1;padding:16px;overflow:auto;display:flex;align-items:start;justify-content:center}
 .cell rect{transition:stroke .1s,stroke-width .1s}
 .cell.active rect:hover{stroke:#fff;stroke-width:2}
@@ -48,7 +44,7 @@ table.prof tr:hover td{background:#222}
 .zone-avg{color:#888;font-size:10px;margin-left:4px}
 #dock-warn{padding:6px 0 0;font-size:11px;color:#f88}
 #rpanel{width:0;overflow:hidden;background:#161616;border-left:1px solid #333;display:flex;flex-direction:column;transition:width .15s ease}
-#rpanel.open{width:380px;min-width:380px}
+#rpanel.open{width:550px;min-width:550px}
 #rpanel-scroll{flex:1;overflow-y:auto;padding:14px}
 #source-panel{display:none}
 #source-panel h4{color:#888;font-size:10px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;margin-top:10px}
@@ -59,13 +55,8 @@ pre.src code{font-size:11px;line-height:1.35;padding:8px!important;display:block
 .zone-tag{font-size:9px;padding:1px 5px;border-radius:2px;margin-left:8px;font-family:'SF Mono',Menlo,monospace;vertical-align:middle}
 </style></head>
 <body>
-<div id="sidebar"><h3>Programs</h3><div id="dispatch-line"></div><div id="prog-list"></div><div id="dram-note" class="note"></div><div id="dram-legend" class="legend"></div><div id="limit-note" class="note"></div></div>
+<div id="sidebar"><h3>Programs</h3><div id="dispatch-line"></div><div id="prog-list"></div><div id="stats-box"></div><div id="dram-note" class="note"></div><div id="limit-note" class="note"></div></div>
 <div id="center">
-  <div id="top-bar">
-    <span class="stat">Max: <b id="st-max">-</b></span>
-    <span class="stat">Min: <b id="st-min">-</b></span>
-    <span class="stat">Mean ± Std.dev: <b id="st-std">-</b></span>
-  </div>
   <div id="grid-wrap"><svg id="grid-svg"></svg></div>
   <div id="dock"><div id="dock-inner">
     <div id="dock-content"><div id="dock-tables"></div><div id="dock-warn"></div></div>
@@ -108,10 +99,6 @@ function buildSidebar(){
   } else {
     d3.select('#dram-note').text('');
   }
-  d3.select('#dram-legend').html(
-    `<div><span class="chip" style="background:#2d6e9f"></span>DRAM tile</div>` +
-    `<div><span class="chip" style="background:#3a3a3a"></span>Fused-off DRAM tile</div>`
-  );
   const btns = d3.select('#prog-list').selectAll('button').data(D.programs);
   btns.enter().append('button').attr('class','prog-btn')
     .on('click', (_,d)=> selectProgram(D.programs.indexOf(d)))
@@ -120,7 +107,7 @@ function buildSidebar(){
       const label = p.name&&p.name.trim() ? esc(p.name) : `Program ${p.index}`;
       return `${label}<br><span style="color:#888;font-size:11px">${p.cores.length} cores</span>`;
     });
-  d3.select('#limit-note').text(D.dispatch_mode==='fast' ? 'Fast dispatch DRAM profiling currently keeps only the first 32 programs.' : '');
+  d3.select('#limit-note').text(D.dispatch_mode==='fast' && D.programs.length > 32 ? 'Fast dispatch DRAM profiling keeps only the first 32 programs.' : '');
 }
 
 function selectProgram(idx){
@@ -320,17 +307,11 @@ function showDock(key){
   if(!p){ d3.select('#dock').classed('open',false); return }
   const riscOrder = { BRISC: 0, TRISC0: 1, TRISC1: 2, TRISC2: 3, NCRISC: 4 };
   const riscs = [...p.riscs].sort((a, b) => (riscOrder[a.name] ?? 99) - (riscOrder[b.name] ?? 99));
-  const riscKernelCycles = riscs
-    .map(r => (r.kern_start!=null && r.kern_end!=null && r.kern_end>r.kern_start) ? (r.kern_end-r.kern_start) : 0)
-    .filter(v => v > 0);
-  const serialKernelCycles = riscKernelCycles.reduce((a,b)=>a+b, 0);
   const wallKernelCycles = p.total_cycles || 0;
-  const overlapCycles = Math.max(0, serialKernelCycles - wallKernelCycles);
-  const overlapPct = serialKernelCycles > 0 ? (100 * overlapCycles / serialKernelCycles) : 0;
 
   // RISC table
   let h = `<div style="color:#aaa;font-size:11px;margin-bottom:4px">Core wall time: <b style="color:#fff">${fmtUs(wallKernelCycles)}</b> (${fmtCyc(wallKernelCycles)} cycles)</div>`;
-  h += `<div style="color:#888;font-size:10px;margin-bottom:6px">Estimated overlap: ${fmtUs(overlapCycles)} (${overlapPct.toFixed(1)}%)</div>`;
+  h += `<div style="color:#666;font-size:10px;margin-bottom:6px">Per-RISC times are total runtimes (RISCs execute in parallel)</div>`;
   h += `<table class="prof"><tr><th>RISC</th><th>FW</th><th>Kernel</th></tr>`;
   for (const r of riscs) {
     const fw = (r.fw_start!=null && r.fw_end!=null) ? r.fw_end-r.fw_start : null;
@@ -466,19 +447,14 @@ function updateStats(){
   const prog = D.programs[selProg];
   const vals = Object.values(prog.profiles).map(p=>p.total_cycles).filter(v=>v>0);
   const fmt = v=>(v/D.freq_mhz).toFixed(2)+'us';
-  d3.select('#st-max').text(vals.length ? fmt(d3.max(vals)) : '-');
-  d3.select('#st-min').text(vals.length ? fmt(d3.min(vals)) : '-');
-  if (!vals.length) {
-    d3.select('#st-std').text('-');
-    return;
-  }
+  if (!vals.length) { d3.select('#stats-box').html('<span style="color:#666">No profiler data</span>'); return }
   const mean = d3.mean(vals);
-  const varPop = d3.mean(vals.map(v => {
-    const d = v - mean;
-    return d * d;
-  }));
-  const std = Math.sqrt(varPop);
-  d3.select('#st-std').text(`${fmt(mean)} ± ${fmt(std)}`);
+  const std = Math.sqrt(d3.mean(vals.map(v => { const d = v - mean; return d * d })));
+  d3.select('#stats-box').html(
+    `Max <b>${fmt(d3.max(vals))}</b><br>` +
+    `Min <b>${fmt(d3.min(vals))}</b><br>` +
+    `Mean <b>${fmt(mean)} ± ${fmt(std)}</b>`
+  );
 }
 </script>
 </body></html>

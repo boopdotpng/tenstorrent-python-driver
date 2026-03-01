@@ -184,8 +184,7 @@ def _layout(device):
     for bank in range(Dram.BANK_COUNT)
     for y in Dram.BANK_TILE_YS[bank]
   ]
-  # Keep a blank spacer column (x=8) left of right DRAM column (x=9) to match BH NoC layout.
-  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles} | {8})
+  grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles})
   grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
   return dram_tiles, grid_x, grid_y
 
