@@ -264,8 +264,10 @@ class _FastCQ:
         return
       if time.perf_counter() > deadline:
         wr_16b, wr_toggle = self._read_completion_wr_ptr()
-        print(f"  completion wr=0x{wr_16b:x} toggle={wr_toggle} rd=0x{self._completion_rd_16b:x} rd_toggle={self._completion_rd_toggle}")
-        raise TimeoutError("timeout waiting for CQ host completion event")
+        raise TimeoutError(
+          f"timeout waiting for CQ host completion event "
+          f"(completion wr=0x{wr_16b:x} toggle={wr_toggle} rd=0x{self._completion_rd_16b:x} rd_toggle={self._completion_rd_toggle})"
+        )
       time.sleep(0.0002)
 
   def reset_run_state(self):
@@ -285,7 +287,6 @@ class _FastCQ:
 
 
 class FastDevice(DeviceBase):
-  DISPATCH_STREAM_INDEX = 48
   DISPATCH_MSG_OFFSET = 0
   _PROFILER_BYTES_PER_RISC = TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC
 
@@ -300,13 +301,9 @@ class FastDevice(DeviceBase):
         return (x, col_ys[i]), (x, col_ys[i + 1])
     raise RuntimeError("could not find a valid dispatch pair on a single column")
 
-  def _firmware_skip_cores(self) -> set[Core]:
-    self._dispatch_core_pair = self._select_dispatch_core_pair()
-    return set()
-
   def __init__(self, device: int = 0):
     super().__init__(device=device, enable_sysmem=True, init_core_plans=False)
-    self.prefetch_core, self.dispatch_core = getattr(self, "_dispatch_core_pair", self._select_dispatch_core_pair())
+    self.prefetch_core, self.dispatch_core = self._select_dispatch_core_pair()
     self.dispatchable_cores = [c for c in self.worker_cores if c not in {self.prefetch_core, self.dispatch_core}]
     self._core_plans = self._build_core_plans()
     self._cq = _FastCQ(
@@ -586,7 +583,6 @@ class FastDevice(DeviceBase):
 
   def run(self):
     if not self._exec_list:
-      self.last_timing = None
       self.last_device_timing = None
       return self.last_profile
 
@@ -596,7 +592,6 @@ class FastDevice(DeviceBase):
     programs_info = self._profile_programs_info()
     if PROFILER:
       self._enqueue_profiler_init()
-    prev_id = None
     last_cores = None
     prof_idx = 0
     for i, program in enumerate(self._exec_list):
@@ -615,8 +610,7 @@ class FastDevice(DeviceBase):
         payloads = patched
         if getattr(program, "profile", True):
           prof_idx += 1
-      skip = False
-      self._enqueue_program_setup(plan, payloads, skip_upload=skip)
+      self._enqueue_program_setup(plan, payloads, skip_upload=False)
       ts_slot = 2 * i
       if ts_slot + 1 < TIMESTAMP_MAX_SLOTS:
         nxy, addr = self._ts_noc_dest(ts_slot)
@@ -625,7 +619,6 @@ class FastDevice(DeviceBase):
       if ts_slot + 1 < TIMESTAMP_MAX_SLOTS:
         nxy, addr = self._ts_noc_dest(ts_slot + 1)
         self._cq.enqueue_timestamp(nxy, addr)
-      prev_id = id(program)
       last_cores = plan.cores
 
     self._cq.enqueue_host_event(self._event_id)
@@ -641,12 +634,6 @@ class FastDevice(DeviceBase):
     total_s = t_end - t_run_start
     compute_s = t_end - t_compute_start
     dispatch_s = max(0.0, total_s - compute_s)
-    self.last_timing = {
-      "programs": program_count,
-      "total_s": total_s,
-      "dispatch_s": dispatch_s,
-      "compute_s": compute_s,
-    }
     self._event_id += 1
 
     # Read dispatch timestamps from DRAM (barrier first to flush DRAM caches)

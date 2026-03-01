@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from compiler import CkernelConfig, Compiler, DataFormat, MathFidelity
+from defs import Core
 from device import DataflowLaunch, Device, Program
 from dram import DType
 
@@ -41,8 +42,6 @@ MATH_FIDELITY = _MATH_FIDELITY_MAP[MATH_FIDELITY_NAME]
 BF16_SMALL_OUT_TILE_THRESHOLD = 16
 BF16_BLOCK_W_SMALL_CAP = 32
 BF16_BLOCK_W_LARGE_CAP = 64
-
-Core = tuple[int, int]
 
 def ceil32(x):
   return (x + 31) & ~31
@@ -900,8 +899,8 @@ def main():
   try:
     plan.validate_against(device.dispatchable_cores)
     grid = plan.grid()
-    cols = list(plan.cols)
-    rows = list(plan.rows)
+    cols = plan.cols
+    rows = plan.rows
     active_cores = plan.active_cores()
     print(f"Grid columns: {cols}")
     print(f"Grid rows: {rows}")
@@ -992,9 +991,6 @@ def main():
         plan.in1_num_subblocks, plan.in0_num_subblocks,
       ]
 
-    def compute_args(core_idx: int, core_xy: tuple[int, int], n_cores: int) -> list[int]:
-      return []
-
     dataflow: list[DataflowLaunch] = []
     for cores, reader_k, writer_k in (
       (top_left, reader_sender, writer_sender),
@@ -1017,7 +1013,7 @@ def main():
     program = Program(
       dataflow=dataflow,
       compute=compute,
-      compute_rt_args=compute_args,
+      compute_rt_args=[],
       cbs=[0, 1, 16, 24],
       tile_size=TILE_BYTES,
       num_pages=plan.cb0_pages,

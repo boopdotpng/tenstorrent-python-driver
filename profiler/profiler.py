@@ -29,10 +29,9 @@ _PKT_TS_DATA = 3
 _PKT_TS_EVENT = 4
 _PKT_TS_DATA_16B = 5
 
-def _read_ctrl_and_buffer_base(win):
+def _read_ctrl(win):
   raw = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
-  ctrl = struct.unpack("<32I", raw)
-  return ctrl, TensixL1.PROFILER_BUFFERS, TensixL1.PROFILER_CONTROL
+  return struct.unpack("<32I", raw)
 
 def _hash_profiler_msg(name: str, fpath: str, lineno: int) -> int:
   return hash16(f"{name},{fpath},{lineno},KERNEL_PROFILER")
@@ -56,7 +55,8 @@ def _parse_marker(w0, w1):
   return zone_hash, ptype, ts
 
 def read_core(win, core):
-  ctrl, buf_base, _ = _read_ctrl_and_buffer_base(win)
+  ctrl = _read_ctrl(win)
+  buf_base = TensixL1.PROFILER_BUFFERS
 
   result = {"core": core, "dropped": ctrl[_DROPPED], "done": ctrl[_DONE], "riscs": []}
 
@@ -325,7 +325,7 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
     } for info in programs_info
   }
   debug = os.environ.get("TT_PROFILER_DEBUG") == "1"
-  debug_left = 3
+  debug_cores_remaining = 3
 
   needed = set()
   for info in programs_info:
@@ -335,7 +335,7 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
     flat_id = core_flat_ids[core]
     l1_cfg.start = l1_cfg.end = core
     device.win.configure(l1_cfg)
-    ctrl, _, ctrl_base = _read_ctrl_and_buffer_base(device.win)
+    ctrl = _read_ctrl(device.win)
     page_id = flat_id // core_count_per_dram
     slot = (flat_id % core_count_per_dram) * 5 * _HOST_BUF_BYTES_PER_RISC
     by_program = {}
@@ -344,17 +344,17 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
       base = page_id * page_size + slot + risc * _HOST_BUF_BYTES_PER_RISC
       raw = dram_raw[base : base + host_end * 4]
       words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
-      if debug and debug_left > 0 and risc == 0:
+      if debug and debug_cores_remaining > 0 and risc == 0:
         dev_ends = [ctrl[_DEVICE_BUF_END + i] for i in range(5)]
         host_ends = [ctrl[_HOST_BUF_END + i] for i in range(5)]
         sample_words = list(words[:16])
         nonzero = sum(1 for w in words[:128] if w != 0)
         print(
-          f"[profdbg] core={core} ctrl_base=0x{ctrl_base:x} done={ctrl[_DONE]} dropped=0x{ctrl[_DROPPED]:x} "
+          f"[profdbg] core={core} done={ctrl[_DONE]} dropped=0x{ctrl[_DROPPED]:x} "
           f"host_ends={host_ends} dev_ends={dev_ends} host_end_r0={host_end} sample_nonzero_first128={nonzero}"
         )
         print(f"[profdbg] core={core} r0_words16={sample_words}")
-        debug_left -= 1
+        debug_cores_remaining -= 1
       for prog_id, r in _parse_risc_words(words, flat_id, risc, program_ids).items():
         by_program.setdefault(prog_id, []).append(r)
 

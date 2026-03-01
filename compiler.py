@@ -114,10 +114,10 @@ def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
     formats[cb_id] = fmt.value
 
   tile_sizes = [_tile_size(fmt) for fmt in formats]
-  arr = lambda vals: ", ".join(str(v) for v in vals)
-  arr32 = lambda v: arr([v] * 32)
+  def arr(vals): return ", ".join(str(v) for v in vals)
+  def arr32(v): return arr([v] * 32)
   dst_sync_mode = "DstSync::SyncFull" if cfg.dst_full_sync else "DstSync::SyncHalf"
-  b = lambda v: "true" if v else "false"
+  def bool_str(v): return "true" if v else "false"
 
   return {
     "chlkc_unpack_data_format.h":
@@ -151,7 +151,7 @@ def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
       f"constexpr uint16_t pack_tile_size[32] = {{{arr(tile_sizes)}}};\n",
     "chlkc_dst_accum_mode.h":
       "#pragma once\n"
-      f"constexpr bool DST_ACCUM_MODE = {b(cfg.dst_accum_mode)};\n",
+      f"constexpr bool DST_ACCUM_MODE = {bool_str(cfg.dst_accum_mode)};\n",
     "chlkc_dst_sync_mode.h":
       "#pragma once\n"
       f"#define DST_SYNC_MODE {dst_sync_mode}\n",
@@ -161,7 +161,7 @@ def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
       f"constexpr std::int32_t MATH_FIDELITY = {cfg.math_fidelity.value};\n",
     "chlkc_math_approx_mode.h":
       "#pragma once\n"
-      f"constexpr bool APPROX = {b(cfg.approx)};\n",
+      f"constexpr bool APPROX = {bool_str(cfg.approx)};\n",
   }
 
 _PROFILE_DEFINES = [

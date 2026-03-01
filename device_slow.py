@@ -5,8 +5,6 @@ from device import DeviceBase, Program, AddrPayload, Rect
 from helpers import PROFILER
 
 class SlowDevice(DeviceBase):
-  def __init__(self, device: int = 0, enable_sysmem: bool = False, init_core_plans: bool = True):
-    super().__init__(device=device, enable_sysmem=enable_sysmem, init_core_plans=init_core_plans)
 
   @staticmethod
   def _mcast_write_rects(win: TLBWindow, cfg: TLBConfig, rects: list[Rect], writes: list[AddrPayload]):
@@ -65,27 +63,10 @@ class SlowDevice(DeviceBase):
 
   def run(self):
     if not self._exec_list:
-      self.last_timing = None
       return self.last_profile
     self.last_profile = None
-    program_count = len(self._exec_list)
-    t_run_start = time.perf_counter()
-    dispatch_s = 0.0
-    compute_s = 0.0
     for p in self._exec_list:
-      d_s, c_s = self._run_single(p)
-      dispatch_s += d_s
-      compute_s += c_s
-    total_s = time.perf_counter() - t_run_start
-    spill_s = total_s - (dispatch_s + compute_s)
-    if spill_s > 0:
-      dispatch_s += spill_s
-    self.last_timing = {
-      "programs": program_count,
-      "total_s": total_s,
-      "dispatch_s": dispatch_s,
-      "compute_s": compute_s,
-    }
+      self._run_single(p)
     programs_info = self._profile_programs_info()
     if programs_info:
       import profiler

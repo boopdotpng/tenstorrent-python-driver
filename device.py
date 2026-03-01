@@ -5,7 +5,7 @@ from pathlib import Path
 from defs import *
 from compiler import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import USE_USB_DISPATCH, PROFILER, align_down, generate_jal_instruction, noc_xy
+from helpers import USE_USB_DISPATCH, PROFILER, PROFILER_UI, align_down, generate_jal_instruction, noc_xy
 from dram import DramAllocator
 
 CoreSpec = int | CoreList | Literal["all"]
@@ -80,7 +80,6 @@ class TileGrid:
   TENSIX_X: ClassVar[tuple[int, ...]] = (*range(1, 8), *range(10, 15))
   TENSIX_Y: ClassVar[tuple[int, int]] = (2, 11)
   TENSIX: ClassVar[CoreList] = [(x, y) for x in TENSIX_X for y in range(2, 12)]
-  TENSIX_MCAST: ClassVar[CoreList] = [(1, 7), (10, 14)]
 
   harvested_dram_bank: int
   dram: DramTileList = field(init=False)
@@ -360,7 +359,7 @@ class CommonDevice:
     global _LIVE_DEVICE_REF
     if hasattr(self, "dram"): self.dram.close()
     if hasattr(self, "win"): self.win.free()
-    if isinstance(getattr(self, "fd", None), int) and self.fd >= 0:
+    if getattr(self, "fd", -1) >= 0:
       os.close(self.fd)
     self.fd = -1
     self._closed = True
@@ -418,7 +417,7 @@ class CommonDevice:
     if getattr(self, "_closed", False):
       return
     try:
-      if isinstance(getattr(self, "fd", None), int) and self.fd >= 0:
+      if getattr(self, "fd", -1) >= 0:
         self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
     finally:
       self._close()
@@ -432,7 +431,6 @@ class DeviceBase(CommonDevice):
       self._core_plans = self._build_core_plans()
     self._exec_list: list[Program] = []
     self.last_profile: dict | None = None
-    self.last_timing: dict[str, float | int] | None = None
     self.win = TLBWindow(self.fd, TLBSize.MiB_2)
     self.dram = DramAllocator(fd=self.fd, dram_tiles=self.tiles.dram, device=self, enable_sysmem=enable_sysmem)
 
@@ -458,30 +456,22 @@ class DeviceBase(CommonDevice):
     return info
 
   def _finish_run(self, profile_data: dict | None = None):
+    self._exec_list.clear()
     if profile_data is not None:
       self.last_profile = profile_data
-      self._exec_list.clear()
-      if os.environ.get("TT_PROFILER_UI") == "0":
+      if not PROFILER_UI:
         import profiler
         profiler.print_data_summary(profile_data)
         return self.last_profile
       from profiler import ui as profiler_ui
       profiler_ui.serve(profile_data)
-      return self.last_profile
-    self._exec_list.clear()
     return self.last_profile
 
   def profiler_freq_mhz(self) -> int:
     try:
       return int(self._read_arc_telem_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK))
-    except Exception:
+    except RuntimeError:
       return 1000
-
-  def resolve_cores(self, cores: CoreSpec = "all") -> CoreList:
-    return list(self._resolve_core_plan(cores).cores)
-
-  def resolve_mcast_rects(self, cores: CoreSpec = "all") -> list[Rect]:
-    return list(self._resolve_core_plan(cores).rects)
 
   # -- Core planning --
 

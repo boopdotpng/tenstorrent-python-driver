@@ -4,8 +4,7 @@ from dataclasses import dataclass
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
 PROFILER = os.environ.get("TT_PROFILER") == "1"
-HiReloc = tuple[int, int]
-LoReloc = tuple[int, int, int]
+PROFILER_UI = os.environ.get("TT_PROFILER_UI") != "0"
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
@@ -42,10 +41,6 @@ def iter_pt_load(elf: bytes):
     if p_offset + p_filesz > len(elf): raise ValueError("ELF truncated")
     paddr = p_paddr or p_vaddr
     yield PTLoad(paddr=paddr, data=elf[p_offset : p_offset + p_filesz], memsz=p_memsz, flags=p_flags)
-
-def load_pt_load(path: str | os.PathLike[str]) -> list[PTLoad]:
-  with open(os.fspath(path), "rb") as f:
-    return list(iter_pt_load(f.read()))
 
 def _xipify_riscv32_elf(elf: bytes) -> bytes:
   # Minimal XIP relocation transform for kernel ELFs:
@@ -120,8 +115,8 @@ def _xipify_riscv32_elf(elf: bytes) -> bytes:
       continue
 
     rela_count = sh_size // sh_entsize
-    hi_by_sym: dict[int, list[HiReloc]] = {}
-    lo_relocs: list[LoReloc] = []
+    hi_by_sym: dict[int, list[tuple[int, int]]] = {}
+    lo_relocs: list[tuple[int, int, int]] = []
 
     for j in range(rela_count):
       roff = sh_offset + j * sh_entsize

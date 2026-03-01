@@ -12,7 +12,6 @@ Usage:
 """
 from __future__ import annotations
 import os, random, struct
-from collections import OrderedDict
 
 os.environ.setdefault("TT_PROFILER", "1")
 os.environ.setdefault("TT_PROFILER_UI", "0")
@@ -113,7 +112,7 @@ void MAIN {
 # SFPU operations to benchmark
 # ---------------------------------------------------------------------------
 
-OPS = OrderedDict([
+OPS = dict([
   ("load_store", {
     "init": "",
     "body": "{ vFloat t = dst_reg[v]; dst_reg[v] = t; }",
@@ -298,7 +297,7 @@ def main():
       dtype=DType.bfloat16, shape=(n_cores, 32, 32),
     )
 
-    results = OrderedDict()
+    results = {}
     for op_name, op in OPS.items():
       kern_src = make_kernel(op)
       compute = compiler.compile_compute(kern_src)
