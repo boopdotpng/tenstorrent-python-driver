@@ -1,11 +1,11 @@
-import atexit, os, struct, time, weakref
+import os, struct, time
 from dataclasses import dataclass, field
 from typing import ClassVar, Callable, Literal
 from pathlib import Path
 from defs import *
 from compiler import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import USE_USB_DISPATCH, PROFILER, PROFILER_UI, align_down, generate_jal_instruction, noc_xy
+from helpers import USE_USB_DISPATCH, PROFILER, align_down, generate_jal_instruction, noc_xy
 from dram import DramAllocator
 
 CoreSpec = int | CoreList | Literal["all"]
@@ -17,18 +17,6 @@ CorePair = tuple[Core, Core]
 AddrPayload = tuple[int, bytes]
 RtaSizes = tuple[int, int, int]
 FAST_CQ_NUM_CIRCULAR_BUFFERS = 32
-_LIVE_DEVICE_REF = None
-
-def _close_live_devices_at_exit():
-  dev = _LIVE_DEVICE_REF() if _LIVE_DEVICE_REF is not None else None
-  if dev is None:
-    return
-  try:
-    dev.close()
-  except Exception:
-    pass
-
-atexit.register(_close_live_devices_at_exit)
 
 @dataclass
 class DataflowLaunch:
@@ -110,8 +98,6 @@ class CommonDevice:
     self.dispatchable_cores = list(self.worker_cores)
     self._closed = False
     self.upload_firmware()
-    global _LIVE_DEVICE_REF
-    _LIVE_DEVICE_REF = weakref.ref(self)
 
   def _core_exists(self, core: Core) -> bool:
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
@@ -136,12 +122,6 @@ class CommonDevice:
   }
 
   def upload_firmware(self):
-    skip = self._firmware_skip_cores()
-    # Always upload firmware for this process so the active runtime mode
-    # (e.g. TT_PROFILER on/off) cannot inherit stale images from a prior run.
-    cores = [core for core in self.worker_cores if core not in skip]
-    if not cores: return
-
     fw = compile_firmware(profile=PROFILER)
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
 
@@ -192,11 +172,11 @@ class CommonDevice:
           win.write32(reg - reg_base, base)
 
       cfg.mcast = False
-      for core in cores:
+      for core in self.worker_cores:
         cfg.start = cfg.end = core
         _reset_and_stage()
 
-      test_tile = cores[0]
+      test_tile = self.worker_cores[0]
       cfg.start, cfg.end = test_tile, test_tile
       cfg.addr, cfg.mode = 0, TLBMode.STRICT
       cfg.mcast = False
@@ -208,7 +188,7 @@ class CommonDevice:
         cfg.addr, cfg.mode = 0, TLBMode.RELAXED
         win.configure(cfg)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
-      for core in cores:
+      for core in self.worker_cores:
         cfg.start = cfg.end = core
         _write_bank_tables()
 
@@ -217,19 +197,14 @@ class CommonDevice:
         win.configure(cfg)
         win.read32(reg_off)
         win.write32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
-      for core in cores:
+      for core in self.worker_cores:
         cfg.start = cfg.end = core
         _release_brisc()
 
     self._wait_firmware_ready()
 
-  def _firmware_skip_cores(self) -> set[Core]:
-    return set()
-
   def _wait_firmware_ready(self):
-    skip = self._firmware_skip_cores()
-    candidates = [core for core in self.worker_cores if core not in skip]
-    tile = (1, 2) if (1, 2) in candidates else candidates[0]
+    tile = (1, 2) if (1, 2) in self.worker_cores else self.worker_cores[0]
     cfg = TLBConfig(addr=0, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
       deadline = time.perf_counter() + 2.0
@@ -356,15 +331,12 @@ class CommonDevice:
   def _close(self):
     if getattr(self, "_closed", False):
       return
-    global _LIVE_DEVICE_REF
     if hasattr(self, "dram"): self.dram.close()
     if hasattr(self, "win"): self.win.free()
     if getattr(self, "fd", -1) >= 0:
       os.close(self.fd)
     self.fd = -1
     self._closed = True
-    if _LIVE_DEVICE_REF is not None and _LIVE_DEVICE_REF() is self:
-      _LIVE_DEVICE_REF = None
 
   def arc_msg(self, msg: int, arg0: int = 0, arg1: int = 0, queue: int = 0, timeout_ms: int = 1000) -> list[int]:
     MSG_QUEUE_SIZE, REQUEST_MSG_LEN, RESPONSE_MSG_LEN = 4, 8, 8
@@ -459,10 +431,6 @@ class DeviceBase(CommonDevice):
     self._exec_list.clear()
     if profile_data is not None:
       self.last_profile = profile_data
-      if not PROFILER_UI:
-        import profiler
-        profiler.print_data_summary(profile_data)
-        return self.last_profile
       from profiler import ui as profiler_ui
       profiler_ui.serve(profile_data)
     return self.last_profile

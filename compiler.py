@@ -4,11 +4,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-import hashlib, re, shutil, subprocess, tempfile
+import pickle, re, shutil, subprocess, tempfile
 
 _DEPS = Path(__file__).resolve().parent / "tt-metal-deps"
 _REPO = Path(__file__).resolve().parent
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
+_CACHE_DIR = Path.home() / ".cache" / "tt-cache"
 
 Strs = list[str]
 
@@ -74,10 +75,6 @@ _INCLUDES = [f"-I{_INC}", *(f"-I{_INC / p}" for p in _INCLUDE_PATHS)]
 _CFLAGS = (
   "-std=c++17", "-flto=auto", "-ffast-math", "-fno-exceptions",
   "-fno-use-cxa-atexit",
-  "-Wall", "-Werror", "-Wno-unknown-pragmas",
-  "-Wno-deprecated-declarations", "-Wno-error=multistatement-macros",
-  "-Wno-error=parentheses", "-Wno-error=unused-but-set-variable",
-  "-Wno-unused-variable", "-Wno-unused-function",
 )
 _LFLAGS = ("-Wl,-z,max-page-size=16", "-Wl,-z,common-page-size=16", "-nostartfiles")
 
@@ -96,14 +93,6 @@ _CQ_INC = [str(_CQ_SRC_DIR)]
 _CQ_PREFETCH_SRC = (_CQ_SRC_DIR / "cq_prefetch.cpp").read_text()
 _CQ_DISPATCH_SRC = (_CQ_SRC_DIR / "cq_dispatch.cpp").read_text()
 _CQ_DISPATCH_S_SRC = (_CQ_SRC_DIR / "cq_dispatch_subordinate.cpp").read_text()
-
-def _cq_dependency_hash() -> str:
-  files = sorted(
-    path for path in _CQ_SRC_DIR.iterdir()
-    if path.suffix in (".h", ".hpp", ".c", ".cc", ".cpp")
-  )
-  payload = "".join(f"{path.name}\0{path.read_text()}\0" for path in files)
-  return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
   in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
@@ -223,6 +212,10 @@ _FW_TARGETS = [
 ]
 
 def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
+  cached = _CACHE_DIR / ("firmware_profiler.pkl" if profile else "firmware.pkl")
+  if cached.is_file():
+    return pickle.loads(cached.read_bytes())
+
   cc = _SFPI / "riscv-tt-elf-g++"
   assert cc.is_file(), f"missing compiler: {cc}"
 
@@ -260,6 +253,8 @@ def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
     text_base = segs[0].paddr
     result[target] = CompiledFirmware(elf_bytes=elf, segments=segs, text_base=text_base)
 
+  _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  cached.write_bytes(pickle.dumps(result))
   return result
 
 class Compiler:
@@ -382,21 +377,22 @@ class CompiledCQKernels:
   dispatch_s_ncrisc: CompiledKernel
 
 def compile_cq_kernels() -> CompiledCQKernels:
-  compiler = Compiler()
-  dep_hash = _cq_dependency_hash()
-  source_tag = f"// cq_deps={dep_hash}\n"
+  cached = _CACHE_DIR / "cq_kernels.pkl"
+  if cached.is_file():
+    return pickle.loads(cached.read_bytes())
 
-  return CompiledCQKernels(
-    prefetch_brisc=compiler._compile_dataflow(source_tag + _CQ_PREFETCH_SRC, "brisc", noc_index=0,
-      extra_includes=_CQ_INC,
-      xip_relocate=True, profiler=False),
-    dispatch_brisc=compiler._compile_dataflow(source_tag + _CQ_DISPATCH_SRC, "brisc", noc_index=1,
-      extra_includes=_CQ_INC,
-      xip_relocate=True, profiler=False),
-    dispatch_s_ncrisc=compiler._compile_dataflow(source_tag + _CQ_DISPATCH_S_SRC, "ncrisc", noc_index=1,
-      extra_includes=_CQ_INC,
-      xip_relocate=True, profiler=False),
+  compiler = Compiler()
+  result = CompiledCQKernels(
+    prefetch_brisc=compiler._compile_dataflow(_CQ_PREFETCH_SRC, "brisc", noc_index=0,
+      extra_includes=_CQ_INC, xip_relocate=True, profiler=False),
+    dispatch_brisc=compiler._compile_dataflow(_CQ_DISPATCH_SRC, "brisc", noc_index=1,
+      extra_includes=_CQ_INC, xip_relocate=True, profiler=False),
+    dispatch_s_ncrisc=compiler._compile_dataflow(_CQ_DISPATCH_S_SRC, "ncrisc", noc_index=1,
+      extra_includes=_CQ_INC, xip_relocate=True, profiler=False),
   )
+  _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  cached.write_bytes(pickle.dumps(result))
+  return result
 
 def _tile_size(fmt: int) -> int:
   sizes = {

@@ -8,13 +8,12 @@ device profiler.
 The benchmark subtracts a load/store baseline to isolate pure SFPU compute cost.
 
 Usage:
-  TT_PROFILER=1 TT_PROFILER_UI=0 python3 examples/sfpu_bench.py
+  TT_PROFILER=1 python3 examples/sfpu_bench.py
 """
 from __future__ import annotations
 import os, random, struct
 
 os.environ.setdefault("TT_PROFILER", "1")
-os.environ.setdefault("TT_PROFILER_UI", "0")
 
 from compiler import Compiler
 from device import Device, Program, DataflowLaunch

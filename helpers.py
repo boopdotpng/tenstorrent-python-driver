@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
 PROFILER = os.environ.get("TT_PROFILER") == "1"
-PROFILER_UI = os.environ.get("TT_PROFILER_UI") != "0"
 
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
