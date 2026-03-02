@@ -9,13 +9,13 @@ This is a low level driver for blackhole p100a (i don't have a p150a so i can't 
 Do not run multiple device-using commands in parallel. Only one process can own the device at a time, so run hardware tests strictly sequentially.
 
 **Definition of done:** A feature is not complete until it passes both dispatch modes:
-1. Fast dispatch (default): `python3 examples/matmul_peak.py`
-2. Slow dispatch: `TT_USB=1 python3 examples/matmul_peak.py`
+1. Fast dispatch (default): `PYTHONPATH=. uv run examples/matmul_peak.py`
+2. Slow dispatch: `PYTHONPATH=. TT_USB=1 uv run examples/matmul_peak.py`
 
 **Device locking:** Multiple agents may be working in this repo concurrently. Always wrap device-accessing commands with `flock` to prevent collisions that brick the device:
 ```bash
-flock /tmp/tt-device.lock python3 examples/matmul_peak.py
-flock /tmp/tt-device.lock env TT_USB=1 python3 examples/matmul_peak.py
+flock /tmp/tt-device.lock PYTHONPATH=. uv run examples/matmul_peak.py
+flock /tmp/tt-device.lock env TT_USB=1 PYTHONPATH=. uv run examples/matmul_peak.py
 flock /tmp/tt-device.lock tt-smi -r
 ```
 This blocks until the lock is free — no polling or sleep needed.
