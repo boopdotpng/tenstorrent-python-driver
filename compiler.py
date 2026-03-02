@@ -11,15 +11,8 @@ _REPO = Path(__file__).resolve().parent
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
 _CACHE_DIR = Path.home() / ".cache" / "tt-cache"
 
-Strs = list[str]
-
 # Zone hash→name mapping captured from DeviceZoneScopedN #pragma messages
 _zone_map: dict[int, tuple[str, str, int]] = {}  # hash → (name, file, line)
-
-def get_zone_map() -> dict[int, tuple[str, str, int]]:
-  return dict(_zone_map)
-LinkArgs = Strs | Callable[[Path], Strs]
-PrepareFn = Callable[[Path], None] | None
 
 class DataFormat(Enum):
   Float32 = 0
@@ -90,9 +83,6 @@ _KERNEL_DEFINES = [
 
 _CQ_SRC_DIR = _REPO / "firmware" / "cq"
 _CQ_INC = [str(_CQ_SRC_DIR)]
-_CQ_PREFETCH_SRC = (_CQ_SRC_DIR / "cq_prefetch.cpp").read_text()
-_CQ_DISPATCH_SRC = (_CQ_SRC_DIR / "cq_dispatch.cpp").read_text()
-_CQ_DISPATCH_S_SRC = (_CQ_SRC_DIR / "cq_dispatch_subordinate.cpp").read_text()
 
 def _render_ckernel_headers(cfg: CkernelConfig) -> dict[str, str]:
   in_fmt, out_fmt = cfg.input_format.value, cfg.output_format.value
@@ -186,7 +176,8 @@ def _run(exe: Path, args: list[str], cwd: Path):
         continue
       _zone_map[hash16(msg)] = (name, fpath, lineno)
 
-def _compile_and_link(cc: Path, src: Path, compile_args: Strs, link_args: LinkArgs, tmp_prefix: str, prepare: PrepareFn = None) -> bytes:
+def _compile_and_link(cc: Path, src: Path, compile_args: list[str], link_args: list[str] | Callable[[Path], list[str]],
+                      tmp_prefix: str, prepare: Callable[[Path], None] | None = None) -> bytes:
   build = Path(tempfile.mkdtemp(prefix=tmp_prefix))
   try:
     if prepare is not None:
@@ -280,8 +271,8 @@ class Compiler:
       self._compile_trisc(src, 2),
     )
 
-  def _compile_dataflow(self, src: str, target: str, noc_index: int, extra_defines: Strs | None = None,
-                        extra_includes: Strs | None = None,
+  def _compile_dataflow(self, src: str, target: str, noc_index: int, extra_defines: list[str] | None = None,
+                        extra_includes: list[str] | None = None,
                         xip_relocate: bool = False, profiler: bool = True) -> CompiledKernel:
     defines = [
       *_KERNEL_DEFINES,
@@ -298,7 +289,7 @@ class Compiler:
       extra_includes=extra_includes, xip_relocate=xip_relocate
     )
 
-  def _compile_trisc(self, src: str, trisc_id: int, profiler: bool = True) -> CompiledKernel:
+  def _compile_trisc(self, src: str, trisc_id: int) -> CompiledKernel:
     stage = ("unpack", "math", "pack")[trisc_id]
     defines = [
       *_KERNEL_DEFINES,
@@ -306,11 +297,11 @@ class Compiler:
       f"-DPROCESSOR_INDEX={trisc_id + 2}",
       f"-DUCK_CHLKC_{stage.upper()}", f"-DNAMESPACE=chlkc_{stage}",
     ]
-    if PROFILER and profiler:
+    if PROFILER:
       defines += _PROFILE_DEFINES
     return self._build(src, f"trisc{trisc_id}", defines, [], opt="-O3", trisc=True)
 
-  def _build(self, kern: str, target: str, defines: Strs, extra_objs: Strs, opt: str, trisc: bool, extra_includes: Strs | None = None,
+  def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str], opt: str, trisc: bool, extra_includes: list[str] | None = None,
              xip_relocate: bool = False) -> CompiledKernel:
     mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
            ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
@@ -327,7 +318,7 @@ class Compiler:
       if trisc:
         self._write_trisc_stubs(build)
 
-    def _kernel_link_args(_: Path) -> Strs:
+    def _kernel_link_args(_: Path) -> list[str]:
       assert fw_link_elf is not None
       ld = _DEPS / "toolchain" / "blackhole" / f"kernel_{target}.ld"
       objs = ["out.o", *extra_objs, str(_DEPS / "lib/blackhole/substitutes.o")]
@@ -381,13 +372,16 @@ def compile_cq_kernels() -> CompiledCQKernels:
   if cached.is_file():
     return pickle.loads(cached.read_bytes())
 
+  prefetch_src = (_CQ_SRC_DIR / "cq_prefetch.cpp").read_text()
+  dispatch_src = (_CQ_SRC_DIR / "cq_dispatch.cpp").read_text()
+  dispatch_s_src = (_CQ_SRC_DIR / "cq_dispatch_subordinate.cpp").read_text()
   compiler = Compiler()
   result = CompiledCQKernels(
-    prefetch_brisc=compiler._compile_dataflow(_CQ_PREFETCH_SRC, "brisc", noc_index=0,
+    prefetch_brisc=compiler._compile_dataflow(prefetch_src, "brisc", noc_index=0,
       extra_includes=_CQ_INC, xip_relocate=True, profiler=False),
-    dispatch_brisc=compiler._compile_dataflow(_CQ_DISPATCH_SRC, "brisc", noc_index=1,
+    dispatch_brisc=compiler._compile_dataflow(dispatch_src, "brisc", noc_index=1,
       extra_includes=_CQ_INC, xip_relocate=True, profiler=False),
-    dispatch_s_ncrisc=compiler._compile_dataflow(_CQ_DISPATCH_S_SRC, "ncrisc", noc_index=1,
+    dispatch_s_ncrisc=compiler._compile_dataflow(dispatch_s_src, "ncrisc", noc_index=1,
       extra_includes=_CQ_INC, xip_relocate=True, profiler=False),
   )
   _CACHE_DIR.mkdir(parents=True, exist_ok=True)

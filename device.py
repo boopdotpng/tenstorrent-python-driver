@@ -5,11 +5,10 @@ from pathlib import Path
 from defs import *
 from compiler import CompiledKernel, compile_firmware
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import USE_USB_DISPATCH, PROFILER, align_down, generate_jal_instruction, noc_xy
+from helpers import USE_USB_DISPATCH, PROFILER, generate_jal_instruction, noc_xy
 from dram import DramAllocator
 
 CoreSpec = int | CoreList | Literal["all"]
-BankPort = tuple[int, int]
 ArgGen = Callable[[int, Core, int], list[int]]
 Rect = tuple[int, int, int, int]
 McastDest = tuple[int, int]
@@ -122,6 +121,12 @@ class CommonDevice:
   }
 
   def upload_firmware(self):
+    skip = self._firmware_skip_cores()
+    # Always upload firmware for this process so the active runtime mode
+    # (e.g. TT_PROFILER on/off) cannot inherit stale images from a prior run.
+    cores = [core for core in self.worker_cores if core not in skip]
+    if not cores: return
+
     fw = compile_firmware(profile=PROFILER)
     reg_base, reg_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBSize.MiB_2)
 
@@ -147,19 +152,18 @@ class CommonDevice:
     go_msg = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
 
     with TLBWindow(self.fd, TLBSize.MiB_2) as win:
-      def _reset_and_stage():
+      cfg.mcast = False
+      for core in cores:
+        cfg.start = cfg.end = core
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.write32(reg_off, TensixMMIO.SOFT_RESET_ALL)
-
         cfg.mode = TLBMode.RELAXED
         for spans in staged.values():
           for addr, data in spans:
             win.write(addr, data, use_uc=True, restore=False)
-
         win.write(0x0, jal_insn.to_bytes(4, "little"), use_uc=True, restore=False)
         win.write(TensixL1.GO_MSG, go_msg, use_uc=True, restore=False)
-
         # Set reset PCs for NCRISC and TRISCs (BRISC uses the JAL at addr 0)
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
@@ -171,40 +175,29 @@ class CommonDevice:
         ]:
           win.write32(reg - reg_base, base)
 
-      cfg.mcast = False
-      for core in self.worker_cores:
-        cfg.start = cfg.end = core
-        _reset_and_stage()
-
-      test_tile = self.worker_cores[0]
-      cfg.start, cfg.end = test_tile, test_tile
-      cfg.addr, cfg.mode = 0, TLBMode.STRICT
-      cfg.mcast = False
-      win.configure(cfg)
-      cfg.mcast = True
-
       bank_tables = self._build_bank_noc_tables()
-      def _write_bank_tables():
+      for core in cores:
+        cfg.start = cfg.end = core
         cfg.addr, cfg.mode = 0, TLBMode.RELAXED
         win.configure(cfg)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_tables, use_uc=True, restore=False)
-      for core in self.worker_cores:
-        cfg.start = cfg.end = core
-        _write_bank_tables()
 
-      def _release_brisc():
+      for core in cores:
+        cfg.start = cfg.end = core
         cfg.addr, cfg.mode = reg_base, TLBMode.STRICT
         win.configure(cfg)
         win.read32(reg_off)
         win.write32(reg_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
-      for core in self.worker_cores:
-        cfg.start = cfg.end = core
-        _release_brisc()
 
     self._wait_firmware_ready()
 
+  def _firmware_skip_cores(self) -> set[Core]:
+    return set()
+
   def _wait_firmware_ready(self):
-    tile = (1, 2) if (1, 2) in self.worker_cores else self.worker_cores[0]
+    skip = self._firmware_skip_cores()
+    candidates = [core for core in self.worker_cores if core not in skip]
+    tile = (1, 2) if (1, 2) in candidates else candidates[0]
     cfg = TLBConfig(addr=0, start=tile, end=tile, noc=0, mcast=False, mode=TLBMode.STRICT)
     with TLBWindow(self.fd, TLBSize.MiB_2, cfg) as win:
       deadline = time.perf_counter() + 2.0
@@ -220,9 +213,9 @@ class CommonDevice:
     NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
     WORKER_EP_LOGICAL = {0: [2, 1], 1: [0, 1], 2: [0, 1], 3: [0, 1], 4: [2, 1], 5: [2, 1], 6: [2, 1], 7: [2, 1]}
 
-    def dram_translated_map(harvested_bank: int | None) -> dict[BankPort, Core]:
+    def dram_translated_map(harvested_bank: int | None) -> dict[tuple[int, int], Core]:
       START_X, START_Y, PORTS, TOTAL_BANKS = 17, 12, 3, 8
-      m: dict[BankPort, Core] = {}
+      m: dict[tuple[int, int], Core] = {}
 
       def map_banks(start: int, end: int, x: int, y0: int = START_Y):
         y = y0
@@ -386,8 +379,6 @@ class CommonDevice:
     raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms)")
 
   def close(self):
-    if getattr(self, "_closed", False):
-      return
     try:
       if getattr(self, "fd", -1) >= 0:
         self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
@@ -415,13 +406,13 @@ class DeviceBase(CommonDevice):
     info = []
     idx = 0
     for program in self._exec_list:
-      if not getattr(program, "profile", True):
+      if not program.profile:
         continue
       plan = self._resolve_core_plan(program.cores)
       info.append({
         "cores": plan.cores,
-        "sources": getattr(program, "sources", {}),
-        "name": getattr(program, "name", None),
+        "sources": program.sources,
+        "name": program.name,
         "index": idx,
       })
       idx += 1
@@ -687,11 +678,11 @@ class DeviceBase(CommonDevice):
     missing = [c for c in cores if c not in assigned]
     if missing:
       raise ValueError(f"every program core must have a dataflow launch; missing {len(missing)} cores")
-    return [
-      _LaunchRole(core=core, launch=launch, role_idx=role_i, role_count=role_n)
-      for core in cores
-      for launch, role_i, role_n in [assigned[core]]
-    ]
+    roles = []
+    for core in cores:
+      launch, role_i, role_n = assigned[core]
+      roles.append(_LaunchRole(core=core, launch=launch, role_idx=role_i, role_count=role_n))
+    return roles
 
   def _prepare_core_payloads(self, program: Program, cores: CoreList, launch_roles: list[_LaunchRole],
                              dispatch_mode: int) -> list[_CorePayload]:

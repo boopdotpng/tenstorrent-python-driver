@@ -158,10 +158,10 @@ def _zone_names_from_sources(programs_info):
   return zone_names
 
 def _build_zone_names(programs_info, used_hashes):
-  from compiler import get_zone_map
+  from compiler import _zone_map
 
   zone_names = _zone_names_from_sources(programs_info)
-  compile_map = get_zone_map()
+  compile_map = _zone_map
   for h in used_hashes:
     key = str(h)
     if key in zone_names:

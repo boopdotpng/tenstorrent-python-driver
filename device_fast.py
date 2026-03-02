@@ -2,13 +2,12 @@ import ctypes, fcntl, mmap, struct, time
 from typing import Callable
 from defs import *
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO, noc_xy, PROFILER
+from defs import _IO
+from helpers import noc_xy, PROFILER
 from compiler import compile_cq_kernels
 from device import DeviceBase, Program, McastDest, CorePair, AddrPayload, FAST_CQ_NUM_CIRCULAR_BUFFERS, _CorePayload
 
 class _FastCQ:
-  NUM_CIRCULAR_BUFFERS = 32
-
   def __init__(self, fd: int, prefetch_core: Core, dispatch_core: Core):
     self.fd = fd
 
@@ -68,13 +67,11 @@ class _FastCQ:
     off = DEV_PREFETCH_Q_BASE + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
     return struct.unpack("<H", self.prefetch_win.uc[off : off + 2])[0]
 
-  def _wait_prefetch_slot_free(self, idx: int, timeout_s: float = 1.0) -> float:
-    t0 = time.perf_counter()
+  def _wait_prefetch_slot_free(self, idx: int, timeout_s: float = 1.0):
     deadline = time.perf_counter() + timeout_s
     while self._read_prefetch_entry(idx) != 0:
       if time.perf_counter() > deadline:
         raise TimeoutError("timeout waiting for prefetch queue slot")
-    return time.perf_counter() - t0
 
   def _write_prefetch_q_entry(self, size_16b: int):
     if not (0 < size_16b <= 0x7FFF):
@@ -171,9 +168,6 @@ class _FastCQ:
     x, y = tile
     dispatch = CQDispatchCmdLarge()
     dispatch.cmd_id = CQ_DISPATCH_CMD_WRITE_LINEAR
-    dispatch.payload.write_linear.num_mcast_dests = 0
-    dispatch.payload.write_linear.write_offset_index = 0
-    dispatch.payload.write_linear.pad1 = 0
     dispatch.payload.write_linear.noc_xy_addr = noc_xy(x, y)
     dispatch.payload.write_linear.addr = addr
     dispatch.payload.write_linear.length = len(data)
@@ -217,13 +211,11 @@ class _FastCQ:
     dispatch.payload.timestamp.addr = addr
     self._relay_inline(as_bytes(dispatch))
 
-  def enqueue_host_event(self, event_id: int, pad1: int = 0):
+  def enqueue_host_event(self, event_id: int):
     payload_data = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(FastDispatch.L1_ALIGNMENT, b"\0")
     dispatch = CQDispatchCmd()
     dispatch.cmd_id = CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST
     dispatch.payload.write_linear_host.is_event = 1
-    dispatch.payload.write_linear_host.pad1 = pad1 & 0xFFFF
-    dispatch.payload.write_linear_host.pad2 = 0
     dispatch.payload.write_linear_host.length = ctypes.sizeof(CQDispatchCmd) + len(payload_data)
     self._relay_inline(as_bytes(dispatch) + payload_data)
 
@@ -340,8 +332,6 @@ class FastDevice(DeviceBase):
     self._start_dispatch_cores()
 
   def close(self):
-    if getattr(self, "_closed", False):
-      return
     if hasattr(self, "_cq"):
       self._cq.close()
     super().close()
@@ -357,7 +347,8 @@ class FastDevice(DeviceBase):
         time.sleep(0.001)
 
   @staticmethod
-  def _build_cq_launch(rt_args: list[int], sem_values: list[int], kernel_text_off: int, ncrisc_text_off: int = 0) -> tuple[bytes, LaunchMsg]:
+  def _build_cq_launch(sem_values: list[int], kernel_text_off: int, ncrisc_text_off: int = 0,
+                       rt_args: list[int] = [0, 0, 0]) -> tuple[bytes, LaunchMsg]:
     l1a = FastDispatch.L1_ALIGNMENT
     rt_blob = b"".join((a & 0xFFFFFFFF).to_bytes(4, "little") for a in rt_args).ljust(l1a, b"\0")
     sem_blob = b"".join((v & 0xFFFFFFFF).to_bytes(4, "little").ljust(l1a, b"\0") for v in sem_values)
@@ -416,10 +407,10 @@ class FastDevice(DeviceBase):
     l1a = FastDispatch.L1_ALIGNMENT
     kernel_off = l1a + 2 * l1a
     pref_img, pref_launch = self._build_cq_launch(
-      rt_args=[0, 0, 0], sem_values=[DEV_DISPATCH_CB_PAGES, 0], kernel_text_off=kernel_off)
+      sem_values=[DEV_DISPATCH_CB_PAGES, 0], kernel_text_off=kernel_off)
     disp_ncrisc_off = align_up(kernel_off + len(cq.dispatch_brisc.xip), l1a)
     disp_img, disp_launch = self._build_cq_launch(
-      rt_args=[0, 0, 0], sem_values=[0, 0], kernel_text_off=kernel_off,
+      sem_values=[0, 0], kernel_text_off=kernel_off,
       ncrisc_text_off=disp_ncrisc_off)
     self._cq.reset_run_state()
     self._upload_cq_core(
@@ -503,7 +494,7 @@ class FastDevice(DeviceBase):
       if i >= len(self._exec_list):
         break
       prog = self._exec_list[i]
-      if not getattr(prog, "profile", True):
+      if not prog.profile:
         continue
       name = prog.name or f"program_{i}"
       rows.append((i, name, int(sample["cycles"]), float(sample["us"])))
@@ -602,13 +593,13 @@ class FastDevice(DeviceBase):
         patched = []
         for p in payloads:
           lm = LaunchMsg.from_buffer_copy(p.launch_blob)
-          lm.kernel_config.host_assigned_id = (prof_idx + 1) if getattr(program, "profile", True) else 0
+          lm.kernel_config.host_assigned_id = (prof_idx + 1) if program.profile else 0
           patched.append(_CorePayload(
             core=p.core, rta=p.rta, launch_blob=as_bytes(lm),
             shared_addr=p.shared_addr, shared_blob=p.shared_blob,
           ))
         payloads = patched
-        if getattr(program, "profile", True):
+        if program.profile:
           prof_idx += 1
       self._enqueue_program_setup(plan, payloads, skip_upload=False)
       ts_slot = 2 * i

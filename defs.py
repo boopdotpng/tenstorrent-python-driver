@@ -1,11 +1,12 @@
 import ctypes
 from ctypes import (
-  LittleEndianStructure as S,
-  c_uint8 as u8,
-  c_uint16 as u16,
-  c_uint32 as u32,
-  c_uint64 as u64,
+  LittleEndianStructure as _S,
+  c_uint8 as _u8,
+  c_uint16 as _u16,
+  c_uint32 as _u32,
+  c_uint64 as _u64,
 )
+S, u8, u16, u32, u64 = _S, _u8, _u16, _u32, _u64
 from enum import Enum
 
 class TLBSize(Enum):
@@ -99,6 +100,7 @@ class Dram:
   BANK_X = {b: 0 if b < 4 else 9 for b in range(8)}
 
 TENSTORRENT_IOCTL_MAGIC = 0xFA
+def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 IOCTL_PIN_PAGES = 7
 IOCTL_UNPIN_PAGES = 10
 IOCTL_ALLOCATE_TLB = 11
@@ -227,9 +229,6 @@ class FastDispatch:
   L1_ALIGNMENT = 16
   PCIE_ALIGNMENT = 64
   PCIE_NOC_BASE = 1 << 60
-  MAX_HUGEPAGE_SIZE = 1 << 30
-  MAX_DEV_CHANNEL_SIZE = 1 << 28
-  DEVICES_PER_UMD_CHANNEL = MAX_HUGEPAGE_SIZE // MAX_DEV_CHANNEL_SIZE
 
   BH_TENSIX_DEFAULT_UNRESERVED = 0x196C0
   BH_PREFETCH_Q_RD_PTR_OFF = 0x00
@@ -239,23 +238,21 @@ class FastDispatch:
   BH_COMPLETION_Q0_LAST_EVENT_PTR_OFF = 0x30
   BH_COMPLETION_Q1_LAST_EVENT_PTR_OFF = 0x40
   BH_DISPATCH_S_SYNC_SEM_OFF = 0x50
-  BH_FABRIC_HEADER_RB_OFF = 0xD0
-  BH_FABRIC_SYNC_STATUS_OFF = 0x150
   BH_UNRESERVED_OFF = 0x180
 
-  HOST_ISSUE_Q_RD_OFF = 0 * PCIE_ALIGNMENT
-  HOST_ISSUE_Q_WR_OFF = 1 * PCIE_ALIGNMENT
   HOST_COMPLETION_Q_WR_OFF = 2 * PCIE_ALIGNMENT
   HOST_COMPLETION_Q_RD_OFF = 3 * PCIE_ALIGNMENT
   HOST_UNRESERVED_OFF = 4 * PCIE_ALIGNMENT
 
   PREFETCH_Q_ENTRY_BYTES = 2
   PREFETCH_Q_ENTRIES_WORKER_DEFAULT = 1534
-  PREFETCH_CMDDAT_Q_SIZE = 256 * 1024
-  PREFETCH_SCRATCH_DB_SIZE = 128 * 1024
 
 def align_up(value: int, align: int) -> int:
   return (value + align - 1) // align * align
+
+def align_down(value: int, alignment: TLBSize) -> tuple[int, int]:
+  base = value & ~(alignment.value - 1)
+  return base, value - base
 
 PAGE_SIZE = 4096
 
@@ -272,7 +269,6 @@ if HOST_COMPLETION_BASE + HOST_COMPLETION_SIZE > HOST_SYSMEM_SIZE:
 DEV_L1_BASE = FastDispatch.BH_TENSIX_DEFAULT_UNRESERVED
 DEV_PREFETCH_Q_BASE = DEV_L1_BASE + FastDispatch.BH_UNRESERVED_OFF
 DEV_PREFETCH_Q_SIZE = FastDispatch.PREFETCH_Q_ENTRIES_WORKER_DEFAULT * FastDispatch.PREFETCH_Q_ENTRY_BYTES
-DEV_CMDDAT_Q_BASE = align_up(DEV_PREFETCH_Q_BASE + DEV_PREFETCH_Q_SIZE, FastDispatch.PCIE_ALIGNMENT)
 DEV_PREFETCH_Q_RD_PTR_ADDR = DEV_L1_BASE + FastDispatch.BH_PREFETCH_Q_RD_PTR_OFF
 DEV_PREFETCH_Q_PCIE_RD_PTR_ADDR = DEV_L1_BASE + FastDispatch.BH_PREFETCH_Q_PCIE_RD_PTR_OFF
 DEV_COMPLETION_Q_WR_PTR_ADDR = DEV_L1_BASE + FastDispatch.BH_COMPLETION_Q_WR_PTR_OFF
@@ -394,4 +390,4 @@ class CQDispatchCmd(S):
   _pack_ = 1
   _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdPayload)]
 
-__all__ = [name for name in globals() if not name.startswith("_")]
+__all__ = [name for name in globals() if not name.startswith("_") and name not in ("S", "u8", "u16", "u32", "u64")]

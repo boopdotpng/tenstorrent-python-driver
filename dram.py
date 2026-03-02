@@ -8,7 +8,7 @@ from defs import (
   PIN_PAGES_NOC_DMA, IOCTL_PIN_PAGES, IOCTL_UNPIN_PAGES, Core, DramTile, align_up,
 )
 from tlb import TLBConfig, TLBWindow, TLBMode
-from helpers import _IO
+from defs import _IO
 
 TILE_R, TILE_C = 32, 32
 FACE_R, FACE_C = 16, 16

@@ -1,11 +1,9 @@
 import os, struct
-from defs import TLBSize, TensixL1, TENSTORRENT_IOCTL_MAGIC
+from defs import TensixL1
 from dataclasses import dataclass
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
 PROFILER = os.environ.get("TT_PROFILER") == "1"
-
-def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 
 def hash16(s: str) -> int:
   h = 0x811c9dc5
@@ -13,13 +11,7 @@ def hash16(s: str) -> int:
     h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
   return (h >> 16) ^ (h & 0xFFFF)
 
-def align_down(value: int, alignment: TLBSize) -> tuple[int, int]:
-  base = value & ~(alignment.value - 1)
-  return base, value - base
-
 def noc_xy(x: int, y: int) -> int: return ((y << 6) | x) & 0xFFFF
-
-def noc1(x: int, y: int) -> tuple[int, int]: return (16 - x, 11 - y)
 
 @dataclass(frozen=True)
 class PTLoad:
@@ -174,12 +166,7 @@ def generate_jal_instruction(target_addr: int) -> int:
   imm_19_12 = target_addr & 0xFF000
   return imm_19_12 | imm_11 | imm_10_1 | opcode
 
-def pack_xip_elf(path_or_elf: str | os.PathLike[str] | bytes, xip_relocate: bool = False) -> tuple[bytes, int]:
-  if isinstance(path_or_elf, bytes):
-    elf = path_or_elf
-  else:
-    with open(os.fspath(path_or_elf), "rb") as f:
-      elf = f.read()
+def pack_xip_elf(elf: bytes, xip_relocate: bool = False) -> tuple[bytes, int]:
   if xip_relocate:
     elf = _xipify_riscv32_elf(elf)
   segs = list(iter_pt_load(elf))

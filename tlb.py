@@ -2,7 +2,7 @@ from ctypes import sizeof
 from dataclasses import dataclass
 from enum import Enum
 from defs import *
-from helpers import _IO, noc1
+from defs import _IO
 import fcntl, mmap
 
 class TLBMode(Enum):
@@ -22,8 +22,8 @@ class TLBConfig:
   def to_struct(self) -> NocTlbConfig:
     if self.start is None or self.end is None: raise ValueError("tlb start/end must be set before configure")
     ordering = self.mode.value
-    start = noc1(*self.start) if self.noc == 1 else self.start
-    end = noc1(*self.end) if self.noc == 1 else self.end
+    start = (16 - self.start[0], 11 - self.start[1]) if self.noc == 1 else self.start
+    end = (16 - self.end[0], 11 - self.end[1]) if self.noc == 1 else self.end
     cfg = NocTlbConfig()
     cfg.addr = self.addr
     cfg.x_start, cfg.y_start = start
@@ -60,7 +60,7 @@ class TLBWindow:
 
   def configure(self, config: TLBConfig):
     assert (config.addr & (self.size - 1)) == 0, f"tlb addr must be {self.size}-aligned"
-    buf = bytearray(sizeof(ConfigureTlbIn) + sizeof(NocTlbConfig))
+    buf = bytearray(sizeof(ConfigureTlbIn))
     cfg = ConfigureTlbIn.from_buffer(buf)
     cfg.tlb_id = self.tlb_id
     cfg.config = config.to_struct()
