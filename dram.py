@@ -1,4 +1,5 @@
-import os, mmap, fcntl, ctypes
+import os, mmap, fcntl, ctypes, pickle
+from pathlib import Path
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -171,13 +172,27 @@ void kernel_main() {
 }
 """
 
+_CACHE_DIR = Path.home() / ".cache" / "tt-cache"
+
 def _drain_kernel():
+  cached = _CACHE_DIR / "drain_kernel.pkl"
+  if cached.is_file():
+    return pickle.loads(cached.read_bytes())
   from compiler import Compiler
-  return Compiler()._compile_dataflow(_DRAIN_KERNEL_SRC, "ncrisc", noc_index=0, profiler=False)
+  result = Compiler()._compile_dataflow(_DRAIN_KERNEL_SRC, "ncrisc", noc_index=0, profiler=False)
+  _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  cached.write_bytes(pickle.dumps(result))
+  return result
 
 def _fill_kernel():
+  cached = _CACHE_DIR / "fill_kernel.pkl"
+  if cached.is_file():
+    return pickle.loads(cached.read_bytes())
   from compiler import Compiler
-  return Compiler()._compile_dataflow(_FILL_KERNEL_SRC, "ncrisc", noc_index=0, profiler=False)
+  result = Compiler()._compile_dataflow(_FILL_KERNEL_SRC, "ncrisc", noc_index=0, profiler=False)
+  _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  cached.write_bytes(pickle.dumps(result))
+  return result
 
 @dataclass(frozen=True)
 class DramBuffer:
