@@ -9,8 +9,6 @@ import numpy as np
 from device import Device, Dtype, MathFidelity, untilize
 from ops import plan_matmul, MatmulProgram
 
-def ceil32(x): return (x + 31) & ~31
-
 F32_ACC = os.environ.get("F32_ACC") == "1"
 IO_MODE = "f16" if os.environ.get("F16") == "1" else "bf16"
 IO_DTYPE = Dtype.Float16 if IO_MODE == "f16" else Dtype.Float16_b
@@ -59,14 +57,10 @@ def main():
   else:
     raise SystemExit("Usage: matmul_peak.py [M K N]")
 
-  Kp, Np = ceil32(K), max(32, ceil32(N))
-  Mt_base, Kt, Nt_base = ceil32(M) // 32, Kp // 32, Np // 32
-
   device = Device()
   try:
-    plan = plan_matmul(Mt_base, Kt, Nt_base, device.cores, io_dtype=IO_DTYPE, f32_acc=F32_ACC)
-    Mp = plan.mt * 32
-    Np = plan.nt * 32
+    plan = plan_matmul(M, K, N, device.cores, io_dtype=IO_DTYPE, f32_acc=F32_ACC)
+    Mp, Kp, Np = plan.mt * 32, plan.kt * 32, plan.nt * 32
     padded = (M != Mp or K != Kp or N != Np)
 
     print(
@@ -74,7 +68,7 @@ def main():
       f"({IO_MODE} io, {'fp32' if F32_ACC else 'mixed'} accum, {MATH_FIDELITY.name})"
     )
     if padded: print(f"  padded: A[{Mp},{Kp}] @ B[{Kp},{Np}] -> C[{Mp},{Np}]")
-    print(f"  Mt={plan.mt} Kt={Kt} Nt={plan.nt} grid={plan.num_rows}x{plan.num_cols}")
+    print(f"  Mt={plan.mt} Kt={plan.kt} Nt={plan.nt} grid={plan.num_rows}x{plan.num_cols}")
     print(f"  per_core_M={plan.per_core_m} per_core_N={plan.per_core_n} "
           f"in0_block_w={plan.in0_block_w} num_blocks={plan.num_blocks}")
     print(f"  subblock: {plan.out_subblock_h}h x {plan.out_subblock_w}w = {plan.out_subblock_num_tiles} tiles")

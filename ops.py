@@ -47,8 +47,11 @@ class MatmulPlan:
   def active_cores(self) -> list[Core]:
     return [c for row in self.grid() for c in row]
 
-def plan_matmul(mt_base: int, kt: int, nt_base: int, cores: list[Core],
+def _ceil32(x): return (x + 31) & ~31
+
+def plan_matmul(M: int, K: int, N: int, cores: list[Core],
                 io_dtype: Dtype = Dtype.Float16_b, f32_acc: bool = False) -> MatmulPlan:
+  mt_base, kt, nt_base = _ceil32(M) // 32, _ceil32(K) // 32, max(1, _ceil32(N) // 32)
   tile_bytes = io_dtype.tile_size
   cb24_tile_bytes = Dtype.Float32.tile_size if f32_acc else tile_bytes
 
