@@ -7,11 +7,6 @@ from ctypes import (
   c_uint64 as _u64,
 )
 S, u8, u16, u32, u64 = _S, _u8, _u16, _u32, _u64
-from enum import Enum
-
-class TLBSize(Enum):
-  MiB_2 = 1 << 21  # BAR 0: 201 available, for L1/registers
-  GiB_4 = 1 << 32  # BAR 4: 8 available, for GDDR6 banks
 
 DRAM_BARRIER_BASE = 0x0
 DRAM_ALIGNMENT = 64
@@ -69,8 +64,6 @@ class TensixMMIO:
 
 class Arc:
   NOC_BASE = 0x80000000
-  CSM_START = 0x10000000
-  CSM_END = 0x1007FFFF
   RESET_UNIT_OFFSET = 0x30000
   SCRATCH_RAM_2 = RESET_UNIT_OFFSET + 0x408
   SCRATCH_RAM_11 = RESET_UNIT_OFFSET + 0x42C
@@ -108,52 +101,6 @@ IOCTL_FREE_TLB = 12
 IOCTL_CONFIGURE_TLB = 13
 
 PIN_PAGES_NOC_DMA = 2
-
-class PinPagesIn(S):
-  _fields_ = [("output_size_bytes", u32), ("flags", u32), ("virtual_address", u64), ("size", u64)]
-
-class PinPagesOutExtended(S):
-  _fields_ = [("physical_address", u64), ("noc_address", u64)]
-
-class UnpinPagesIn(S):
-  _fields_ = [("virtual_address", u64), ("size", u64), ("reserved", u64)]
-
-class AllocateTlbIn(S):
-  _fields_ = [("size", u64), ("reserved", u64)]
-
-class AllocateTlbOut(S):
-  _fields_ = [
-    ("tlb_id", u32),
-    ("reserved0", u32),
-    ("mmap_offset_uc", u64),
-    ("mmap_offset_wc", u64),
-    ("reserved1", u64),
-  ]
-
-class FreeTlbIn(S):
-  _fields_ = [("tlb_id", u32)]
-
-class NocTlbConfig(S):
-  _fields_ = [
-    ("addr", u64),
-    ("x_end", u16),
-    ("y_end", u16),
-    ("x_start", u16),
-    ("y_start", u16),
-    ("noc", u8),
-    ("mcast", u8),
-    ("ordering", u8),
-    ("linked", u8),
-    ("static_vc", u8),
-    ("reserved0_0", u8),
-    ("reserved0_1", u8),
-    ("reserved0_2", u8),
-    ("reserved1_0", u32),
-    ("reserved1_1", u32),
-  ]
-
-class ConfigureTlbIn(S):
-  _fields_ = [("tlb_id", u32), ("reserved", u32), ("config", NocTlbConfig)]
 
 def as_bytes(obj) -> bytes:
   return ctypes.string_at(ctypes.addressof(obj), ctypes.sizeof(obj))
@@ -250,8 +197,8 @@ class FastDispatch:
 def align_up(value: int, align: int) -> int:
   return (value + align - 1) // align * align
 
-def align_down(value: int, alignment: TLBSize) -> tuple[int, int]:
-  base = value & ~(alignment.value - 1)
+def align_down(value: int, alignment: int) -> tuple[int, int]:
+  base = value & ~(alignment - 1)
   return base, value - base
 
 PAGE_SIZE = 4096
@@ -298,96 +245,5 @@ CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS = 35
 CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM = 0x08
 CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM = 0x10
 CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET = 0xFF
-
-class CQPrefetchRelayInlineCmd(S):
-  _pack_ = 1
-  _fields_ = [("dispatcher_type", u8), ("pad", u16), ("length", u32), ("stride", u32)]
-
-class CQPrefetchCmdPayload(ctypes.Union):
-  _pack_ = 1
-  _fields_ = [("relay_inline", CQPrefetchRelayInlineCmd), ("raw", u8 * 15)]
-
-class CQPrefetchCmd(S):
-  _pack_ = 1
-  _fields_ = [("cmd_id", u8), ("payload", CQPrefetchCmdPayload)]
-
-class CQDispatchWriteCmd(S):
-  _pack_ = 1
-  _fields_ = [
-    ("num_mcast_dests", u8),
-    ("write_offset_index", u8),
-    ("pad1", u8),
-    ("noc_xy_addr", u32),
-    ("addr", u64),
-    ("length", u64),
-  ]
-
-class CQDispatchWriteHostCmd(S):
-  _pack_ = 1
-  _fields_ = [("is_event", u8), ("pad1", u16), ("pad2", u32), ("length", u64)]
-
-class CQDispatchWaitCmd(S):
-  _pack_ = 1
-  _fields_ = [("flags", u8), ("stream", u16), ("addr", u32), ("count", u32)]
-
-class CQDispatchCmdLargePayload(ctypes.Union):
-  _pack_ = 1
-  _fields_ = [("write_linear", CQDispatchWriteCmd), ("raw", u8 * 31)]
-
-class CQDispatchCmdLarge(S):
-  _pack_ = 1
-  _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdLargePayload)]
-
-class CQDispatchWritePackedCmd(S):
-  _pack_ = 1
-  _fields_ = [("flags", u8), ("count", u16), ("write_offset_index", u16), ("size", u16), ("addr", u32)]
-
-class CQDispatchWritePackedUnicastSubCmd(S):
-  _pack_ = 1
-  _fields_ = [("noc_xy_addr", u32)]
-
-class CQDispatchWritePackedLargeCmd(S):
-  _pack_ = 1
-  _fields_ = [("type", u8), ("count", u16), ("alignment", u16), ("write_offset_index", u16)]
-
-class CQDispatchWritePackedLargeSubCmd(S):
-  _pack_ = 1
-  _fields_ = [("noc_xy_addr", u32), ("addr", u32), ("length_minus1", u16), ("num_mcast_dests", u8), ("flags", u8)]
-
-class CQDispatchGoSignalMcastCmd(S):
-  _pack_ = 1
-  _fields_ = [
-    ("go_signal", u32),
-    ("multicast_go_offset", u8),
-    ("num_unicast_txns", u8),
-    ("noc_data_start_index", u8),
-    ("wait_count", u32),
-    ("wait_stream", u32),
-  ]
-
-class CQDispatchSetGoSignalNocDataCmd(S):
-  _pack_ = 1
-  _fields_ = [("pad1", u8), ("pad2", u16), ("num_words", u32)]
-
-class CQDispatchTimestampCmd(S):
-  _pack_ = 1
-  _fields_ = [("pad1", u8), ("pad2", u16), ("noc_xy_addr", u32), ("addr", u32)]
-
-class CQDispatchCmdPayload(ctypes.Union):
-  _pack_ = 1
-  _fields_ = [
-    ("write_linear_host", CQDispatchWriteHostCmd),
-    ("write_packed", CQDispatchWritePackedCmd),
-    ("write_packed_large", CQDispatchWritePackedLargeCmd),
-    ("wait", CQDispatchWaitCmd),
-    ("mcast", CQDispatchGoSignalMcastCmd),
-    ("set_go_signal_noc_data", CQDispatchSetGoSignalNocDataCmd),
-    ("timestamp", CQDispatchTimestampCmd),
-    ("raw", u8 * 15),
-  ]
-
-class CQDispatchCmd(S):
-  _pack_ = 1
-  _fields_ = [("cmd_id", u8), ("payload", CQDispatchCmdPayload)]
 
 __all__ = [name for name in globals() if not name.startswith("_") and name not in ("S", "u8", "u16", "u32", "u64")]

@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// clang-format off
 #include "ckernel.h"
 #include "internal/firmware_common.h"
 #include "risc_common.h"
@@ -20,7 +19,6 @@
 #include "internal/circular_buffer_init.h"
 #endif
 #include "tt-metalium/circular_buffer_constants.h"
-// clang-format on
 
 #if defined(PROFILE_KERNEL)
 namespace kernel_profiler {
@@ -42,7 +40,7 @@ uint8_t my_relative_y_ __attribute__((used));
 namespace ckernel {
 
 enum class ttRiscCores : std::uint32_t { Unpack = 0, Math = 1, Pack = 2, Brisc = 3, Nrisc = 4 };
-// Transition shim
+
 #if defined(__PTR_CONST)
 #define PTR_CONST const
 #else
@@ -55,16 +53,15 @@ volatile tt_reg_ptr uint* PTR_CONST regfile = reinterpret_cast<volatile uint*>(R
 #if defined(__INSTRN_BUFFER_TOS)
 volatile tt_reg_ptr uint32_t* const instrn_buffer = reinterpret_cast<volatile uint32_t*>(INSTRN_BUF_BASE);
 #endif
-uint32_t cfg_state_id __attribute__((used)) = 0;    // Flip between 0 and 1 to keep state between kernel calls
-uint32_t dest_offset_id __attribute__((used)) = 0;  // Flip between 0 and 1 to keep dest pointer between kernel calls
+uint32_t cfg_state_id __attribute__((used)) = 0;
+uint32_t dest_offset_id __attribute__((used)) = 0;
 
 uint32_t op_info_offset __attribute__((used)) = 0;
 
 const uint8_t thread_id = COMPILE_FOR_TRISC;
 
 volatile tt_l1_ptr uint8_t* const trisc_run =
-    &((tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE))
-         ->subordinate_sync.map[COMPILE_FOR_TRISC + 1];  // first entry is for NCRISC
+    &((tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE))->subordinate_sync.map[COMPILE_FOR_TRISC + 1];
 tt_l1_ptr mailboxes_t* const mailboxes = (tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE);
 }  // namespace ckernel
 
@@ -99,7 +96,6 @@ int main(int argc, char* argv[]) {
 
     do_crt1((uint32_t tt_l1_ptr*)PREPROCESSOR_EXPAND(MEM_TRISC, COMPILE_FOR_TRISC, _INIT_LOCAL_L1_BASE_SCRATCH));
 
-    // Initialize GPRs to all 0s
 #pragma GCC unroll 0
     for (int i = 0; i < 64; i++) {
         regfile[i] = 0;
@@ -108,7 +104,6 @@ int main(int argc, char* argv[]) {
     reset_cfg_state_id();
 
     {
-        // #31901: initialize PRNG seed to 0 to avoid nondeterministic behavior
         volatile uint tt_reg_ptr* cfg = get_cfg_pointer();
         cfg[PRNG_SEED_Seed_Val_ADDR32] = 0;
         riscv_wait(600);
@@ -144,7 +139,7 @@ int main(int argc, char* argv[]) {
 
         cb_l1_base = (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.remote_cb_offset);
         uint32_t end_cb_index = launch_msg->kernel_config.min_remote_cb_start_index;
-        // NOC argument is unused
+
         experimental::setup_remote_cb_interfaces<false>(cb_l1_base, end_cb_index, 0, 0, 0, 0);
 #endif
 
@@ -163,7 +158,6 @@ int main(int argc, char* argv[]) {
         record_stack_usage(stack_free);
         WAYPOINT("D");
 
-        // Signal completion
         tensix_sync();
         *trisc_run = RUN_SYNC_MSG_DONE;
     }

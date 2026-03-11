@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// clang-format off
 #include <cstdint>
 #include "risc_common.h"
 #include "noc_overlay_parameters.h"
@@ -19,7 +18,6 @@
 #include "api/debug/waypoint.h"
 #include "api/debug/dprint.h"
 #include "internal/debug/stack_usage.h"
-// clang-format on
 
 tt_l1_ptr mailboxes_t* const mailboxes = (tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE);
 volatile tt_l1_ptr uint8_t* const ncrisc_run = mailboxes->subordinate_sync.map;
@@ -43,14 +41,11 @@ uint32_t tt_l1_ptr* rta_l1_base __attribute__((used));
 uint32_t tt_l1_ptr* crta_l1_base __attribute__((used));
 uint32_t tt_l1_ptr* sem_l1_base[ProgrammableCoreType::COUNT] __attribute__((used));
 
-// These arrays are stored in local memory of FW, but primarily used by the kernel which shares
-// FW symbols. Hence mark these as 'used' so that FW compiler doesn't optimize it out.
 uint16_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
 int32_t bank_to_dram_offset[NUM_DRAM_BANKS] __attribute__((used));
 uint16_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
 int32_t bank_to_l1_offset[NUM_L1_BANKS] __attribute__((used));
 
-// These arrays are used to store the worker logical to virtual coordinate mapping
 uint8_t worker_logical_col_to_virtual_col[round_up_to_mult_of_4(noc_size_x)] __attribute__((used));
 uint8_t worker_logical_row_to_virtual_row[round_up_to_mult_of_4(noc_size_y)] __attribute__((used));
 
@@ -73,7 +68,9 @@ inline __attribute__((always_inline)) void wait_for_brisc_notification() {
     }
 }
 
-inline __attribute__((always_inline)) void signal_ncrisc_completion() { *ncrisc_run = RUN_SYNC_MSG_DONE; }
+inline __attribute__((always_inline)) void signal_ncrisc_completion() {
+    *ncrisc_run = RUN_SYNC_MSG_DONE;
+}
 
 int main(int argc, char* argv[]) {
     configure_csr();
@@ -111,7 +108,7 @@ int main(int argc, char* argv[]) {
 
         cb_l1_base = (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.remote_cb_offset);
         uint32_t end_cb_index = launch_msg->kernel_config.min_remote_cb_start_index;
-        // NOC argument is unused
+
         experimental::setup_remote_cb_interfaces<false>(cb_l1_base, end_cb_index, 0, 0, 0, 0);
         my_relative_x_ = my_logical_x_ - launch_msg->kernel_config.sub_device_origin_x;
         my_relative_y_ = my_logical_y_ - launch_msg->kernel_config.sub_device_origin_y;

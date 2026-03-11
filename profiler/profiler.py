@@ -1,7 +1,7 @@
-import os, re
-import struct
-from defs import TensixL1, Dram
-from helpers import hash16
+import os, re, struct
+
+from autogen import Dram, TensixL1
+from compiler import hash16
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
@@ -175,17 +175,12 @@ def _layout(device):
   from device import TileGrid
 
   dram_tiles = [
-    {
-      "bank": bank,
-      "x": Dram.BANK_X[bank],
-      "y": y,
-      "valid": bank != device.harvested_dram,
-    }
+    {"bank": bank, "x": Dram.BANK_X[bank], "y": y, "valid": bank != device.harvested_dram}
     for bank in range(Dram.BANK_COUNT)
     for y in Dram.BANK_TILE_YS[bank]
   ]
   grid_x = sorted(set(TileGrid.TENSIX_X) | {t["x"] for t in dram_tiles})
-  grid_y = list(range(0, TileGrid.TENSIX_Y[1] + 1))
+  grid_y = list(range(0, 12))  # NOC rows 0-11
   return dram_tiles, grid_x, grid_y
 
 def _profile_result(device, dispatch_mode, dispatch_cores, freq_mhz, programs, zone_names):
@@ -282,18 +277,16 @@ def _parse_risc_words(words, flat_id, risc_id, program_ids):
       out[prog_id] = candidate
   return out
 
-def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, freq_mhz=1000):
-  from tlb import TLBConfig, TLBMode
-
-  l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
+def collect(device, programs_info, dispatch_mode="slow", dispatch_cores=None, freq_mhz=1000):
+  """Collect profiler data via L1 readback (slow dispatch)."""
+  from device import TLBWindow
   programs = []
   for info in programs_info:
     cores = info["cores"]
     core_profiles = {}
     for core in cores:
-      l1_cfg.start = l1_cfg.end = core
-      device.win.configure(l1_cfg)
-      p = read_core(device.win, core)
+      with TLBWindow(device.fd, start=core) as win:
+        p = read_core(win, core)
       p["total_cycles"] = _core_total_cycles(p)
       p["riscs"] = [_risc_to_json(r) for r in p["riscs"]]
       p["core"] = list(core)
@@ -309,13 +302,17 @@ def collect(device, programs_info, dispatch_mode="fast", dispatch_cores=None, fr
   zone_names = _build_zone_names(programs_info, _used_zone_hashes(programs))
   return _profile_result(device, dispatch_mode, dispatch_cores, freq_mhz, programs, zone_names)
 
-def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count_per_dram, freq_mhz=1000, dispatch_cores=None):
-  from tlb import TLBConfig, TLBMode
-
-  l1_cfg = TLBConfig(addr=0, noc=0, mcast=False, mode=TLBMode.STRICT)
-  # Avoid re-entering Device.run() while already inside profiler collection.
-  dram_raw = device.dram._read_slow(dram_buf)
-  page_size = dram_buf.page_size
+def collect_fast_dram(device, programs_info, core_flat_ids, dram_addr, page_size,
+                      core_count_per_dram, freq_mhz=1000, dispatch_cores=None):
+  """Collect profiler data from DRAM buffer (fast dispatch)."""
+  from device import NocOrdering, TLBWindow
+  # Read raw DRAM: one page per bank
+  bank_count = len(device.dram.bank_tiles)
+  dram_raw = bytearray(page_size * bank_count)
+  for bank_idx, (_, x, y) in enumerate(device.dram.bank_tiles):
+    device.dram.win.target((x, y), mode=NocOrdering.RELAXED)
+    dram_raw[bank_idx * page_size:(bank_idx + 1) * page_size] = \
+      device.dram.win.wc[dram_addr:dram_addr + page_size]
   program_ids = {info["index"] + 1 for info in programs_info}
   by_index = {
     info["index"]: {
@@ -333,9 +330,8 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
 
   for core in sorted(needed):
     flat_id = core_flat_ids[core]
-    l1_cfg.start = l1_cfg.end = core
-    device.win.configure(l1_cfg)
-    ctrl = _read_ctrl(device.win)
+    with TLBWindow(device.fd, start=core) as win:
+      ctrl = _read_ctrl(win)
     page_id = flat_id // core_count_per_dram
     slot = (flat_id % core_count_per_dram) * 5 * _HOST_BUF_BYTES_PER_RISC
     by_program = {}
@@ -367,9 +363,11 @@ def collect_fast_dram(device, programs_info, core_flat_ids, dram_buf, core_count
         present = {r["name"] for r in riscs}
         for i, name in enumerate(RISC_NAMES):
           if name not in present:
-            riscs.append({"name": name, "fw_start": None, "fw_end": None, "kern_start": None, "kern_end": None, "custom": [], "end_idx": 0})
+            riscs.append({"name": name, "fw_start": None, "fw_end": None,
+                          "kern_start": None, "kern_end": None, "custom": [], "end_idx": 0})
         riscs.sort(key=lambda r: RISC_NAMES.index(r["name"]))
-      p = {"core": list(core), "dropped": ctrl[_DROPPED], "done": ctrl[_DONE], "riscs": [_risc_to_json(r) for r in riscs]}
+      p = {"core": list(core), "dropped": ctrl[_DROPPED], "done": ctrl[_DONE],
+           "riscs": [_risc_to_json(r) for r in riscs]}
       p["total_cycles"] = _core_total_cycles({"riscs": riscs})
       by_index[info["index"]]["profiles"][f"{core[0]},{core[1]}"] = p
 
