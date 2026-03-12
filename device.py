@@ -230,6 +230,14 @@ class Allocator:
         local_page += 1
     return bytes(result)
 
+  def read_raw_bank_pages(self, addr: int, page_size: int) -> bytes:
+    result = bytearray(page_size * len(self.bank_tiles))
+    for bank_idx, (_, x, y) in enumerate(self.bank_tiles):
+      self.win.target((x, y), mode=NocOrdering.RELAXED)
+      off = bank_idx * page_size
+      result[off : off + page_size] = self.win.wc[addr : addr + page_size]
+    return bytes(result)
+
   def close(self):
     self.win.close()
 
@@ -586,16 +594,8 @@ class Device:
     )  # DEVICE_BUFFER_END × 5
     self.cq.write_packed_large(rects, base + 19 * 4, b"\0" * 4)  # PROFILER_DONE
 
-  def _read_profiler_dram(self) -> bytearray:
-    bank_count = len(self.dram.bank_tiles)
-    page_size = self._profiler_page_size
-    raw = bytearray(page_size * bank_count)
-    for bank_idx, (_, x, y) in enumerate(self.dram.bank_tiles):
-      self.dram.win.target((x, y), mode=NocOrdering.RELAXED)
-      raw[bank_idx * page_size : (bank_idx + 1) * page_size] = self.dram.win.wc[
-        self._profiler_dram_addr : self._profiler_dram_addr + page_size
-      ]
-    return raw
+  def _read_profiler_dram(self) -> bytes:
+    return self.dram.read_raw_bank_pages(self._profiler_dram_addr, self._profiler_page_size)
 
   def _read_profiler_ctrl(self, cores: list[Core]) -> dict[Core, bytes]:
     ctrl = {}
