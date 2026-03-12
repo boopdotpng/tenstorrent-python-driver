@@ -5,27 +5,9 @@ from pathlib import Path
 from typing import Callable, Literal
 from autogen import *
 from autogen import _IO
-from dispatch import (
-  CBConfig,
-  CQ_CMD_SIZE,
-  Core,
-  CoreArgs,
-  Dtype,
-  MathFidelity,
-  Program,
-  Rect,
-  FAST_CQ_NUM_CIRCULAR_BUFFERS,
-)
+from dispatch import CBConfig, CQ_CMD_SIZE, Core, CoreArgs, Dtype, MathFidelity, Program, Rect, FAST_CQ_NUM_CIRCULAR_BUFFERS
 from dispatch import Go, McastWrite, SetGoSignalNocData, UnicastWrite, Wait
-from dispatch import (
-  build_commands,
-  fast_enqueue,
-  mcast_rects,
-  noc_mcast_xy,
-  noc_xy,
-  resolve_args,
-  slow_dispatch,
-)
+from dispatch import build_commands, fast_enqueue, mcast_rects, noc_mcast_xy, noc_xy, resolve_args, slow_dispatch
 
 class NocOrdering(Enum):
   RELAXED = 0
@@ -36,58 +18,24 @@ class TLBWindow:
   SIZE_2M = 1 << 21
   SIZE_4G = 1 << 32
 
-  def __init__(
-    self,
-    fd: int,
-    start: Core | None,
-    end: Core | None = None,
-    addr: int = 0,
-    mode: NocOrdering = NocOrdering.STRICT,
-    size: int = SIZE_2M,
-  ):
+  def __init__(self, fd: int, start: Core, end: Core | None = None, addr: int = 0,
+               mode: NocOrdering = NocOrdering.STRICT, size: int = SIZE_2M):
     self.fd, self.size = fd, size
-
     buf = bytearray(48)
     struct.pack_into("<Q", buf, 0, size)
     fcntl.ioctl(fd, _IO(IOCTL_ALLOCATE_TLB), buf, True)
     self._id, _, uc_off, wc_off, _ = struct.unpack_from("<IIQQQ", buf, 16)
-
     rw = mmap.PROT_READ | mmap.PROT_WRITE
     self.uc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=uc_off)
     self.wc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=wc_off)
-
     self.target(start, end, addr=addr, mode=mode)
 
-  def target(
-    self,
-    start: Core,
-    end: Core | None = None,
-    addr: int = 0,
-    mode: NocOrdering = NocOrdering.STRICT,
-  ):
+  def target(self, start: Core, end: Core | None = None, addr: int = 0, mode: NocOrdering = NocOrdering.STRICT):
     end = end or start
     mcast = end != start
-    buf = struct.pack(
-      "<IIQ4H8B2I",
-      self._id,
-      0,
-      addr,
-      end[0],
-      end[1],
-      start[0],
-      start[1],
-      0,
-      int(mcast),
-      mode.value,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-    )
-    fcntl.ioctl(self.fd, _IO(IOCTL_CONFIGURE_TLB), bytearray(buf), False)
+    buf = bytearray(40)
+    struct.pack_into("<IIQ4H3B", buf, 0, self._id, 0, addr, end[0], end[1], start[0], start[1], 0, int(mcast), mode.value)
+    fcntl.ioctl(self.fd, _IO(IOCTL_CONFIGURE_TLB), buf, False)
 
   def read32(self, offset: int) -> int:
     return int.from_bytes(self.uc[offset : offset + 4], "little")
@@ -323,13 +271,13 @@ class CQ:
 
   def _relay_inline(self, inner: bytes):
     stride = align_up(CQ_CMD_SIZE + len(inner), FastDispatch.PCIE_ALIGNMENT)
-    hdr = struct.pack(
-      "<BBHII", CQ_PREFETCH_CMD_RELAY_INLINE, 0, 0, len(inner), stride
-    )
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    record = hdr + inner + b"\0" * (stride - CQ_CMD_SIZE - len(inner))
+    hdr = struct.pack("<BBHII", CQ_PREFETCH_CMD_RELAY_INLINE, 0, 0, len(inner), stride).ljust(CQ_CMD_SIZE, b"\0")
+    record = hdr + inner.ljust(stride - CQ_CMD_SIZE, b"\0")
     self._stream.extend(record)
     self._sizes.append(len(record) >> 4)
+
+  def _cmd(self, cmd_id, payload=b""):
+    self._relay_inline(bytes([cmd_id]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0"))
 
   def _read_prefetch_entry(self, idx: int) -> int:
     off = DEV_PREFETCH_Q_BASE + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
@@ -355,96 +303,52 @@ class CQ:
     entries = DEV_PREFETCH_Q_SIZE // FastDispatch.PREFETCH_Q_ENTRY_BYTES
     self._prefetch_q_wr_idx = (idx + 1) % entries
 
-  def write_packed(
-    self, cores: list[Core], addr: int, data: bytes | list[bytes]
-  ):
+  def write_packed(self, cores: list[Core], addr: int, data: bytes | list[bytes]):
     uniform = isinstance(data, bytes)
-    count = len(cores)
     payload_size = len(data) if uniform else len(data[0])
     flags = CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE if uniform else 0
-    hdr = struct.pack("<BBHHHI", CQ_DISPATCH_CMD_WRITE_PACKED, flags, count, 0, payload_size, addr)
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    sub = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores)
-    sub = sub.ljust(align_up(len(sub), FastDispatch.L1_ALIGNMENT), b"\0")
+    l1a = FastDispatch.L1_ALIGNMENT
+    hdr = struct.pack("<BBHHHI", CQ_DISPATCH_CMD_WRITE_PACKED, flags, len(cores), 0, payload_size, addr).ljust(CQ_CMD_SIZE, b"\0")
+    noc_addrs = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores).ljust(align_up(len(cores) * 4, l1a), b"\0")
     if uniform:
-      data_section = bytes(data).ljust(
-        align_up(payload_size, FastDispatch.L1_ALIGNMENT), b"\0"
-      )
+      body = bytes(data).ljust(align_up(payload_size, l1a), b"\0")
     else:
-      stride = align_up(payload_size, FastDispatch.L1_ALIGNMENT)
-      data_section = b"".join(d.ljust(stride, b"\0") for d in data)
-    self._relay_inline(hdr + sub + data_section)
+      stride = align_up(payload_size, l1a)
+      body = b"".join(d.ljust(stride, b"\0") for d in data)
+    self._relay_inline(hdr + noc_addrs + body)
 
   def write_packed_large(self, rects: list[Rect], addr: int, data: bytes):
-    data_padded = bytes(data).ljust(
-      align_up(len(data), FastDispatch.L1_ALIGNMENT), b"\0"
-    )
+    l1a = FastDispatch.L1_ALIGNMENT
+    data_padded = bytes(data).ljust(align_up(len(data), l1a), b"\0")
     max_batch = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS
     for batch_start in range(0, len(rects), max_batch):
       batch = rects[batch_start : batch_start + max_batch]
-      hdr = struct.pack("<BBHHH", CQ_DISPATCH_CMD_WRITE_PACKED_LARGE, 2, len(batch), FastDispatch.L1_ALIGNMENT, 0)
-      hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
+      hdr = struct.pack("<BBHHH", CQ_DISPATCH_CMD_WRITE_PACKED_LARGE, 2, len(batch), l1a, 0).ljust(CQ_CMD_SIZE, b"\0")
       sub = b"".join(
-        struct.pack(
-          "<IIHBB",
-          noc_mcast_xy(rect)[0],
-          addr,
-          len(data) - 1,
-          noc_mcast_xy(rect)[1],
-          CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK,
-        )
-        for rect in batch
-      )
-      sub = sub.ljust(align_up(len(sub), FastDispatch.L1_ALIGNMENT), b"\0")
+        struct.pack("<IIHBB", noc_mcast_xy(r)[0], addr, len(data) - 1, noc_mcast_xy(r)[1],
+                    CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK) for r in batch
+      ).ljust(align_up(len(batch) * 12, l1a), b"\0")
       self._relay_inline(hdr + sub + data_padded * len(batch))
 
   def set_go_signal_noc_data(self, cores: list[Core]):
-    hdr = struct.pack("<BBHI", CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA, 0, 0, len(cores))
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    payload = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores)
-    self._relay_inline(hdr + payload)
+    hdr = struct.pack("<BBHI", CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA, 0, 0, len(cores)).ljust(CQ_CMD_SIZE, b"\0")
+    self._relay_inline(hdr + b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores))
 
-  def send_go_signal(
-    self, go_word: int, stream: int, count: int, num_unicast: int
-  ):
-    hdr = struct.pack(
-      "<BIBBBII",
-      CQ_DISPATCH_CMD_SEND_GO_SIGNAL,
-      go_word & 0xFFFFFFFF,
-      CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
-      num_unicast & 0xFF,
-      0,
-      count & 0xFFFFFFFF,
-      stream & 0xFFFFFFFF,
-    )
-    self._relay_inline(hdr)
+  def send_go_signal(self, go_word: int, stream: int, count: int, num_unicast: int):
+    self._cmd(CQ_DISPATCH_CMD_SEND_GO_SIGNAL,
+      struct.pack("<IBBBII", go_word, CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET, num_unicast, 0, count, stream))
 
   def wait_stream(self, stream: int, count: int, clear: bool = True):
-    flags = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM
-    if clear:
-      flags |= CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM
-    hdr = struct.pack("<BBHII", CQ_DISPATCH_CMD_WAIT, flags, stream, 0, count)
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    self._relay_inline(hdr)
+    flags = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | (CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM if clear else 0)
+    self._cmd(CQ_DISPATCH_CMD_WAIT, struct.pack("<BHII", flags, stream, 0, count))
 
   def host_event(self, event_id: int):
-    payload = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(
-      FastDispatch.L1_ALIGNMENT, b"\0"
-    )
-    hdr = struct.pack(
-      "<BBHIQ",
-      CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST,
-      1,
-      0,
-      0,
-      CQ_CMD_SIZE + len(payload),
-    )
+    payload = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(FastDispatch.L1_ALIGNMENT, b"\0")
+    hdr = struct.pack("<BBHIQ", CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST, 1, 0, 0, CQ_CMD_SIZE + len(payload))
     self._relay_inline(hdr + payload)
 
   def timestamp(self, noc_xy_addr: int, addr: int):
-    hdr = struct.pack("<BBHII", CQ_DISPATCH_CMD_TIMESTAMP, 0, 0, noc_xy_addr, addr)
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    self._relay_inline(hdr)
+    self._cmd(CQ_DISPATCH_CMD_TIMESTAMP, struct.pack("<xHII", 0, noc_xy_addr, addr))
 
   def flush(self):
     offset = 0
@@ -455,46 +359,32 @@ class CQ:
     self._stream.clear()
     self._sizes.clear()
 
+  def _sysmem_read32(self, off):
+    return struct.unpack("<I", self.sysmem[off : off + 4])[0]
+
+  def _sysmem_write32(self, off, val):
+    self.sysmem[off : off + 4] = struct.pack("<I", val)
+
   def wait_completion(self, event_id: int, timeout_s: float = 10.0):
     deadline = time.perf_counter() + timeout_s
     while True:
-      wr_raw = struct.unpack(
-        "<I",
-        self.sysmem[
-          FastDispatch.HOST_COMPLETION_Q_WR_OFF : FastDispatch.HOST_COMPLETION_Q_WR_OFF
-          + 4
-        ],
-      )[0]
-      wr_16b = wr_raw & 0x7FFF_FFFF
-      wr_toggle = (wr_raw >> 31) & 0x1
-      if (wr_16b != self._completion_rd_16b) or (
-        wr_toggle != self._completion_rd_toggle
-      ):
+      wr_raw = self._sysmem_read32(FastDispatch.HOST_COMPLETION_Q_WR_OFF)
+      wr_16b, wr_toggle = wr_raw & 0x7FFF_FFFF, (wr_raw >> 31) & 1
+      if wr_16b != self._completion_rd_16b or wr_toggle != self._completion_rd_toggle:
         off = (self._completion_rd_16b << 4) - self.noc_local
-        got = struct.unpack(
-          "<I", self.sysmem[off + CQ_CMD_SIZE : off + CQ_CMD_SIZE + 4]
-        )[0]
+        got = self._sysmem_read32(off + CQ_CMD_SIZE)
         self._completion_rd_16b += self._completion_page_16b
         if self._completion_rd_16b >= self._completion_end_16b:
           self._completion_rd_16b = self._completion_base_16b
           self._completion_rd_toggle ^= 1
-        raw = (self._completion_rd_16b & 0x7FFF_FFFF) | (
-          self._completion_rd_toggle << 31
-        )
+        raw = (self._completion_rd_16b & 0x7FFF_FFFF) | (self._completion_rd_toggle << 31)
         self._dispatch_win.write32(DEV_COMPLETION_Q_RD_PTR_ADDR, raw)
-        self.sysmem[
-          FastDispatch.HOST_COMPLETION_Q_RD_OFF : FastDispatch.HOST_COMPLETION_Q_RD_OFF
-          + 4
-        ] = struct.pack("<I", raw)
+        self._sysmem_write32(FastDispatch.HOST_COMPLETION_Q_RD_OFF, raw)
         if got != (event_id & 0xFFFFFFFF):
-          raise RuntimeError(
-            f"completion event mismatch: got {got}, expected {event_id}"
-          )
+          raise RuntimeError(f"completion event mismatch: got {got}, expected {event_id}")
         return
       if time.perf_counter() > deadline:
-        raise TimeoutError(
-          f"timeout waiting for completion event {event_id} — try tt-smi -r"
-        )
+        raise TimeoutError(f"timeout waiting for completion event {event_id} — try tt-smi -r")
       time.sleep(0.0002)
 
   def reset_run_state(self):
@@ -502,29 +392,17 @@ class CQ:
     self._prefetch_q_wr_idx = 0
     self._stream.clear()
     self._sizes.clear()
-    self._prefetch_win.write32(
-      DEV_PREFETCH_Q_RD_PTR_ADDR, DEV_PREFETCH_Q_BASE + DEV_PREFETCH_Q_SIZE
-    )
-    self._prefetch_win.write32(
-      DEV_PREFETCH_Q_PCIE_RD_PTR_ADDR,
-      (self.noc_local + HOST_ISSUE_BASE) & 0xFFFFFFFF,
-    )
+    self._prefetch_win.write32(DEV_PREFETCH_Q_RD_PTR_ADDR, DEV_PREFETCH_Q_BASE + DEV_PREFETCH_Q_SIZE)
+    self._prefetch_win.write32(DEV_PREFETCH_Q_PCIE_RD_PTR_ADDR, (self.noc_local + HOST_ISSUE_BASE) & 0xFFFFFFFF)
     for i in range(FastDispatch.PREFETCH_Q_ENTRIES_WORKER_DEFAULT):
       off = DEV_PREFETCH_Q_BASE + i * FastDispatch.PREFETCH_Q_ENTRY_BYTES
       self._prefetch_win.uc[off : off + 2] = b"\0\0"
     self._completion_rd_16b = self._completion_base_16b
     self._completion_rd_toggle = 0
-    base_val = self._completion_base_16b
-    self._dispatch_win.write32(DEV_COMPLETION_Q_WR_PTR_ADDR, base_val)
-    self._dispatch_win.write32(DEV_COMPLETION_Q_RD_PTR_ADDR, base_val)
-    self.sysmem[
-      FastDispatch.HOST_COMPLETION_Q_WR_OFF : FastDispatch.HOST_COMPLETION_Q_WR_OFF
-      + 4
-    ] = struct.pack("<I", base_val)
-    self.sysmem[
-      FastDispatch.HOST_COMPLETION_Q_RD_OFF : FastDispatch.HOST_COMPLETION_Q_RD_OFF
-      + 4
-    ] = struct.pack("<I", base_val)
+    self._dispatch_win.write32(DEV_COMPLETION_Q_WR_PTR_ADDR, self._completion_base_16b)
+    self._dispatch_win.write32(DEV_COMPLETION_Q_RD_PTR_ADDR, self._completion_base_16b)
+    self._sysmem_write32(FastDispatch.HOST_COMPLETION_Q_WR_OFF, self._completion_base_16b)
+    self._sysmem_write32(FastDispatch.HOST_COMPLETION_Q_RD_OFF, self._completion_base_16b)
 
   def close(self):
     self._prefetch_win.close()
@@ -1141,89 +1019,61 @@ class Device:
       return untilize(result, buf.dtype.bpe, buf.shape)
     return result
 
-  def queue(self, program):
+  def queue(self, program: Program):
     self._programs.append(program)
 
-  def _compile_commands(
-    self, program, dispatch_mode, host_assigned_id: int = 0
-  ) -> list:
-    if hasattr(program, "compile"):
-      prog, roles, compute, all_cores, per_core_args = program.compile(
-        self.compiler
-      )
-      return build_commands(
-        prog,
-        roles,
-        compute,
-        all_cores,
-        per_core_args,
-        dispatch_mode,
-        host_assigned_id=host_assigned_id,
-      )
-    writer = (
-      self.compiler.compile_dataflow(program.writer_kernel, "brisc")
-      if program.writer_kernel
-      else None
-    )
-    reader = (
-      self.compiler.compile_dataflow(program.reader_kernel, "ncrisc")
-      if program.reader_kernel
-      else None
-    )
-    compute = (
-      self.compiler.compile_compute(program.compute_kernel, program)
-      if program.compute_kernel
-      else None
-    )
-    cores = self._resolve_cores(program.cores)
-    n = len(cores)
-    per_core_args = [
-      (
-        resolve_args(program.writer_args, i, c, n),
-        resolve_args(program.reader_args, i, c, n),
-        resolve_args(program.compute_args, i, c, n),
-      )
-      for i, c in enumerate(cores)
-    ]
-    return build_commands(
-      program,
-      [(cores, reader, writer)],
-      compute,
-      cores,
-      per_core_args,
-      dispatch_mode,
-      host_assigned_id=host_assigned_id,
-    )
+  def _compile_commands(self, program: Program, dispatch_mode, host_assigned_id: int = 0) -> list:
+    writer = self.compiler.compile_dataflow(program.writer_kernel, "brisc") if program.writer_kernel else None
+    reader = self.compiler.compile_dataflow(program.reader_kernel, "ncrisc") if program.reader_kernel else None
+    compute = self.compiler.compile_compute(program.compute_kernel, program) if program.compute_kernel else None
 
-  def _program_cores(self, program) -> list[Core]:
-    if hasattr(program, "plan"):
-      return sorted(program.plan.active_cores(), key=lambda c: (c[0], c[1]))
+    if program.grid is not None:
+      rows, cols = program.grid
+      grid = [[(x, y) for x in cols] for y in rows]
+      all_cores = sorted([c for row in grid for c in row], key=lambda c: (c[0], c[1]))
+      n = len(all_cores)
+      per_core_args = [
+        (resolve_args(program.writer_args, i, c, n), resolve_args(program.reader_args, i, c, n),
+         resolve_args(program.compute_args, i, c, n))
+        for i, c in enumerate(all_cores)
+      ]
+      r_recv = self.compiler.compile_dataflow(program.reader_recv_kernel, "ncrisc") if program.reader_recv_kernel else reader
+      w_recv = self.compiler.compile_dataflow(program.writer_recv_kernel, "brisc") if program.writer_recv_kernel else writer
+      top_left = [grid[0][0]]
+      top_row = [grid[0][c] for c in range(1, len(cols))]
+      left_col = [grid[r][0] for r in range(1, len(rows))]
+      interior = [grid[r][c] for r in range(1, len(rows)) for c in range(1, len(cols))]
+      roles = [(cs, rk, wk) for cs, rk, wk in [
+        (top_left, reader, writer), (top_row, r_recv, writer), (left_col, reader, w_recv), (interior, r_recv, w_recv),
+      ] if cs]
+    else:
+      cores = self._resolve_cores(program.cores)
+      all_cores = cores
+      n = len(cores)
+      per_core_args = [
+        (resolve_args(program.writer_args, i, c, n), resolve_args(program.reader_args, i, c, n),
+         resolve_args(program.compute_args, i, c, n))
+        for i, c in enumerate(cores)
+      ]
+      roles = [(cores, reader, writer)]
+
+    return build_commands(program, roles, compute, all_cores, per_core_args, dispatch_mode, host_assigned_id=host_assigned_id)
+
+  def _program_cores(self, program: Program) -> list[Core]:
+    if program.grid is not None:
+      rows, cols = program.grid
+      return sorted([(x, y) for x in cols for y in rows], key=lambda c: (c[0], c[1]))
     return self._resolve_cores(program.cores)
 
   def _programs_info(self) -> list[dict]:
     info = []
-    for i, program in enumerate(self._programs):
-      cores = self._program_cores(program)
+    for i, prog in enumerate(self._programs):
+      cores = self._program_cores(prog)
       sources = {}
-      prog = (
-        program.compiled_program
-        if hasattr(program, "compiled_program")
-        else program
-      )
-      if prog.reader_kernel:
-        sources["reader"] = prog.reader_kernel
-      if prog.writer_kernel:
-        sources["writer"] = prog.writer_kernel
-      if prog.compute_kernel:
-        sources["compute"] = prog.compute_kernel
-      info.append(
-        {
-          "index": i,
-          "name": prog.name or None,
-          "cores": cores,
-          "sources": sources,
-        }
-      )
+      if prog.reader_kernel: sources["reader"] = prog.reader_kernel
+      if prog.writer_kernel: sources["writer"] = prog.writer_kernel
+      if prog.compute_kernel: sources["compute"] = prog.compute_kernel
+      info.append({"index": i, "name": prog.name or None, "cores": cores, "sources": sources})
     return info
 
   def run(self) -> list[dict] | None:

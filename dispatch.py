@@ -67,6 +67,9 @@ class Program:
   approx: bool = False
   dst_accum_mode: bool = False
   dst_full_sync: bool = False
+  reader_recv_kernel: str = ""
+  writer_recv_kernel: str = ""
+  grid: tuple[tuple[int, ...], tuple[int, ...]] | None = None
 
 @dataclass
 class McastWrite:
