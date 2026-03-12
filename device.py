@@ -8,6 +8,7 @@ from autogen import *
 from dispatch import CBConfig, CQ_CMD_SIZE, Core, CoreArgs, Dtype, MathFidelity, Program, Rect, FAST_CQ_NUM_CIRCULAR_BUFFERS
 from dispatch import Go, McastWrite, SetGoSignalNocData, UnicastWrite, Wait
 from dispatch import build_commands, fast_enqueue, mcast_rects, noc_mcast_xy, noc_xy, resolve_args, slow_dispatch
+from kernels import TILIZE_READER, TILIZE_COMPUTE, TILIZE_WRITER, UNTILIZE_READER, UNTILIZE_COMPUTE, UNTILIZE_WRITER
 
 class NocOrdering(Enum):
   RELAXED = 0
@@ -949,10 +950,6 @@ class Device:
   def _firmware_src(name: str) -> str:
     return (Path(__file__).parent / "firmware" / name).read_text()
 
-  @staticmethod
-  def _kernel_src(*parts: str) -> str:
-    return (Path(__file__).parent / "kernels" / Path(*parts)).read_text()
-
   def _layout_transfer_plan(self, buf: DramBuffer) -> LayoutTransferPlan:
     assert buf.shape is not None
     shape = buf.shape
@@ -1008,9 +1005,9 @@ class Device:
     return Program(
       cores=plan.n_cores,
       name="dram_fill_tilize",
-      reader_kernel=sysmem_defs + self._kernel_src("tilize", "reader.cc"),
-      compute_kernel=self._kernel_src("tilize", "compute.cc"),
-      writer_kernel=dram_defs + self._kernel_src("tilize", "writer.cc"),
+      reader_kernel=sysmem_defs + TILIZE_READER,
+      compute_kernel=TILIZE_COMPUTE,
+      writer_kernel=dram_defs + TILIZE_WRITER,
       cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=1), CBConfig(index=16, dtype=buf.dtype, tiles=1)],
       reader_args=tile_args,
       writer_args=tile_args,
@@ -1033,9 +1030,9 @@ class Device:
     return Program(
       cores=plan.n_cores,
       name="dram_drain_untilize",
-      reader_kernel=dram_defs + self._kernel_src("untilize", "reader.cc"),
-      compute_kernel=self._kernel_src("untilize", "compute.cc"),
-      writer_kernel=sysmem_defs + self._kernel_src("untilize", "writer.cc"),
+      reader_kernel=dram_defs + UNTILIZE_READER,
+      compute_kernel=UNTILIZE_COMPUTE,
+      writer_kernel=sysmem_defs + UNTILIZE_WRITER,
       cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=1), CBConfig(index=16, dtype=buf.dtype, tiles=1)],
       reader_args=tile_args,
       writer_args=tile_args,
