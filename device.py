@@ -1055,6 +1055,30 @@ void MAIN {
 }  // namespace NAMESPACE
 '''
 
+  def _pack_untilize_compute_src(self, block_tile_cols: int) -> str:
+    assert 1 <= block_tile_cols <= 8
+    return f'''#include <cstdint>
+#include "compute_kernel_api/pack_untilize.h"
+
+namespace NAMESPACE {{
+void MAIN {{
+  constexpr uint32_t src_cb_id = tt::CBIndex::c_0;
+  constexpr uint32_t out_cb_id = tt::CBIndex::c_16;
+  const uint32_t total_blocks = get_arg_val<uint32_t>(0);
+  compute_kernel_hw_startup(src_cb_id, out_cb_id);
+  pack_untilize_init<{block_tile_cols}, {block_tile_cols}>(src_cb_id, out_cb_id);
+  for (uint32_t b = 0; b < total_blocks; ++b) {{
+    cb_wait_front(src_cb_id, {block_tile_cols});
+    cb_reserve_back(out_cb_id, {block_tile_cols});
+    pack_untilize_block<{block_tile_cols}, {block_tile_cols}>(src_cb_id, 1, out_cb_id, 0);
+    cb_push_back(out_cb_id, {block_tile_cols});
+    cb_pop_front(src_cb_id, {block_tile_cols});
+  }}
+  pack_untilize_uninit(out_cb_id);
+}}
+}}  // namespace NAMESPACE
+'''
+
   def _build_tilize_transfer_program(self, buf: DramBuffer, plan: LayoutTransferPlan) -> Program:
     sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
 
@@ -1116,11 +1140,17 @@ void MAIN {
       _, num_tile_rows = self._layout_core_range(plan, core_idx)
       return [num_tile_rows * plan.blocks_per_row, plan.block_tile_cols]
 
+    use_pack_untilize = plan.block_tile_cols <= (4 if buf.dtype.bpe == 4 else 8)
+    compute_kernel = (
+      self._pack_untilize_compute_src(plan.block_tile_cols)
+      if use_pack_untilize else self._untilize_compute_src()
+    )
+
     return Program(
       cores=plan.n_cores,
       name="dram_drain_untilize",
       reader_kernel=self._firmware_src("tiled_dram_reader.cc"),
-      compute_kernel=self._untilize_compute_src(),
+      compute_kernel=compute_kernel,
       writer_kernel=self._firmware_src("rm_sysmem_writer.cc"),
       cbs=[
         CBConfig(index=0, dtype=buf.dtype, tiles=plan.block_tile_cols),
