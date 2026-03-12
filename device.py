@@ -968,9 +968,6 @@ class Device:
   def _firmware_src(self, name: str) -> str:
     return (Path(__file__).parent / "firmware" / name).read_text()
 
-  def _compile_dram_kernel(self, name: str):
-    return self.compiler.compile_dataflow(self._firmware_src(name), "ncrisc")
-
   def _layout_transfer_plan(self, buf: DramBuffer) -> LayoutTransferPlan:
     assert buf.shape is not None
     shape = buf.shape
@@ -1166,44 +1163,6 @@ void MAIN {{
     self.queue(program)
     self.run()
 
-  def _run_dram_transfer(self, buf: DramBuffer, kernel, extra_args: list[int] | None = None):
-    self._ensure_dram_sysmem()
-    assert not self._programs, "queue must be empty for DRAM transfers"
-    n_tiles = buf.num_tiles
-    all_cores = self.cores
-    tiles_per_core = (n_tiles + len(all_cores) - 1) // len(all_cores)
-    n_cores = min(len(all_cores), n_tiles)
-    sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
-    base_args = [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset]
-    tail = extra_args or []
-
-    def reader_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      start = core_idx * tiles_per_core
-      count = min(tiles_per_core, n_tiles - start) if start < n_tiles else 0
-      return base_args + [start, count, buf.page_size] + tail
-
-    prog = Program(
-      cores=n_cores, reader_kernel="", writer_kernel="", compute_kernel="",
-      cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=2)], reader_args=reader_args,
-    )
-    cores = self._resolve_cores(prog.cores)
-    per_core_args = [
-      ([], resolve_args(prog.reader_args, i, c, len(cores)), [])
-      for i, c in enumerate(cores)
-    ]
-    dispatch_mode = self._dispatch_mode
-    commands = build_commands(
-      prog, [(cores, kernel, None)], None, cores, per_core_args, dispatch_mode,
-    )
-    self._set_power_busy()
-    go_word = self._go_word()
-    fast_enqueue(self.cq, commands, go_word)
-    self.cq._event_id += 1
-    self.cq.host_event(self.cq._event_id)
-    self.cq.flush()
-    self.cq.wait_completion(self.cq._event_id)
-    self._set_power_idle()
-
   def dram_write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
     if self._use_fast_dispatch and buf.shape is not None:
@@ -1215,13 +1174,7 @@ void MAIN {{
       return
     if buf.shape is not None:
       data = tilize(data, buf.dtype.bpe, buf.shape)
-    if self._use_fast_dispatch:
-      self._ensure_dram_sysmem(len(data))
-      self._dram_sysmem.buf[:len(data)] = data
-      kernel = self._compile_dram_kernel("dram_fill.cc")
-      self._run_dram_transfer(buf, kernel)
-    else:
-      self.dram.write(buf, data)
+    self.dram.write(buf, data)
 
   def dram_read(self, buf: DramBuffer) -> bytes:
     if self._use_fast_dispatch and buf.shape is not None:
@@ -1229,13 +1182,7 @@ void MAIN {{
       self._ensure_dram_sysmem(plan.logical_bytes)
       self._run_transfer_program(self._build_untilize_transfer_program(buf, plan))
       return bytes(self._dram_sysmem.buf[:plan.logical_bytes])
-    if self._use_fast_dispatch:
-      self._ensure_dram_sysmem(buf.size)
-      kernel = self._compile_dram_kernel("dram_drain.cc")
-      self._run_dram_transfer(buf, kernel, extra_args=[0])
-      result = bytes(self._dram_sysmem.buf[:buf.size])
-    else:
-      result = self.dram.read(buf)
+    result = self.dram.read(buf)
     if buf.shape is not None:
       return untilize(result, buf.dtype.bpe, buf.shape)
     return result
