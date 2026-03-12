@@ -1,4 +1,4 @@
-import os, re, shutil, struct, subprocess, tempfile
+import hashlib, os, pickle, re, shutil, struct, subprocess, tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,9 +11,34 @@ PROFILER = os.environ.get("PROFILE") == "1"
 _REPO = Path(__file__).resolve().parent
 _DEPS = _REPO / "tt-metal-deps"
 _SFPI = _DEPS / "sfpi-toolchain" / "bin"
+_CACHE_DIR = Path.home() / "cache" / "tt-cache"
 
 # zone hash→name mapping captured from DeviceZoneScopedN #pragma messages
 _zone_map: dict[int, tuple[str, str, int]] = {}
+
+def _cache_hash(*parts) -> str:
+  h = hashlib.sha256()
+  for p in parts:
+    if isinstance(p, bytes):
+      h.update(p)
+    else:
+      h.update(repr(p).encode())
+    h.update(b"\x00")
+  return h.hexdigest()
+
+def _cache_load(key: str):
+  try:
+    with open(_CACHE_DIR / f"{key}.pkl", "rb") as f:
+      return pickle.load(f)
+  except (FileNotFoundError, pickle.UnpicklingError, EOFError, ValueError):
+    return None
+
+def _cache_store(key: str, data):
+  _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  tmp = _CACHE_DIR / f"{key}.tmp"
+  with open(tmp, "wb") as f:
+    pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+  tmp.rename(_CACHE_DIR / f"{key}.pkl")
 
 def hash16(s: str) -> int:
   h = 0x811c9dc5
@@ -280,6 +305,15 @@ def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
   cc = _SFPI / "riscv-tt-elf-g++"
   assert cc.is_file(), f"missing compiler: {cc}"
 
+  fw_src_dir = _REPO / "firmware"
+  unique_srcs = sorted(set(s for s, *_ in _FW_TARGETS))
+  key = _cache_hash("fw", profile, tuple((n, (fw_src_dir / n).read_bytes()) for n in unique_srcs))
+  cached = _cache_load(key)
+  if cached is not None:
+    _zone_map.update(cached["zones"])
+    return cached["result"]
+
+  zones_before = dict(_zone_map)
   common_defines = [
     "-DTENSIX_FIRMWARE", "-DFW_BUILD", "-DARCH_BLACKHOLE",
     "-DLOCAL_MEM_EN=0", "-DDISPATCH_MESSAGE_ADDR=0xFFB70438", *_DEVICE_DEFINES,
@@ -287,7 +321,6 @@ def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
   if profile: common_defines += _PROFILE_DEFINES
   lib = _DEPS / "lib" / "blackhole"
   ld_dir = _DEPS / "toolchain" / "blackhole"
-  fw_src_dir = _REPO / "firmware"
 
   result: dict[str, CompiledFirmware] = {}
   for src_name, target, target_defs, mcpu, opt, extra in _FW_TARGETS:
@@ -300,6 +333,8 @@ def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
     segs = list(iter_pt_load(elf))
     result[target] = CompiledFirmware(elf_bytes=elf, segments=segs)
 
+  new_zones = {k: v for k, v in _zone_map.items() if k not in zones_before}
+  _cache_store(key, {"result": result, "zones": new_zones})
   return result
 
 class Compiler:
@@ -345,6 +380,20 @@ class Compiler:
   def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str], opt: str, trisc: bool,
              extra_includes: list[str] | None = None, xip_relocate: bool = False,
              program: Program = _DEFAULT_PROGRAM) -> CompiledKernel:
+    hdrs = _ckernel_headers(program)
+    inc_content = b""
+    if extra_includes:
+      for d in sorted(extra_includes):
+        for f in sorted(Path(d).rglob("*")):
+          if f.is_file(): inc_content += f.read_bytes()
+    key = _cache_hash("kern", kern, target, tuple(defines), opt, trisc,
+                      xip_relocate, tuple(sorted(hdrs.items())), self._fw[target].elf_bytes, inc_content)
+    cached = _cache_load(key)
+    if cached is not None:
+      _zone_map.update(cached["zones"])
+      return cached["result"]
+
+    zones_before = dict(_zone_map)
     mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
            ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
     fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
@@ -356,8 +405,6 @@ class Compiler:
       nonlocal fw_link_elf
       fw_link_elf = self._weaken_fw_symbols(build, self._fw[target].elf_bytes)
       (build / "kernel_includes.hpp").write_text(kern)
-      # Always write ckernel headers (dataflow kernels need unpack_tile_size etc.)
-      hdrs = _ckernel_headers(program)
       for name, content in hdrs.items():
         (build / name).write_text(content)
       if trisc:
@@ -372,7 +419,10 @@ class Compiler:
 
     elf = _compile_and_link(cc=self._cc, src=fw_src, compile_args=compile_args,
                             link_args=_kernel_link_args, tmp_prefix=f"tt-{target}-", prepare=_prepare)
-    return CompiledKernel(*pack_xip_elf(elf, xip_relocate=xip_relocate))
+    result = CompiledKernel(*pack_xip_elf(elf, xip_relocate=xip_relocate))
+    new_zones = {k: v for k, v in _zone_map.items() if k not in zones_before}
+    _cache_store(key, {"result": result, "zones": new_zones})
+    return result
 
   def _weaken_fw_symbols(self, build: Path, fw: bytes) -> Path:
     out = build / "fw.elf"
@@ -381,13 +431,11 @@ class Compiler:
                          "--localize-symbol=exit", "--weaken", str(out)], build)
     return out
 
-def compile_cq_kernels() -> dict[str, CompiledKernel]:
-  compiler = Compiler()
-  cq = lambda src, proc, noc: compiler._compile_dataflow(
-    (_CQ_SRC_DIR / src).read_text(), proc, noc_index=noc, extra_includes=_CQ_INC, xip_relocate=True, profiler=False)
-  result = {
-    "prefetch_brisc": cq("cq_prefetch.cpp", "brisc", 0),
-    "dispatch_brisc": cq("cq_dispatch.cpp", "brisc", 1),
-    "dispatch_s_ncrisc": cq("cq_dispatch_subordinate.cpp", "ncrisc", 1),
-  }
-  return result
+  def compile_cq_kernels(self) -> dict[str, CompiledKernel]:
+    cq = lambda src, proc, noc: self._compile_dataflow(
+      (_CQ_SRC_DIR / src).read_text(), proc, noc_index=noc, extra_includes=_CQ_INC, xip_relocate=True, profiler=False)
+    return {
+      "prefetch_brisc": cq("cq_prefetch.cpp", "brisc", 0),
+      "dispatch_brisc": cq("cq_dispatch.cpp", "brisc", 1),
+      "dispatch_s_ncrisc": cq("cq_dispatch_subordinate.cpp", "ncrisc", 1),
+    }

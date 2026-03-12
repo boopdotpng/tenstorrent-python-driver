@@ -1055,9 +1055,7 @@ class Device:
         time.sleep(0.001)
 
   def _start_dispatch_cores(self) -> None:
-    from compiler import compile_cq_kernels
-
-    cq_kernels = compile_cq_kernels()
+    cq_kernels = self.compiler.compile_cq_kernels()
     l1a = FastDispatch.L1_ALIGNMENT
 
     self._wait_core_done(self._prefetch_core)
@@ -1185,7 +1183,7 @@ class Device:
     src = (Path(__file__).parent / "firmware" / name).read_text()
     return self.compiler.compile_dataflow(src, "ncrisc")
 
-  def _run_dram_transfer(self, buf: DramBuffer, kernel):
+  def _run_dram_transfer(self, buf: DramBuffer, kernel, extra_args: list[int] | None = None):
     self._ensure_dram_sysmem()
     assert not self._programs, "queue must be empty for DRAM transfers"
     n_tiles = buf.num_tiles
@@ -1194,49 +1192,55 @@ class Device:
     n_cores = min(len(all_cores), n_tiles)
     sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
     base_args = [buf.addr, Sysmem.PCIE_NOC_XY, sysmem_offset]
+    tail = extra_args or []
 
     def reader_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
       start = core_idx * tiles_per_core
       count = min(tiles_per_core, n_tiles - start) if start < n_tiles else 0
-      return base_args + [start, count, buf.page_size]
+      return base_args + [start, count, buf.page_size] + tail
 
-    self.queue(
-      Program(
-        cores=n_cores,
-        reader_kernel="",
-        writer_kernel="",
-        compute_kernel="",
-        cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=2)],
-        reader_args=reader_args,
-      )
+    prog = Program(
+      cores=n_cores, reader_kernel="", writer_kernel="", compute_kernel="",
+      cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=2)], reader_args=reader_args,
     )
-    prog = self._programs[0]
-    self._set_power_busy()
-    dispatch_mode = self._dispatch_mode
     cores = self._resolve_cores(prog.cores)
-    rects = mcast_rects(cores)
-    commands = build_commands(prog, kernel, None, None, cores, rects, dispatch_mode)
-    if not self._use_fast_dispatch:
-      with TLBWindow(self.fd, start=cores[0]) as win:
-        slow_dispatch(win, commands)
-    else:
-      go_word = self._go_word()
-      fast_enqueue(self.cq, commands, go_word)
-      self.cq._event_id += 1
-      self.cq.host_event(self.cq._event_id)
-      self.cq.flush()
-      self.cq.wait_completion(self.cq._event_id)
-    self._programs.clear()
+    per_core_args = [
+      ([], resolve_args(prog.reader_args, i, c, len(cores)), [])
+      for i, c in enumerate(cores)
+    ]
+    dispatch_mode = self._dispatch_mode
+    commands = build_commands(
+      prog, [(cores, kernel, None)], None, cores, per_core_args, dispatch_mode,
+    )
+    self._set_power_busy()
+    go_word = self._go_word()
+    fast_enqueue(self.cq, commands, go_word)
+    self.cq._event_id += 1
+    self.cq.host_event(self.cq._event_id)
+    self.cq.flush()
+    self.cq.wait_completion(self.cq._event_id)
     self._set_power_idle()
 
   def dram_write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
     if buf.shape is not None:
       data = tilize(data, buf.dtype.bpe, buf.shape)
-    self.dram.write(buf, data)
+    if self._use_fast_dispatch:
+      self._ensure_dram_sysmem()
+      self._dram_sysmem.buf[:len(data)] = data
+      kernel = self._compile_dram_kernel("dram_fill.cc")
+      self._run_dram_transfer(buf, kernel)
+    else:
+      self.dram.write(buf, data)
 
   def dram_read(self, buf: DramBuffer) -> bytes:
-    result = self.dram.read(buf)
+    if self._use_fast_dispatch:
+      self._ensure_dram_sysmem()
+      kernel = self._compile_dram_kernel("dram_drain.cc")
+      self._run_dram_transfer(buf, kernel, extra_args=[0])
+      result = bytes(self._dram_sysmem.buf[:buf.size])
+    else:
+      result = self.dram.read(buf)
     if buf.shape is not None:
       return untilize(result, buf.dtype.bpe, buf.shape)
     return result
