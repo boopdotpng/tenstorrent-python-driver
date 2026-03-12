@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-import struct
+import struct, time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Literal
 
-from autogen import DevMsgs, FastDispatch, LaunchMsg, TensixL1, align_up, as_bytes
+from autogen import (
+  DevMsgs,
+  FastDispatch,
+  GoMsg,
+  LaunchMsg,
+  TensixL1,
+  align_up,
+  as_bytes,
+)
 
 Core = tuple[int, int]
 Rect = tuple[int, int, int, int]
@@ -14,7 +22,6 @@ RtArgs = Args | Callable[[int, Core, int], Args]
 CoreArgs = tuple[Args, Args, Args]  # (writer, reader, compute) per core
 
 FAST_CQ_NUM_CIRCULAR_BUFFERS = 32
-
 
 class Dtype(Enum):
   Float32 = 0
@@ -34,20 +41,17 @@ class Dtype(Enum):
   def tile_size(self) -> int:
     return 32 * 32 * self.bpe
 
-
 class MathFidelity(Enum):
   LoFi = 0
   HiFi2 = 2
   HiFi3 = 3
   HiFi4 = 4
 
-
 @dataclass
 class CBConfig:
   index: int
   dtype: Dtype
   tiles: int = 2
-
 
 @dataclass
 class Program:
@@ -56,6 +60,7 @@ class Program:
   compute_kernel: str
   writer_kernel: str
   cbs: list[CBConfig]
+  name: str = ""
   reader_args: RtArgs = field(default_factory=list)
   writer_args: RtArgs = field(default_factory=list)
   compute_args: RtArgs = field(default_factory=list)
@@ -65,13 +70,11 @@ class Program:
   dst_accum_mode: bool = False
   dst_full_sync: bool = False
 
-
 @dataclass
 class McastWrite:
   rects: list[Rect]
   addr: int
   data: bytes
-
 
 @dataclass
 class UnicastWrite:
@@ -79,21 +82,19 @@ class UnicastWrite:
   addr: int
   data: list[bytes]
 
-
 @dataclass
 class SetGoSignalNocData:
   cores: list[Core]
-
 
 @dataclass
 class Go:
   cores: list[Core]
 
-
 @dataclass
 class Wait:
   cores: list[Core]
 
+Command = McastWrite | UnicastWrite | SetGoSignalNocData | Go | Wait
 
 def mcast_rects(cores: list[Core]) -> list[Rect]:
   if not cores:
@@ -114,11 +115,9 @@ def mcast_rects(cores: list[Core]) -> list[Rect]:
     rects.append((x0, x1, y0, y1))
   return rects
 
-
 def noc_mcast_xy(rect: Rect) -> tuple[int, int]:
   x0, x1, y0, y1 = rect
   return (y1 << 18) | (x1 << 12) | (y0 << 6) | x0, (x1 - x0 + 1) * (y1 - y0 + 1)
-
 
 def build_cb_blob(program: Program) -> tuple[int, bytes]:
   if not program.cbs:
@@ -140,15 +139,21 @@ def build_cb_blob(program: Program) -> tuple[int, bytes]:
       cb_addr = addr
       addr += size
     shared_addr[cb.index] = cb_addr
-    struct.pack_into("<IIII", arr, cb.index * 16, cb_addr, size, cb.tiles, page_size)
+    struct.pack_into(
+      "<IIII", arr, cb.index * 16, cb_addr, size, cb.tiles, page_size
+    )
   return mask, bytes(arr)
-
 
 def resolve_args(args: RtArgs, core_idx: int, core_xy: Core, num_cores: int) -> Args:
   return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
 
-
-def pack_rta(writer_args: Args, reader_args: Args, compute_args: Args, num_sems: int, sem_off: int) -> bytes:
+def pack_rta(
+  writer_args: Args,
+  reader_args: Args,
+  compute_args: Args,
+  num_sems: int,
+  sem_off: int,
+) -> bytes:
   pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
   rta = pack(writer_args) + pack(reader_args) + pack(compute_args)
   if num_sems > 0:
@@ -157,10 +162,16 @@ def pack_rta(writer_args: Args, reader_args: Args, compute_args: Args, num_sems:
     rta += b"\0" * (num_sems * 16)
   return rta
 
-
-def build_payload(program: Program, reader, writer, compute: tuple | None,
-                  rta_sizes: tuple[int, int, int], dispatch_mode: int,
-                  sem_off: int | None = None, host_assigned_id: int = 0) -> tuple[int, bytes, bytes]:
+def build_payload(
+  program: Program,
+  reader,
+  writer,
+  compute: tuple | None,
+  rta_sizes: tuple[int, int, int],
+  dispatch_mode: int,
+  sem_off: int | None = None,
+  host_assigned_id: int = 0,
+) -> tuple[int, bytes, bytes]:
   l1a = FastDispatch.L1_ALIGNMENT
   rta_offsets = [0, rta_sizes[0], rta_sizes[0] + rta_sizes[1]]
   rta_total = align_up(rta_offsets[2] + rta_sizes[2], l1a)
@@ -188,10 +199,10 @@ def build_payload(program: Program, reader, writer, compute: tuple | None,
     enables |= 1 << idx
 
   shared = bytearray(off - local_cb_off)
-  shared[0:len(cb_blob)] = cb_blob
+  shared[0 : len(cb_blob)] = cb_blob
   for _, kernel, idx in proc:
     dst = kernel_text_off[idx] - local_cb_off
-    shared[dst:dst + len(kernel.xip)] = kernel.xip
+    shared[dst : dst + len(kernel.xip)] = kernel.xip
   shared_addr = TensixL1.KERNEL_CONFIG_BASE + local_cb_off
 
   launch = LaunchMsg()
@@ -207,28 +218,45 @@ def build_payload(program: Program, reader, writer, compute: tuple | None,
   cfg.brisc_noc_id = 1
   cfg.brisc_noc_mode = 0
   cfg.mode = dispatch_mode
-  cfg.rta_offset[0].rta_offset, cfg.rta_offset[0].crta_offset = rta_offsets[0], local_cb_off
-  cfg.rta_offset[1].rta_offset, cfg.rta_offset[1].crta_offset = rta_offsets[1], local_cb_off
+  cfg.rta_offset[0].rta_offset, cfg.rta_offset[0].crta_offset = (
+    rta_offsets[0],
+    local_cb_off,
+  )
+  cfg.rta_offset[1].rta_offset, cfg.rta_offset[1].crta_offset = (
+    rta_offsets[1],
+    local_cb_off,
+  )
   for i in (2, 3, 4):
-    cfg.rta_offset[i].rta_offset, cfg.rta_offset[i].crta_offset = rta_offsets[2], local_cb_off
+    cfg.rta_offset[i].rta_offset, cfg.rta_offset[i].crta_offset = (
+      rta_offsets[2],
+      local_cb_off,
+    )
   for i, value in enumerate(kernel_text_off):
     cfg.kernel_text_offset[i] = value
   cfg.host_assigned_id = host_assigned_id
   return shared_addr, bytes(shared), as_bytes(launch)
 
-
 Role = tuple[list[Core], object, object]  # (cores, reader, writer)
 
-def build_commands(program: Program, roles: list[Role], compute: tuple | None,
-                   all_cores: list[Core], per_core_args: list[CoreArgs], dispatch_mode: int,
-                   host_assigned_id: int = 0) -> list[Command]:
+def build_commands(
+  program: Program,
+  roles: list[Role],
+  compute: tuple | None,
+  all_cores: list[Core],
+  per_core_args: list[CoreArgs],
+  dispatch_mode: int,
+  host_assigned_id: int = 0,
+) -> list[Command]:
+
   max_w = max((len(a[0]) for a in per_core_args), default=0) * 4
   max_r = max((len(a[1]) for a in per_core_args), default=0) * 4
   max_c = max((len(a[2]) for a in per_core_args), default=0) * 4
   rta_sizes = (max_w, max_r, max_c)
   sem_off = align_up(max_w + max_r + max_c, FastDispatch.L1_ALIGNMENT)
 
-  rta_blobs = [pack_rta(w, r, c, program.semaphores, sem_off) for w, r, c in per_core_args]
+  rta_blobs = [
+    pack_rta(w, r, c, program.semaphores, sem_off) for w, r, c in per_core_args
+  ]
   all_rects = mcast_rects(all_cores)
   reset_blob = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_RESET_READ_PTR_FROM_HOST)
 
@@ -240,18 +268,78 @@ def build_commands(program: Program, roles: list[Role], compute: tuple | None,
 
   # RTAs: mcast if uniform, unicast if per-core
   if rta_blobs and all(b == rta_blobs[0] for b in rta_blobs):
-    commands.append(McastWrite(all_rects, TensixL1.KERNEL_CONFIG_BASE, rta_blobs[0]))
+    commands.append(
+      McastWrite(all_rects, TensixL1.KERNEL_CONFIG_BASE, rta_blobs[0])
+    )
   elif rta_blobs:
     commands.append(UnicastWrite(all_cores, TensixL1.KERNEL_CONFIG_BASE, rta_blobs))
 
   # Per-role: mcast launch blob + shared blob (kernel text)
   for role_cores, reader, writer in roles:
     shared_addr, shared_blob, launch_blob = build_payload(
-      program, reader, writer, compute, rta_sizes, dispatch_mode, sem_off=sem_off,
-      host_assigned_id=host_assigned_id)
+      program,
+      reader,
+      writer,
+      compute,
+      rta_sizes,
+      dispatch_mode,
+      sem_off=sem_off,
+      host_assigned_id=host_assigned_id,
+    )
     role_rects = mcast_rects(role_cores)
     commands.append(McastWrite(role_rects, TensixL1.LAUNCH, launch_blob))
     commands.append(McastWrite(role_rects, shared_addr, shared_blob))
 
   commands += [Go(all_cores), Wait(all_cores)]
   return commands
+
+def noc_xy(x: int, y: int) -> int:
+  return ((y << 6) | x) & 0xFFFF
+
+CQ_CMD_SIZE = 16  # all prefetch/dispatch commands are 16 bytes
+
+def slow_dispatch(win, commands: list[Command]) -> None:
+  for cmd in commands:
+    match cmd:
+      case McastWrite(rects=rects, addr=addr, data=data):
+        for x0, x1, y0, y1 in rects:
+          win.target((x0, y0), (x1, y1))
+          win.write(addr, data)
+      case UnicastWrite(cores=cores, addr=addr, data=data):
+        for core, d in zip(cores, data):
+          win.target(core)
+          win.write(addr, d)
+      case SetGoSignalNocData():
+        pass
+      case Go(cores=cores):
+        go = GoMsg()
+        go.bits.signal = DevMsgs.RUN_MSG_GO
+        go_blob = struct.pack("<I", go.all)
+        for x0, x1, y0, y1 in mcast_rects(cores):
+          win.target((x0, y0), (x1, y1))
+          win.uc[TensixL1.GO_MSG : TensixL1.GO_MSG + 4] = go_blob
+      case Wait(cores=cores):
+        for x, y in cores:
+          win.target((x, y))
+          deadline = time.perf_counter() + 10.0
+          while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
+            if time.perf_counter() > deadline:
+              raise TimeoutError(
+                f"timeout waiting for core ({x}, {y}) — try tt-smi -r"
+              )
+
+def fast_enqueue(cq, commands: list[Command], go_word: int) -> None:
+  for cmd in commands:
+    match cmd:
+      case McastWrite(rects=rects, addr=addr, data=data):
+        cq.write_packed_large(rects, addr, data)
+      case UnicastWrite(cores=cores, addr=addr, data=data):
+        cq.write_packed(cores, addr, data)
+      case SetGoSignalNocData(cores=cores):
+        cq.set_go_signal_noc_data(cores)
+      case Go(cores=cores):
+        cq.wait_stream(48, 0)
+        cq.send_go_signal(go_word, stream=48, count=0, num_unicast=len(cores))
+        cq.wait_stream(48, len(cores))
+      case Wait():
+        pass  # handled by Go's wait_stream in fast dispatch

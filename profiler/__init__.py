@@ -1,12 +1,3 @@
-from profiler.profiler import (
-  read_core, collect, collect_fast_dram,
-  print_data_summary, RISC_NAMES,
-)
+from profiler.profiler import collect, print_summary, RISC_NAMES
 
-__all__ = [
-  "read_core",
-  "collect",
-  "collect_fast_dram",
-  "print_data_summary",
-  "RISC_NAMES",
-]
+__all__ = ["collect", "print_summary", "RISC_NAMES"]

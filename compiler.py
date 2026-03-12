@@ -6,7 +6,7 @@ from pathlib import Path
 from autogen import TensixL1
 from dispatch import Dtype, MathFidelity, Program
 
-PROFILER = os.environ.get("TT_PROFILER") == "1"
+PROFILER = os.environ.get("PROFILE") == "1"
 
 _REPO = Path(__file__).resolve().parent
 _DEPS = _REPO / "tt-metal-deps"
@@ -20,8 +20,6 @@ def hash16(s: str) -> int:
   for c in s.encode():
     h = ((h ^ c) * 0x01000193) & 0xFFFFFFFF
   return (h >> 16) ^ (h & 0xFFFF)
-
-# ── includes and flags ────────────────────────────────────────────────────────
 
 _INCLUDE_PATHS = [
   "tt_metal/hw/inc", "tt_metal/hostdevcommon/api", "tt_metal/api",
@@ -76,8 +74,6 @@ _FW_TARGETS = [
    ["-mcpu=tt-bh-tensix"], "-O3", []),
 ]
 
-# ── data types and ckernel config ─────────────────────────────────────────────
-
 _DEFAULT_PROGRAM = Program(cores=1, reader_kernel="", writer_kernel="", compute_kernel="", cbs=[])
 
 def _ckernel_headers(program: Program) -> dict[str, str]:
@@ -115,8 +111,6 @@ def _ckernel_headers(program: Program) -> dict[str, str]:
     "chlkc_math_fidelity.h": f"#pragma once\n#include <cstdint>\nconstexpr std::int32_t MATH_FIDELITY = {program.math_fidelity.value};\n",
     "chlkc_math_approx_mode.h": f"#pragma once\nconstexpr bool APPROX = {b(program.approx)};\n",
   }
-
-# ── ELF helpers ───────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class PTLoad:
@@ -238,8 +232,6 @@ def pack_xip_elf(elf: bytes, xip_relocate: bool = False) -> tuple[bytes, int]:
   text = next((s for s in l1 if (s.flags & 1) and s.data), l1[0])
   return bytes(out), len(text.data)
 
-# ── compilation ───────────────────────────────────────────────────────────────
-
 @dataclass(frozen=True)
 class CompiledKernel:
   xip: bytes
@@ -352,7 +344,7 @@ class Compiler:
 
   def _build(self, kern: str, target: str, defines: list[str], extra_objs: list[str], opt: str, trisc: bool,
              extra_includes: list[str] | None = None, xip_relocate: bool = False,
-             program: Program | None = None) -> CompiledKernel:
+             program: Program = _DEFAULT_PROGRAM) -> CompiledKernel:
     mcpu = ["-mcpu=tt-bh-tensix", "-mno-tt-tensix-optimize-replay"] if trisc else \
            ["-mcpu=tt-bh", "-mno-tt-tensix-optimize-replay", "-fno-tree-loop-distribute-patterns"]
     fw_src = _DEPS / "firmware-src" / ("trisck.cc" if trisc else f"{target}k.cc")
@@ -365,7 +357,7 @@ class Compiler:
       fw_link_elf = self._weaken_fw_symbols(build, self._fw[target].elf_bytes)
       (build / "kernel_includes.hpp").write_text(kern)
       # Always write ckernel headers (dataflow kernels need unpack_tile_size etc.)
-      hdrs = _ckernel_headers(program) if program is not None else _ckernel_headers(_DEFAULT_PROGRAM)
+      hdrs = _ckernel_headers(program)
       for name, content in hdrs.items():
         (build / name).write_text(content)
       if trisc:

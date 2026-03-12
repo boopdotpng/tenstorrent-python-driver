@@ -40,3 +40,9 @@ def serve(data: dict, port: int = 8000):
     pass
   finally:
     server.server_close()
+
+if __name__ == "__main__":
+  import sys
+
+  path = sys.argv[1] if len(sys.argv) > 1 else "profiler_data.json"
+  serve(json.loads(Path(path).read_text()))
