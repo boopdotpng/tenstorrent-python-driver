@@ -92,6 +92,28 @@ class Dram:
   }
   BANK_X = {b: 0 if b < 4 else 9 for b in range(8)}
 
+class Profiler:
+  # ControlBuffer enum indices (into 32×u32 control block, from profiler_common.h)
+  HOST_BUF_END = 0       # per RISC (indices 0-4)
+  DEVICE_BUF_END = 5     # per RISC (indices 5-9)
+  DROPPED = 18
+  DONE = 19
+  # BufferIndex guaranteed marker positions (u32 indices within a run)
+  GUARANTEED_FW_START = 4
+  GUARANTEED_FW_END = 6
+  GUARANTEED_KERN_START = 8
+  GUARANTEED_KERN_END = 10
+  CUSTOM_START = 12
+  # Marker packet types
+  ZONE_START = 0
+  ZONE_END = 1
+  ZONE_TOTAL = 2
+  TS_DATA = 3
+  TS_DATA_16B = 5
+  # Derived
+  HOST_BUF_BYTES_PER_RISC = TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC
+  HOST_BUF_WORDS_PER_RISC = HOST_BUF_BYTES_PER_RISC // 4
+
 TENSTORRENT_IOCTL_MAGIC = 0xFA
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
 IOCTL_PIN_PAGES = 7
