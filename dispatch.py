@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import struct, time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -298,7 +296,7 @@ def noc_xy(x: int, y: int) -> int:
 
 CQ_CMD_SIZE = 16  # all prefetch/dispatch commands are 16 bytes
 
-def slow_dispatch(win, commands: list[Command]) -> None:
+def slow_dispatch(win, commands: list[Command]):
   for cmd in commands:
     match cmd:
       case McastWrite(rects=rects, addr=addr, data=data):
@@ -328,7 +326,7 @@ def slow_dispatch(win, commands: list[Command]) -> None:
                 f"timeout waiting for core ({x}, {y}) — try tt-smi -r"
               )
 
-def fast_enqueue(cq, commands: list[Command], go_word: int) -> None:
+def fast_enqueue(cq, commands: list[Command], go_word: int):
   for cmd in commands:
     match cmd:
       case McastWrite(rects=rects, addr=addr, data=data):

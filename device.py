@@ -1,4 +1,3 @@
-from __future__ import annotations
 import ctypes, time, fcntl, mmap, os, struct
 from dataclasses import dataclass
 from enum import Enum
@@ -48,7 +47,6 @@ class TLBWindow:
   ):
     self.fd, self.size = fd, size
 
-    # AllocateTlbIn -> AllocateTlbOut
     buf = bytearray(48)
     struct.pack_into("<Q", buf, 0, size)
     fcntl.ioctl(fd, _IO(IOCTL_ALLOCATE_TLB), buf, True)
@@ -66,10 +64,9 @@ class TLBWindow:
     end: Core | None = None,
     addr: int = 0,
     mode: NocOrdering = NocOrdering.STRICT,
-  ) -> None:
+  ):
     end = end or start
     mcast = end != start
-    # NocTlbConfig(u64 addr, 4×u16 end/start, 8×u8 flags, 2×u32 res)
     buf = struct.pack(
       "<IIQ4H8B2I",
       self._id,
@@ -95,21 +92,21 @@ class TLBWindow:
   def read32(self, offset: int) -> int:
     return int.from_bytes(self.uc[offset : offset + 4], "little")
 
-  def write32(self, offset: int, value: int) -> None:
+  def write32(self, offset: int, value: int):
     self.uc[offset : offset + 4] = value.to_bytes(4, "little")
 
-  def write(self, addr: int, data: bytes, wc: bool = False) -> None:
+  def write(self, addr: int, data: bytes, wc: bool = False):
     view = self.wc if wc else self.uc
     view[addr : addr + len(data)] = data
 
-  def close(self) -> None:
+  def close(self):
     self.uc.close()
     self.wc.close()
     fcntl.ioctl(
       self.fd, _IO(IOCTL_FREE_TLB), bytearray(struct.pack("<I", self._id)), False
     )
 
-  def __enter__(self) -> TLBWindow:
+  def __enter__(self):
     return self
 
   def __exit__(self, *_):
@@ -132,14 +129,12 @@ class Sysmem:
       prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
     self._va = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
-    # PinPagesIn(output_size u32, flags u32, va u64, size u64) -> PinPagesOutExtended(phys u64, noc u64)
     buf = bytearray(40)
     struct.pack_into("<IIQQ", buf, 0, 16, PIN_PAGES_NOC_DMA, self._va, self.size)
     fcntl.ioctl(self.fd, _IO(IOCTL_PIN_PAGES), buf, True)
     _, self.noc_addr = struct.unpack_from("<QQ", buf, 24)
 
   def close(self):
-    # UnpinPagesIn(va u64, size u64, reserved u64)
     buf = bytearray(24)
     struct.pack_into("<QQQ", buf, 0, self._va, self.size, 0)
     fcntl.ioctl(self.fd, _IO(IOCTL_UNPIN_PAGES), buf, False)
@@ -284,12 +279,11 @@ class Allocator:
 
 class TileGrid:
   ARC = (8, 0)
-  # See tt-isa-documentation. Cols 8,9 are l2cpu & dram.
   TENSIX_X = (*range(1, 8), *range(10, 15))
   WORKER_CORES = [(x, y) for x in TENSIX_X for y in range(2, 12)]
 
 class CQ:
-  def __init__(self, fd: int):
+  def __init__(self, fd: int, prefetch_win: TLBWindow, dispatch_win: TLBWindow):
     self.fd = fd
     flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS
     if hasattr(mmap, "MAP_POPULATE"):
@@ -301,11 +295,8 @@ class CQ:
     if (self._sysmem_addr % PAGE_SIZE) != 0 or (HOST_SYSMEM_SIZE % PAGE_SIZE) != 0:
       raise RuntimeError("CQ sysmem must be page-aligned and page-sized")
 
-    # PinPagesIn -> PinPagesOutExtended
     buf = bytearray(40)
-    struct.pack_into(
-      "<IIQQ", buf, 0, 16, PIN_PAGES_NOC_DMA, self._sysmem_addr, HOST_SYSMEM_SIZE
-    )
+    struct.pack_into("<IIQQ", buf, 0, 16, PIN_PAGES_NOC_DMA, self._sysmem_addr, HOST_SYSMEM_SIZE)
     fcntl.ioctl(self.fd, _IO(IOCTL_PIN_PAGES), buf, True)
     _, self.noc_addr = struct.unpack_from("<QQ", buf, 24)
     if (self.noc_addr & FastDispatch.PCIE_NOC_BASE) != FastDispatch.PCIE_NOC_BASE:
@@ -314,7 +305,7 @@ class CQ:
     if self.noc_local > 0xFFFF_FFFF:
       raise RuntimeError(f"CQ sysmem NOC offset too large: 0x{self.noc_local:x}")
     self._stream = bytearray()
-    self._sizes: list[int] = []
+    self._sizes = []
     self._issue_wr = 0
     self._prefetch_q_wr_idx = 0
     self._event_id = 0
@@ -327,13 +318,11 @@ class CQ:
     )
     self._completion_rd_16b = self._completion_base_16b
     self._completion_rd_toggle = 0
-    # TLB windows for prefetch queue and dispatch core (set up by Device)
-    self._prefetch_win: TLBWindow | None = None
-    self._dispatch_win: TLBWindow | None = None
+    self._prefetch_win = prefetch_win
+    self._dispatch_win = dispatch_win
 
-  def _relay_inline(self, inner: bytes) -> None:
+  def _relay_inline(self, inner: bytes):
     stride = align_up(CQ_CMD_SIZE + len(inner), FastDispatch.PCIE_ALIGNMENT)
-    # prefetch cmd: cmd_id(1) + dispatcher_type(1) + pad(2) + length(4) + stride(4) + pad(4) = 16
     hdr = struct.pack(
       "<BBHII", CQ_PREFETCH_CMD_RELAY_INLINE, 0, 0, len(inner), stride
     )
@@ -346,13 +335,13 @@ class CQ:
     off = DEV_PREFETCH_Q_BASE + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
     return struct.unpack("<H", self._prefetch_win.uc[off : off + 2])[0]
 
-  def _wait_prefetch_slot_free(self, idx: int, timeout_s: float = 1.0) -> None:
+  def _wait_prefetch_slot_free(self, idx: int, timeout_s: float = 1.0):
     deadline = time.perf_counter() + timeout_s
     while self._read_prefetch_entry(idx) != 0:
       if time.perf_counter() > deadline:
         raise TimeoutError("timeout waiting for prefetch queue slot")
 
-  def _issue_write(self, record: bytes) -> None:
+  def _issue_write(self, record: bytes):
     self._issue_wr = align_up(self._issue_wr, FastDispatch.PCIE_ALIGNMENT)
     if self._issue_wr + len(record) > HOST_ISSUE_SIZE:
       self._issue_wr = 0
@@ -368,15 +357,12 @@ class CQ:
 
   def write_packed(
     self, cores: list[Core], addr: int, data: bytes | list[bytes]
-  ) -> None:
+  ):
     uniform = isinstance(data, bytes)
     count = len(cores)
     payload_size = len(data) if uniform else len(data[0])
     flags = CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE if uniform else 0
-    # cmd_id(1) + flags(1) + count(2) + write_offset_index(2) + size(2) + addr(4) + pad(4) = 16
-    hdr = struct.pack(
-      "<BBHHHI", CQ_DISPATCH_CMD_WRITE_PACKED, flags, count, 0, payload_size, addr
-    )
+    hdr = struct.pack("<BBHHHI", CQ_DISPATCH_CMD_WRITE_PACKED, flags, count, 0, payload_size, addr)
     hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
     sub = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores)
     sub = sub.ljust(align_up(len(sub), FastDispatch.L1_ALIGNMENT), b"\0")
@@ -389,25 +375,16 @@ class CQ:
       data_section = b"".join(d.ljust(stride, b"\0") for d in data)
     self._relay_inline(hdr + sub + data_section)
 
-  def write_packed_large(self, rects: list[Rect], addr: int, data: bytes) -> None:
+  def write_packed_large(self, rects: list[Rect], addr: int, data: bytes):
     data_padded = bytes(data).ljust(
       align_up(len(data), FastDispatch.L1_ALIGNMENT), b"\0"
     )
     max_batch = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS
     for batch_start in range(0, len(rects), max_batch):
       batch = rects[batch_start : batch_start + max_batch]
-      # cmd_id(1) + type(1) + count(2) + alignment(2) + write_offset_index(2) + pad(8) = 16
-      hdr = struct.pack(
-        "<BBHHH",
-        CQ_DISPATCH_CMD_WRITE_PACKED_LARGE,
-        2,
-        len(batch),
-        FastDispatch.L1_ALIGNMENT,
-        0,
-      )
+      hdr = struct.pack("<BBHHH", CQ_DISPATCH_CMD_WRITE_PACKED_LARGE, 2, len(batch), FastDispatch.L1_ALIGNMENT, 0)
       hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
       sub = b"".join(
-        # noc_xy_addr(4) + addr(4) + length_minus1(2) + num_mcast_dests(1) + flags(1) = 12
         struct.pack(
           "<IIHBB",
           noc_mcast_xy(rect)[0],
@@ -421,19 +398,15 @@ class CQ:
       sub = sub.ljust(align_up(len(sub), FastDispatch.L1_ALIGNMENT), b"\0")
       self._relay_inline(hdr + sub + data_padded * len(batch))
 
-  def set_go_signal_noc_data(self, cores: list[Core]) -> None:
-    # cmd_id(1) + pad(3) + num_words(4) + pad(8) = 16
-    hdr = struct.pack(
-      "<BBHI", CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA, 0, 0, len(cores)
-    )
+  def set_go_signal_noc_data(self, cores: list[Core]):
+    hdr = struct.pack("<BBHI", CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA, 0, 0, len(cores))
     hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
     payload = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores)
     self._relay_inline(hdr + payload)
 
   def send_go_signal(
     self, go_word: int, stream: int, count: int, num_unicast: int
-  ) -> None:
-    # cmd_id(1) + go_signal(4) + mcast_offset(1) + num_unicast(1) + noc_start_idx(1) + wait_count(4) + wait_stream(4) = 16
+  ):
     hdr = struct.pack(
       "<BIBBBII",
       CQ_DISPATCH_CMD_SEND_GO_SIGNAL,
@@ -446,20 +419,18 @@ class CQ:
     )
     self._relay_inline(hdr)
 
-  def wait_stream(self, stream: int, count: int, clear: bool = True) -> None:
+  def wait_stream(self, stream: int, count: int, clear: bool = True):
     flags = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM
     if clear:
       flags |= CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM
-    # cmd_id(1) + flags(1) + stream(2) + addr(4) + count(4) + pad(4) = 16
     hdr = struct.pack("<BBHII", CQ_DISPATCH_CMD_WAIT, flags, stream, 0, count)
     hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
     self._relay_inline(hdr)
 
-  def host_event(self, event_id: int) -> None:
+  def host_event(self, event_id: int):
     payload = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(
       FastDispatch.L1_ALIGNMENT, b"\0"
     )
-    # cmd_id(1) + is_event(1) + pad(6) + length(8) = 16
     hdr = struct.pack(
       "<BBHIQ",
       CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST,
@@ -470,13 +441,12 @@ class CQ:
     )
     self._relay_inline(hdr + payload)
 
-  def timestamp(self, noc_xy_addr: int, addr: int) -> None:
-    # cmd_id(1) + pad(3) + noc_xy_addr(4) + addr(4) + pad(4) = 16
+  def timestamp(self, noc_xy_addr: int, addr: int):
     hdr = struct.pack("<BBHII", CQ_DISPATCH_CMD_TIMESTAMP, 0, 0, noc_xy_addr, addr)
     hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
     self._relay_inline(hdr)
 
-  def flush(self) -> None:
+  def flush(self):
     offset = 0
     for size_16b in self._sizes:
       size = size_16b << 4
@@ -485,7 +455,7 @@ class CQ:
     self._stream.clear()
     self._sizes.clear()
 
-  def wait_completion(self, event_id: int, timeout_s: float = 10.0) -> None:
+  def wait_completion(self, event_id: int, timeout_s: float = 10.0):
     deadline = time.perf_counter() + timeout_s
     while True:
       wr_raw = struct.unpack(
@@ -527,7 +497,7 @@ class CQ:
         )
       time.sleep(0.0002)
 
-  def reset_run_state(self) -> None:
+  def reset_run_state(self):
     self._issue_wr = 0
     self._prefetch_q_wr_idx = 0
     self._stream.clear()
@@ -557,10 +527,8 @@ class CQ:
     ] = struct.pack("<I", base_val)
 
   def close(self):
-    if self._prefetch_win:
-      self._prefetch_win.close()
-    if self._dispatch_win:
-      self._dispatch_win.close()
+    self._prefetch_win.close()
+    self._dispatch_win.close()
     buf = bytearray(24)
     struct.pack_into("<QQQ", buf, 0, self._sysmem_addr, HOST_SYSMEM_SIZE, 0)
     fcntl.ioctl(self.fd, _IO(IOCTL_UNPIN_PAGES), buf, False)
@@ -602,14 +570,8 @@ class Device:
     self._set_active_dram_tiles()
     self.dram = Allocator(self.fd, self.dram_tiles)
     self._init_timestamp_dram()
-    self._dispatch_mode = (
-      DevMsgs.DISPATCH_MODE_HOST
-      if USE_USB_DISPATCH
-      else DevMsgs.DISPATCH_MODE_DEV
-    )
+    self._dispatch_mode = DevMsgs.DISPATCH_MODE_HOST if USE_USB_DISPATCH else DevMsgs.DISPATCH_MODE_DEV
     self._use_fast_dispatch = not USE_USB_DISPATCH
-
-    # Reserve dispatch cores only when the runtime is actually using fast dispatch.
     self.cores = list(TileGrid.WORKER_CORES)
     if self._use_fast_dispatch:
       self._prefetch_core, self._dispatch_core = self._select_dispatch_core_pair()
@@ -619,41 +581,32 @@ class Device:
         if c not in {self._prefetch_core, self._dispatch_core}
       ]
 
-    # Compiler and firmware
     from compiler import Compiler
-
     self.compiler = Compiler()
     self._upload_firmware()
 
-    # Fast dispatch expects the CQ host buffer to land in the second PCIe aperture.
-    # Reserve the first pinned host window up front, matching the source-of-truth
-    # runtime's dram allocator initialization order.
-    self._dram_sysmem: Sysmem | None = (
-      Sysmem(self.fd) if self._use_fast_dispatch else None
-    )
-
-    # CQ for device-side fast dispatch
-    self.cq: CQ | None = None
+    self._dram_sysmem = Sysmem(self.fd) if self._use_fast_dispatch else None
+    self.cq = None
     if self._use_fast_dispatch:
-      self.cq = CQ(self.fd)
-      self.cq._prefetch_win = TLBWindow(self.fd, start=self._prefetch_core)
-      self.cq._dispatch_win = TLBWindow(self.fd, start=self._dispatch_core)
+      self.cq = CQ(
+        self.fd,
+        prefetch_win=TLBWindow(self.fd, start=self._prefetch_core),
+        dispatch_win=TLBWindow(self.fd, start=self._dispatch_core),
+      )
       self._start_dispatch_cores()
 
-    self._programs: list = []
-    self.last_profile: dict | None = None
+    self._programs = []
+    self.last_profile = None
     self._profiler_initialized = False
 
-    # Profiler DRAM buffer (fast dispatch only)
     from compiler import PROFILER
-
     self._profiler = PROFILER and self._use_fast_dispatch
-    self._profiler_flat_ids: dict[Core, int] = {}
+    self._profiler_flat_ids = {}
     self._profiler_core_count_per_dram = 0
     if self._profiler:
       self._init_profiler_dram()
 
-  def _set_active_dram_tiles(self) -> None:
+  def _set_active_dram_tiles(self):
     dram_bank_ys = Dram.BANK_TILE_YS
     self.dram_tiles = [
       (bank, Dram.BANK_X[bank], y)
@@ -662,7 +615,7 @@ class Device:
       for y in dram_bank_ys[bank]
     ]
 
-  def _init_timestamp_dram(self) -> None:
+  def _init_timestamp_dram(self):
     self._ts_bank_tiles = list(self.dram.bank_tiles)
     self._ts_bank_count = len(self._ts_bank_tiles)
     self._ts_slots_per_page = TIMESTAMP_PAGE_SIZE // TIMESTAMP_STRIDE
@@ -707,7 +660,7 @@ class Device:
     hi = self.dram.win.read32(addr + 4)
     return (hi << 32) | lo
 
-  def _init_profiler_dram(self) -> None:
+  def _init_profiler_dram(self):
     cores = sorted(self.cores, key=lambda xy: (xy[0], xy[1]))
     self._profiler_flat_ids = {core: i for i, core in enumerate(cores)}
     bank_count = len(self.dram.bank_tiles)
@@ -732,7 +685,7 @@ class Device:
     ctrl[17] = self._profiler_core_count_per_dram  # CORE_COUNT_PER_DRAM
     return struct.pack("<32I", *ctrl)
 
-  def _enqueue_profiler_init(self) -> None:
+  def _enqueue_profiler_init(self):
     cores = sorted(self._profiler_flat_ids, key=lambda xy: (xy[0], xy[1]))
     self.cq.write_packed(
       cores,
@@ -740,7 +693,7 @@ class Device:
       [self._profiler_control_blob(c) for c in cores],
     )
 
-  def _enqueue_profiler_reset(self, rects: list[Rect]) -> None:
+  def _enqueue_profiler_reset(self, rects: list[Rect]):
     base = TensixL1.PROFILER_CONTROL
     self.cq.write_packed_large(
       rects, base + 5 * 4, b"\0" * (5 * 4)
@@ -768,8 +721,7 @@ class Device:
     return ctrl
 
   def _read_arc_tag(self, tag: int, default: int) -> int:
-    arc = TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE)
-    try:
+    with TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE) as arc:
       telem_ptr = arc.read32(Arc.SCRATCH_RAM_13)
       csm_base, csm_off = align_down(telem_ptr, TLBWindow.SIZE_2M)
       arc.target(TileGrid.ARC, addr=csm_base)
@@ -782,8 +734,6 @@ class Device:
         tag_to_offset[tag_offset & 0xFFFF] = (tag_offset >> 16) & 0xFFFF
       off = tag_to_offset.get(tag)
       return default if off is None else arc.read32(data_base + off * 4)
-    finally:
-      arc.close()
 
   def _get_harvested_dram_bank(self) -> int:
     gddr_enabled = self._read_arc_tag(
@@ -815,13 +765,10 @@ class Device:
     ARC_MISC_CNTL = Arc.RESET_UNIT_OFFSET + 0x100
     IRQ0_TRIG = 1 << 16
 
-    arc = TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE)
-    try:
+    with TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE) as arc:
       info_ptr = arc.read32(Arc.SCRATCH_RAM_11)
       if info_ptr == 0:
-        raise RuntimeError(
-          "msgqueue not initialized (SCRATCH_RAM_11 == 0) — try tt-smi -r"
-        )
+        raise RuntimeError("msgqueue not initialized (SCRATCH_RAM_11 == 0) — try tt-smi -r")
       info_base, info_off = align_down(info_ptr, TLBWindow.SIZE_2M)
       arc.target(TileGrid.ARC, addr=info_base)
       queues_ptr = arc.read32(info_off)
@@ -829,39 +776,27 @@ class Device:
       arc.target(TileGrid.ARC, addr=q_base)
       q = q_off + queue * QUEUE_STRIDE
 
-      # Enqueue request
       wptr = arc.read32(q)
       req = q + HEADER_BYTES + (wptr % MSG_QUEUE_SIZE) * REQUEST_BYTES
-      words = [msg & 0xFF, arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF] + [0] * (
-        REQUEST_MSG_LEN - 3
-      )
+      words = [msg & 0xFF, arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF] + [0] * (REQUEST_MSG_LEN - 3)
       for i, w in enumerate(words):
         arc.write32(req + i * 4, w)
       arc.write32(q, (wptr + 1) % MSG_QUEUE_POINTER_WRAP)
 
-      # Trigger IRQ
       arc.target(TileGrid.ARC, addr=Arc.NOC_BASE)
       arc.write32(ARC_MISC_CNTL, arc.read32(ARC_MISC_CNTL) | IRQ0_TRIG)
 
-      # Poll for response
       arc.target(TileGrid.ARC, addr=q_base)
       rptr = arc.read32(q + 4)
       deadline = time.monotonic() + timeout_ms / 1000
       while time.monotonic() < deadline:
         if arc.read32(q + 20) != rptr:
-          resp = (
-            q
-            + HEADER_BYTES
-            + MSG_QUEUE_SIZE * REQUEST_BYTES
-            + (rptr % MSG_QUEUE_SIZE) * RESPONSE_BYTES
-          )
+          resp = q + HEADER_BYTES + MSG_QUEUE_SIZE * REQUEST_BYTES + (rptr % MSG_QUEUE_SIZE) * RESPONSE_BYTES
           out = [arc.read32(resp + i * 4) for i in range(RESPONSE_MSG_LEN)]
           arc.write32(q + 4, (rptr + 1) % MSG_QUEUE_POINTER_WRAP)
           return out
         time.sleep(0.001)
       raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms) — try tt-smi -r")
-    finally:
-      arc.close()
 
   def _set_power_busy(self, timeout_s: float = 2.0):
     self.arc_msg(Arc.MSG_AICLK_GO_BUSY, 0, 0, timeout_ms=1000)
@@ -879,26 +814,18 @@ class Device:
     except (TimeoutError, RuntimeError):
       pass  # best-effort on shutdown
 
-  def _upload_firmware(self) -> None:
+  def _upload_firmware(self):
     fw = self.compiler._fw
-    mmio_base, mmio_off = align_down(
-      TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBWindow.SIZE_2M
-    )
+    mmio_base, mmio_off = align_down(TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0, TLBWindow.SIZE_2M)
     reset_off = TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0 - mmio_base
-
-    # Resolve local-RAM segments to L1 scratch addresses
-    staged: dict[str, list[tuple[int, bytes]]] = {}
+    staged = {}
     for name, cfw in fw.items():
       scratch = _INIT_SCRATCH[name]
       spans = []
       for s in cfw.segments:
         if not s.data and s.memsz == 0:
           continue
-        data = (
-          s.data
-          if s.memsz <= len(s.data)
-          else s.data + b"\0" * (s.memsz - len(s.data))
-        )
+        data = s.data if s.memsz <= len(s.data) else s.data + b"\0" * (s.memsz - len(s.data))
         addr = s.paddr
         if TensixMMIO.LOCAL_RAM_START <= addr <= TensixMMIO.LOCAL_RAM_END:
           addr = scratch + (addr - TensixMMIO.LOCAL_RAM_START)
@@ -909,12 +836,7 @@ class Device:
       staged[name] = spans
 
     brisc_base = TensixL1.BRISC_FIRMWARE_BASE
-    jal = (
-      (brisc_base & 0xFF000)
-      | ((brisc_base & 0x800) << 9)
-      | ((brisc_base & 0x7FE) << 20)
-      | 0x6F
-    ).to_bytes(4, "little")
+    jal = ((brisc_base & 0xFF000) | ((brisc_base & 0x800) << 9) | ((brisc_base & 0x7FE) << 20) | 0x6F).to_bytes(4, "little")
     go_init = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
     bank_table = self._build_bank_noc_table()
 
@@ -924,49 +846,29 @@ class Device:
 
     with TLBWindow(self.fd, start=all_cores[0]) as win:
       for core in all_cores:
-        # Put all RISCs in reset
         win.target(core, addr=mmio_base)
         win.write32(reset_off, TensixMMIO.SOFT_RESET_ALL)
-        # Write firmware segments to L1
         win.target(core, mode=NocOrdering.RELAXED)
         for spans in staged.values():
           for addr, data in spans:
             win.write(addr, data)
-        # JAL at address 0 → BRISC firmware entry
         win.write(0, jal)
-        # GO_MSG = RUN_MSG_INIT
         win.write(TensixL1.GO_MSG, go_init)
-        # Bank-to-NOC tables
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_table)
-        # Reset PCs for NCRISC/TRISC
         win.target(core, addr=mmio_base)
         for reg, text_base in [
-          (
-            TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC,
-            fw["ncrisc"].text_base,
-          ),
-          (
-            TensixMMIO.RISCV_DEBUG_REG_TRISC0_RESET_PC,
-            fw["trisc0"].text_base,
-          ),
-          (
-            TensixMMIO.RISCV_DEBUG_REG_TRISC1_RESET_PC,
-            fw["trisc1"].text_base,
-          ),
-          (
-            TensixMMIO.RISCV_DEBUG_REG_TRISC2_RESET_PC,
-            fw["trisc2"].text_base,
-          ),
+          (TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC, fw["ncrisc"].text_base),
+          (TensixMMIO.RISCV_DEBUG_REG_TRISC0_RESET_PC, fw["trisc0"].text_base),
+          (TensixMMIO.RISCV_DEBUG_REG_TRISC1_RESET_PC, fw["trisc1"].text_base),
+          (TensixMMIO.RISCV_DEBUG_REG_TRISC2_RESET_PC, fw["trisc2"].text_base),
         ]:
           win.write32(reg - mmio_base, text_base)
 
-      # Release BRISC on all cores (keep NCRISC/TRISC in reset)
       for core in all_cores:
         win.target(core, addr=mmio_base)
         win.read32(reset_off)  # fence
         win.write32(reset_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
 
-      # Wait for firmware ready on one core
       probe = (1, 2) if (1, 2) in all_cores else all_cores[0]
       win.target(probe)
       deadline = time.perf_counter() + 2.0
@@ -1043,7 +945,7 @@ class Device:
     blob += struct.pack(f"<{NUM_L1_BANKS}i", *([0] * NUM_L1_BANKS))
     return blob
 
-  def _wait_core_done(self, core: Core, timeout_s: float = 2.0) -> None:
+  def _wait_core_done(self, core: Core, timeout_s: float = 2.0):
     deadline = time.perf_counter() + timeout_s
     with TLBWindow(self.fd, start=core) as win:
       while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
@@ -1054,25 +956,19 @@ class Device:
           )
         time.sleep(0.001)
 
-  def _start_dispatch_cores(self) -> None:
+  def _start_dispatch_cores(self):
     cq_kernels = self.compiler.compile_cq_kernels()
     l1a = FastDispatch.L1_ALIGNMENT
 
     self._wait_core_done(self._prefetch_core)
     self._wait_core_done(self._dispatch_core)
 
-    # Kernel config layout: [rt_args(16B)] [sem0(16B)] [sem1(16B)] [kernel XIP...]
-    kernel_off = l1a + 2 * l1a  # = 48
-
-    # Prefetch core: BRISC only, sem[0] = DEV_DISPATCH_CB_PAGES
+    kernel_off = l1a + 2 * l1a
     pref_rt = b"\0" * l1a
-    pref_sems = (
-      struct.pack("<I", DEV_DISPATCH_CB_PAGES).ljust(l1a, b"\0") + b"\0" * l1a
-    )
+    pref_sems = struct.pack("<I", DEV_DISPATCH_CB_PAGES).ljust(l1a, b"\0") + b"\0" * l1a
     pref_img = pref_rt + pref_sems
     pref_launch = self._build_cq_launch(kernel_off, 0, sem_off=l1a)
 
-    # Dispatch core: BRISC + NCRISC
     disp_rt = b"\0" * l1a
     disp_sems = b"\0" * l1a + b"\0" * l1a
     disp_img = disp_rt + disp_sems
@@ -1116,7 +1012,7 @@ class Device:
     kc.min_remote_cb_start_index = FAST_CQ_NUM_CIRCULAR_BUFFERS
     return launch
 
-  def _init_dispatch_core_state(self, win: TLBWindow) -> None:
+  def _init_dispatch_core_state(self, win: TLBWindow):
     l1a = FastDispatch.L1_ALIGNMENT
     base_16b = self.cq._completion_base_16b
     win.write32(DEV_COMPLETION_Q_WR_PTR_ADDR, base_16b)
@@ -1134,7 +1030,7 @@ class Device:
     launch: LaunchMsg,
     kernels: list[tuple[int, bytes]],
     init: Callable[[TLBWindow], None] | None = None,
-  ) -> None:
+  ):
     win = (
       self.cq._prefetch_win
       if core == self._prefetch_core
@@ -1366,7 +1262,6 @@ class Device:
         self.cq.flush()
         self.cq.wait_completion(self.cq._event_id)
 
-        # Profiler collection: read raw DRAM + control regs, hand off to profiler
         if profiling:
           self.dram.barrier()
           import profiler

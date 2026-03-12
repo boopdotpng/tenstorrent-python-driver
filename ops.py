@@ -1,7 +1,5 @@
 """Operation templates for Blackhole — matmul, eltwise, reduction."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from autogen import TensixL1
 from device import DramBuffer

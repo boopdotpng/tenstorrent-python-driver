@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """Matmul peak throughput benchmark using MatmulProgram template."""
-from __future__ import annotations
-
 import os, sys
 from pathlib import Path
 import numpy as np
