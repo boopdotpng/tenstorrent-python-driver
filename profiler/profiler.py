@@ -1,4 +1,4 @@
-import os, re, struct
+import re, struct
 
 from autogen import Profiler as P
 from compiler import hash16
@@ -213,8 +213,6 @@ def collect(
   # Parse all RISC data from DRAM, keyed by (core, prog_id)
   # core_data[core][prog_id] = list of (risc_name, fw, kern, kern_start, kern_end, zones)
   core_data = {}
-  debug = os.environ.get("TT_PROFILER_DEBUG") == "1"
-  debug_remaining = 3
 
   for core in sorted(needed):
     flat_id = flat_ids[core]
@@ -228,15 +226,6 @@ def collect(
       base = page_id * page_size + slot + risc * _HOST_BUF_BYTES_PER_RISC
       raw = raw_dram[base : base + host_end * 4]
       words = struct.unpack(f"<{len(raw) // 4}I", raw) if raw else ()
-
-      if debug and debug_remaining > 0 and risc == 0:
-        host_ends = [ctrl[P.HOST_BUF_END + i] for i in range(5)]
-        dev_ends = [ctrl[P.DEVICE_BUF_END + i] for i in range(5)]
-        print(
-          f"[profdbg] core={core} done={ctrl[P.DONE]} dropped=0x{ctrl[P.DROPPED]:x} "
-          f"host_ends={host_ends} dev_ends={dev_ends}"
-        )
-        debug_remaining -= 1
 
       for prog_id, (fw, kern, kern_start, kern_end, custom) in _parse_risc(
         words, risc, program_ids

@@ -101,8 +101,6 @@ def main():
     for _ in range(WARMUP_ITERS):
       device.queue(prog)
     device.run()
-    if os.environ.get("TT_DEBUG_CQ_DUMP") == "1":
-      return
 
     print(f"Timing ({TIMED_ITERS} iters)...")
     for _ in range(TIMED_ITERS):
@@ -117,8 +115,7 @@ def main():
       out = Path("profiler_data.json")
       out.write_text(json.dumps(device.last_profile))
       print(f"Profiler data written to {out.resolve()}")
-      if os.environ.get("TT_PROFILER_SERVE") == "1":
-        device.serve_profile()
+      device.serve_profile()
 
   finally:
     device.close()
