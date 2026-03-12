@@ -3,8 +3,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal
+import numpy as np
 from autogen import *
-from autogen import _IO
 from dispatch import CBConfig, CQ_CMD_SIZE, Core, CoreArgs, Dtype, MathFidelity, Program, Rect, FAST_CQ_NUM_CIRCULAR_BUFFERS
 from dispatch import Go, McastWrite, SetGoSignalNocData, UnicastWrite, Wait
 from dispatch import build_commands, fast_enqueue, mcast_rects, noc_mcast_xy, noc_xy, resolve_args, slow_dispatch
@@ -21,21 +21,25 @@ class TLBWindow:
   def __init__(self, fd: int, start: Core, end: Core | None = None, addr: int = 0,
                mode: NocOrdering = NocOrdering.STRICT, size: int = SIZE_2M):
     self.fd, self.size = fd, size
-    buf = bytearray(48)
-    struct.pack_into("<Q", buf, 0, size)
-    fcntl.ioctl(fd, _IO(IOCTL_ALLOCATE_TLB), buf, True)
-    self._id, _, uc_off, wc_off, _ = struct.unpack_from("<IIQQQ", buf, 16)
+    req = AllocateTlb()
+    req.input.size = size
+    fcntl.ioctl(fd, IOCTL_ALLOCATE_TLB, req, True)
+    self._id = req.output.id
     rw = mmap.PROT_READ | mmap.PROT_WRITE
-    self.uc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=uc_off)
-    self.wc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=wc_off)
+    self.uc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=req.output.mmap_offset_uc)
+    self.wc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=req.output.mmap_offset_wc)
     self.target(start, end, addr=addr, mode=mode)
 
   def target(self, start: Core, end: Core | None = None, addr: int = 0, mode: NocOrdering = NocOrdering.STRICT):
     end = end or start
-    mcast = end != start
-    buf = bytearray(40)
-    struct.pack_into("<IIQ4H3B", buf, 0, self._id, 0, addr, end[0], end[1], start[0], start[1], 0, int(mcast), mode.value)
-    fcntl.ioctl(self.fd, _IO(IOCTL_CONFIGURE_TLB), buf, False)
+    req = ConfigureTlbIn()
+    req.id = self._id
+    req.config.addr = addr
+    req.config.x_end, req.config.y_end = end
+    req.config.x_start, req.config.y_start = start
+    req.config.mcast = int(end != start)
+    req.config.ordering = mode.value
+    fcntl.ioctl(self.fd, IOCTL_CONFIGURE_TLB, req, False)
 
   def read32(self, offset: int) -> int:
     return int.from_bytes(self.uc[offset : offset + 4], "little")
@@ -50,7 +54,8 @@ class TLBWindow:
   def close(self):
     self.uc.close()
     self.wc.close()
-    fcntl.ioctl(self.fd, _IO(IOCTL_FREE_TLB), bytearray(struct.pack("<I", self._id)), False)
+    req = FreeTlbIn(id=self._id)
+    fcntl.ioctl(self.fd, IOCTL_FREE_TLB, req, False)
 
   def __enter__(self): return self
   def __exit__(self, *_): self.close()
@@ -64,74 +69,50 @@ class Sysmem:
     self.fd = fd
     page_size = os.sysconf("SC_PAGE_SIZE")
     self.size = (size + page_size - 1) & ~(page_size - 1)
-    flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
-    self.buf = mmap.mmap(
-      -1,
-      self.size,
-      flags=flags,
-      prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
+    self.buf = mmap.mmap(-1, self.size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                         prot=mmap.PROT_READ | mmap.PROT_WRITE)
     self._va = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
-    buf = bytearray(40)
-    struct.pack_into("<IIQQ", buf, 0, 16, PIN_PAGES_NOC_DMA, self._va, self.size)
-    fcntl.ioctl(self.fd, _IO(IOCTL_PIN_PAGES), buf, True)
-    _, self.noc_addr = struct.unpack_from("<QQ", buf, 24)
+    req = PinPages()
+    req.input.output_size_bytes = ctypes.sizeof(PinPagesOut)
+    req.input.flags = PIN_PAGES_NOC_DMA
+    req.input.virtual_address = self._va
+    req.input.size = self.size
+    fcntl.ioctl(self.fd, IOCTL_PIN_PAGES, req, True)
+    self.noc_addr = req.output.noc_address
 
   def close(self):
-    buf = bytearray(24)
-    struct.pack_into("<QQQ", buf, 0, self._va, self.size, 0)
-    fcntl.ioctl(self.fd, _IO(IOCTL_UNPIN_PAGES), buf, False)
+    req = UnpinPagesIn(virtual_address=self._va, size=self.size)
+    fcntl.ioctl(self.fd, IOCTL_UNPIN_PAGES, req, False)
     self.buf.close()
 
 Shape = tuple[int, ...]
 TILE_R, TILE_C, FACE_R, FACE_C = 32, 32, 16, 16
 
-def _face_transform(data: bytes, bpe: int, forward: bool) -> bytes:
-  n_tiles = len(data) // (TILE_R * TILE_C * bpe)
-  out = bytearray(len(data))
-  for t in range(n_tiles):
-    toff = t * TILE_R * TILE_C * bpe
-    for fr in range(2):
-      for fc in range(2):
-        fi = fr * 2 + fc
-        for r in range(FACE_R):
-          rm = toff + ((fr * FACE_R + r) * TILE_C + fc * FACE_C) * bpe
-          tf = toff + (fi * FACE_R * FACE_C + r * FACE_C) * bpe
-          src, dst = (rm, tf) if forward else (tf, rm)
-          out[dst : dst + FACE_C * bpe] = data[src : src + FACE_C * bpe]
-  return bytes(out)
+def _np_dtype(bpe: int) -> np.dtype:
+  return {2: np.dtype('uint16'), 4: np.dtype('uint32')}[bpe]
 
-def _grid_transform(data: bytes, bpe: int, shape: Shape, forward: bool) -> bytes:
+def tilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   rows, cols = shape[-2], shape[-1]
   assert rows % TILE_R == 0 and cols % TILE_C == 0
   batch = 1
-  for d in shape[:-2]:
-    batch *= d
-  slice_bytes = rows * cols * bpe
-  assert len(data) == batch * slice_bytes
-  tr, tc = rows // TILE_R, cols // TILE_C
-  out = bytearray(len(data))
-  for b in range(batch):
-    base = b * slice_bytes
-    for ri in range(tr):
-      for ci in range(tc):
-        ti = ri * tc + ci
-        for r in range(TILE_R):
-          grid_off = base + ((ri * TILE_R + r) * cols + ci * TILE_C) * bpe
-          tile_off = base + (ti * TILE_R * TILE_C + r * TILE_C) * bpe
-          src, dst = (grid_off, tile_off) if forward else (tile_off, grid_off)
-          out[dst : dst + TILE_C * bpe] = data[src : src + TILE_C * bpe]
-  return bytes(out)
-
-def tilize(data: bytes, bpe: int, shape: Shape) -> bytes:
-  return _face_transform(
-    _grid_transform(data, bpe, shape, forward=True), bpe, forward=True
-  )
+  for d in shape[:-2]: batch *= d
+  dt = _np_dtype(bpe)
+  a = np.frombuffer(data, dtype=dt).reshape(batch, rows // TILE_R, TILE_R, cols // TILE_C, TILE_C)
+  a = a.transpose(0, 1, 3, 2, 4)                                   # grid transform: (b, tr, tc, 32, 32)
+  a = a.reshape(-1, 2, FACE_R, 2, FACE_C).transpose(0, 1, 3, 2, 4) # face transform: (n_tiles, 2, 2, 16, 16)
+  return a.tobytes()
 
 def untilize(data: bytes, bpe: int, shape: Shape) -> bytes:
-  return _grid_transform(
-    _face_transform(data, bpe, forward=False), bpe, shape, forward=False
-  )
+  rows, cols = shape[-2], shape[-1]
+  assert rows % TILE_R == 0 and cols % TILE_C == 0
+  batch = 1
+  for d in shape[:-2]: batch *= d
+  tr, tc = rows // TILE_R, cols // TILE_C
+  dt = _np_dtype(bpe)
+  a = np.frombuffer(data, dtype=dt).reshape(-1, 2, 2, FACE_R, FACE_C)
+  a = a.transpose(0, 1, 3, 2, 4).reshape(batch, tr, tc, TILE_R, TILE_C) # undo face, then undo grid
+  a = a.transpose(0, 1, 3, 2, 4).reshape(batch, rows, cols)
+  return a.tobytes()
 
 @dataclass
 class DramBuffer:
@@ -153,14 +134,11 @@ class DramBuffer:
 class LayoutTransferPlan:
   shape: Shape
   logical_bytes: int
-  tile_rows: int
   tile_cols: int
-  block_tile_cols: int
-  blocks_per_row: int
+  total_tiles: int
   row_bytes: int
-  block_width_bytes: int
   n_cores: int
-  tile_rows_per_core: int
+  tiles_per_core: int
 
 class Allocator:
   def __init__(self, fd: int, bank_tiles: list):
@@ -259,10 +237,13 @@ class CQ:
     if (self._sysmem_addr % PAGE_SIZE) != 0 or (HOST_SYSMEM_SIZE % PAGE_SIZE) != 0:
       raise RuntimeError("CQ sysmem must be page-aligned and page-sized")
 
-    buf = bytearray(40)
-    struct.pack_into("<IIQQ", buf, 0, 16, PIN_PAGES_NOC_DMA, self._sysmem_addr, HOST_SYSMEM_SIZE)
-    fcntl.ioctl(self.fd, _IO(IOCTL_PIN_PAGES), buf, True)
-    _, self.noc_addr = struct.unpack_from("<QQ", buf, 24)
+    req = PinPages()
+    req.input.output_size_bytes = ctypes.sizeof(PinPagesOut)
+    req.input.flags = PIN_PAGES_NOC_DMA
+    req.input.virtual_address = self._sysmem_addr
+    req.input.size = HOST_SYSMEM_SIZE
+    fcntl.ioctl(self.fd, IOCTL_PIN_PAGES, req, True)
+    self.noc_addr = req.output.noc_address
     if (self.noc_addr & FastDispatch.PCIE_NOC_BASE) != FastDispatch.PCIE_NOC_BASE:
       raise RuntimeError(f"bad NOC sysmem address: 0x{self.noc_addr:x}")
     self.noc_local = self.noc_addr - FastDispatch.PCIE_NOC_BASE
@@ -423,9 +404,8 @@ class CQ:
   def close(self):
     self._prefetch_win.close()
     self._dispatch_win.close()
-    buf = bytearray(24)
-    struct.pack_into("<QQQ", buf, 0, self._sysmem_addr, HOST_SYSMEM_SIZE, 0)
-    fcntl.ioctl(self.fd, _IO(IOCTL_UNPIN_PAGES), buf, False)
+    req = UnpinPagesIn(virtual_address=self._sysmem_addr, size=HOST_SYSMEM_SIZE)
+    fcntl.ioctl(self.fd, IOCTL_UNPIN_PAGES, req, False)
     self.sysmem.close()
 
 _INIT_SCRATCH = {
@@ -965,8 +945,13 @@ class Device:
       self._dram_sysmem.close()
     self._dram_sysmem = Sysmem(self.fd, size=max(128 * 1024 * 1024, need))
 
-  def _firmware_src(self, name: str) -> str:
+  @staticmethod
+  def _firmware_src(name: str) -> str:
     return (Path(__file__).parent / "firmware" / name).read_text()
+
+  @staticmethod
+  def _kernel_src(*parts: str) -> str:
+    return (Path(__file__).parent / "kernels" / Path(*parts)).read_text()
 
   def _layout_transfer_plan(self, buf: DramBuffer) -> LayoutTransferPlan:
     assert buf.shape is not None
@@ -981,181 +966,81 @@ class Device:
     assert logical_bytes == buf.size, f"shape {shape} does not match tiled buffer size {buf.size}"
     tile_rows = batch * (rows // TILE_R)
     tile_cols = cols // TILE_C
-    max_block_tile_cols = min(tile_cols, 8)
-    block_tile_cols = max(
-      n for n in range(max_block_tile_cols, 0, -1) if tile_cols % n == 0
-    )
-    blocks_per_row = tile_cols // block_tile_cols
-    n_cores = min(len(self.cores), tile_rows)
-    tile_rows_per_core = (tile_rows + n_cores - 1) // n_cores
+    total_tiles = tile_rows * tile_cols
+    n_cores = min(len(self.cores), total_tiles)
+    tiles_per_core = (total_tiles + n_cores - 1) // n_cores
     return LayoutTransferPlan(
       shape=shape,
       logical_bytes=logical_bytes,
-      tile_rows=tile_rows,
       tile_cols=tile_cols,
-      block_tile_cols=block_tile_cols,
-      blocks_per_row=blocks_per_row,
+      total_tiles=total_tiles,
       row_bytes=cols * buf.dtype.bpe,
-      block_width_bytes=block_tile_cols * TILE_C * buf.dtype.bpe,
       n_cores=n_cores,
-      tile_rows_per_core=tile_rows_per_core,
+      tiles_per_core=tiles_per_core,
     )
 
   def _layout_core_range(self, plan: LayoutTransferPlan, core_idx: int) -> tuple[int, int]:
-    start = core_idx * plan.tile_rows_per_core
-    count = min(plan.tile_rows_per_core, plan.tile_rows - start) if start < plan.tile_rows else 0
+    start = core_idx * plan.tiles_per_core
+    count = min(plan.tiles_per_core, plan.total_tiles - start) if start < plan.total_tiles else 0
     return start, count
 
-  def _tilize_compute_src(self) -> str:
-    return '''#include <cstdint>
-#include "compute_kernel_api/tilize.h"
-
-namespace NAMESPACE {
-void MAIN {
-  constexpr uint32_t cb_id_in0 = tt::CBIndex::c_0;
-  constexpr uint32_t cb_id_out0 = tt::CBIndex::c_16;
-  const uint32_t total_blocks = get_arg_val<uint32_t>(0);
-  const uint32_t block_tile_cols = get_arg_val<uint32_t>(1);
-  compute_kernel_hw_startup(cb_id_in0, cb_id_out0);
-  tilize_init(cb_id_in0, block_tile_cols, cb_id_out0);
-  for (uint32_t b = 0; b < total_blocks; ++b) {
-    cb_wait_front(cb_id_in0, block_tile_cols);
-    cb_reserve_back(cb_id_out0, block_tile_cols);
-    tilize_block(cb_id_in0, block_tile_cols, cb_id_out0);
-    cb_push_back(cb_id_out0, block_tile_cols);
-    cb_pop_front(cb_id_in0, block_tile_cols);
-  }
-}
-}  // namespace NAMESPACE
-'''
-
-  def _untilize_compute_src(self) -> str:
-    return '''#include <cstdint>
-#include "compute_kernel_api/untilize.h"
-
-namespace NAMESPACE {
-void MAIN {
-  constexpr uint32_t src_cb_id = tt::CBIndex::c_0;
-  constexpr uint32_t out_cb_id = tt::CBIndex::c_16;
-  const uint32_t total_blocks = get_arg_val<uint32_t>(0);
-  const uint32_t block_tile_cols = get_arg_val<uint32_t>(1);
-  compute_kernel_hw_startup(src_cb_id, out_cb_id);
-  untilize_init(src_cb_id);
-  for (uint32_t b = 0; b < total_blocks; ++b) {
-    cb_wait_front(src_cb_id, block_tile_cols);
-    cb_reserve_back(out_cb_id, block_tile_cols);
-    untilize_block(src_cb_id, block_tile_cols, out_cb_id);
-    cb_push_back(out_cb_id, block_tile_cols);
-    cb_pop_front(src_cb_id, block_tile_cols);
-  }
-}
-}  // namespace NAMESPACE
-'''
-
-  def _pack_untilize_compute_src(self, block_tile_cols: int) -> str:
-    assert 1 <= block_tile_cols <= 8
-    return f'''#include <cstdint>
-#include "compute_kernel_api/pack_untilize.h"
-
-namespace NAMESPACE {{
-void MAIN {{
-  constexpr uint32_t src_cb_id = tt::CBIndex::c_0;
-  constexpr uint32_t out_cb_id = tt::CBIndex::c_16;
-  const uint32_t total_blocks = get_arg_val<uint32_t>(0);
-  compute_kernel_hw_startup(src_cb_id, out_cb_id);
-  pack_untilize_init<{block_tile_cols}, {block_tile_cols}>(src_cb_id, out_cb_id);
-  for (uint32_t b = 0; b < total_blocks; ++b) {{
-    cb_wait_front(src_cb_id, {block_tile_cols});
-    cb_reserve_back(out_cb_id, {block_tile_cols});
-    pack_untilize_block<{block_tile_cols}, {block_tile_cols}>(src_cb_id, 1, out_cb_id, 0);
-    cb_push_back(out_cb_id, {block_tile_cols});
-    cb_pop_front(src_cb_id, {block_tile_cols});
-  }}
-  pack_untilize_uninit(out_cb_id);
-}}
-}}  // namespace NAMESPACE
-'''
+  def _sysmem_defines(self, buf: DramBuffer, plan: LayoutTransferPlan) -> str:
+    pcie_base = (Sysmem.PCIE_NOC_XY << 36) | (1 << 60) | (self._dram_sysmem.noc_addr & ((1 << 36) - 1))
+    return (
+      f"#define PCIE_BASE 0x{pcie_base:x}ULL\n"
+      f"#define TILE_ROW_BYTES {TILE_C * buf.dtype.bpe}\n"
+      f"#define TILE_COLS {plan.tile_cols}\n"
+      f"#define ROW_BYTES {plan.row_bytes}\n"
+    )
 
   def _build_tilize_transfer_program(self, buf: DramBuffer, plan: LayoutTransferPlan) -> Program:
-    sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
+    sysmem_defs = self._sysmem_defines(buf, plan)
+    dram_defs = f"#define DRAM_ADDR {buf.addr}\n"
 
-    def reader_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
-      return [
-        Sysmem.PCIE_NOC_XY, sysmem_offset, start_tile_row, num_tile_rows,
-        plan.row_bytes, plan.block_width_bytes, plan.blocks_per_row, plan.block_tile_cols,
-      ]
-
-    def writer_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
-      return [
-        buf.addr,
-        start_tile_row * plan.tile_cols,
-        num_tile_rows * plan.blocks_per_row,
-        plan.block_tile_cols,
-      ]
+    def tile_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      start_tile, num_tiles = self._layout_core_range(plan, core_idx)
+      return [start_tile, num_tiles]
 
     def compute_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      _, num_tile_rows = self._layout_core_range(plan, core_idx)
-      return [num_tile_rows * plan.blocks_per_row, plan.block_tile_cols]
+      _, num_tiles = self._layout_core_range(plan, core_idx)
+      return [num_tiles]
 
     return Program(
       cores=plan.n_cores,
       name="dram_fill_tilize",
-      reader_kernel=self._firmware_src("rm_sysmem_reader.cc"),
-      compute_kernel=self._tilize_compute_src(),
-      writer_kernel=self._firmware_src("tiled_dram_writer.cc"),
-      cbs=[
-        CBConfig(index=0, dtype=buf.dtype, tiles=plan.block_tile_cols),
-        CBConfig(index=16, dtype=buf.dtype, tiles=plan.block_tile_cols),
-      ],
-      reader_args=reader_args,
-      writer_args=writer_args,
+      reader_kernel=sysmem_defs + self._kernel_src("tilize", "reader.cc"),
+      compute_kernel=self._kernel_src("tilize", "compute.cc"),
+      writer_kernel=dram_defs + self._kernel_src("tilize", "writer.cc"),
+      cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=1), CBConfig(index=16, dtype=buf.dtype, tiles=1)],
+      reader_args=tile_args,
+      writer_args=tile_args,
       compute_args=compute_args,
+      profile=False,
     )
 
   def _build_untilize_transfer_program(self, buf: DramBuffer, plan: LayoutTransferPlan) -> Program:
-    sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
+    sysmem_defs = self._sysmem_defines(buf, plan)
+    dram_defs = f"#define DRAM_ADDR {buf.addr}\n"
 
-    def reader_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
-      return [
-        buf.addr,
-        start_tile_row * plan.tile_cols,
-        num_tile_rows * plan.blocks_per_row,
-        plan.block_tile_cols,
-      ]
-
-    def writer_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
-      return [
-        Sysmem.PCIE_NOC_XY, sysmem_offset, start_tile_row, num_tile_rows,
-        plan.row_bytes, plan.block_width_bytes, plan.blocks_per_row, plan.block_tile_cols,
-      ]
+    def tile_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      start_tile, num_tiles = self._layout_core_range(plan, core_idx)
+      return [start_tile, num_tiles]
 
     def compute_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
-      _, num_tile_rows = self._layout_core_range(plan, core_idx)
-      return [num_tile_rows * plan.blocks_per_row, plan.block_tile_cols]
-
-    use_pack_untilize = plan.block_tile_cols <= (4 if buf.dtype.bpe == 4 else 8)
-    compute_kernel = (
-      self._pack_untilize_compute_src(plan.block_tile_cols)
-      if use_pack_untilize else self._untilize_compute_src()
-    )
+      _, num_tiles = self._layout_core_range(plan, core_idx)
+      return [num_tiles]
 
     return Program(
       cores=plan.n_cores,
       name="dram_drain_untilize",
-      reader_kernel=self._firmware_src("tiled_dram_reader.cc"),
-      compute_kernel=compute_kernel,
-      writer_kernel=self._firmware_src("rm_sysmem_writer.cc"),
-      cbs=[
-        CBConfig(index=0, dtype=buf.dtype, tiles=plan.block_tile_cols),
-        CBConfig(index=16, dtype=buf.dtype, tiles=plan.block_tile_cols),
-      ],
-      reader_args=reader_args,
-      writer_args=writer_args,
+      reader_kernel=dram_defs + self._kernel_src("untilize", "reader.cc"),
+      compute_kernel=self._kernel_src("untilize", "compute.cc"),
+      writer_kernel=sysmem_defs + self._kernel_src("untilize", "writer.cc"),
+      cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=1), CBConfig(index=16, dtype=buf.dtype, tiles=1)],
+      reader_args=tile_args,
+      writer_args=tile_args,
       compute_args=compute_args,
+      profile=False,
     )
 
   def _run_transfer_program(self, program: Program):
@@ -1236,6 +1121,8 @@ void MAIN {{
   def _programs_info(self) -> list[dict]:
     info = []
     for i, prog in enumerate(self._programs):
+      if not prog.profile:
+        continue
       cores = self._program_cores(prog)
       sources = {}
       if prog.reader_kernel: sources["reader"] = prog.reader_kernel
@@ -1263,12 +1150,13 @@ void MAIN {{
             all_rects, base, b"\0" * (5 * 4)
           )  # reset HOST_BUFFER_END × 5
         for i, program in enumerate(self._programs):
-          if profiling:
+          prof_this = profiling and program.profile
+          if prof_this:
             self._enqueue_profiler_reset(all_rects)
           ts_slot = 2 * i
           if timing and ts_slot + 1 < TIMESTAMP_MAX_SLOTS:
             self.cq.timestamp(*self._ts_noc_dest(ts_slot))
-          prof_id = (i + 1) if profiling else 0
+          prof_id = (i + 1) if prof_this else 0
           commands = self._compile_commands(
             program, self._dispatch_mode, host_assigned_id=prof_id
           )
@@ -1281,25 +1169,26 @@ void MAIN {{
         self.cq.wait_completion(self.cq._event_id)
 
         if profiling:
-          self.dram.barrier()
-          import profiler
-
           programs_info = self._programs_info()
-          needed = set()
-          for info in programs_info:
-            needed.update(info["cores"])
-          raw_dram = self._read_profiler_dram()
-          ctrl_regs = self._read_profiler_ctrl(sorted(needed))
-          self.last_profile = profiler.collect(
-            programs_info,
-            raw_dram,
-            ctrl_regs,
-            flat_ids=self._profiler_flat_ids,
-            page_size=self._profiler_page_size,
-            core_count_per_dram=self._profiler_core_count_per_dram,
-            harvested_dram_bank=self.harvested_dram,
-          )
-          profiler.print_summary(self.last_profile)
+          if programs_info:
+            self.dram.barrier()
+            import profiler
+
+            needed = set()
+            for info in programs_info:
+              needed.update(info["cores"])
+            raw_dram = self._read_profiler_dram()
+            ctrl_regs = self._read_profiler_ctrl(sorted(needed))
+            self.last_profile = profiler.collect(
+              programs_info,
+              raw_dram,
+              ctrl_regs,
+              flat_ids=self._profiler_flat_ids,
+              page_size=self._profiler_page_size,
+              core_count_per_dram=self._profiler_core_count_per_dram,
+              harvested_dram_bank=self.harvested_dram,
+            )
+            profiler.print_summary(self.last_profile)
 
         if not timing:
           return None

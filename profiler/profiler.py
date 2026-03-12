@@ -5,6 +5,9 @@ from compiler import hash16
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
+_HOST_BUF_BYTES_PER_RISC = P.HOST_BUF_BYTES_PER_RISC
+_HOST_BUF_WORDS_PER_RISC = P.HOST_BUF_WORDS_PER_RISC
+
 _ZONE_RE = re.compile(r'DeviceZoneScopedN\s*\(\s*"([^"]+)"')
 
 def _parse_ts(w0, w1):

@@ -116,13 +116,61 @@ class Profiler:
 
 TENSTORRENT_IOCTL_MAGIC = 0xFA
 def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
-IOCTL_PIN_PAGES = 7
-IOCTL_UNPIN_PAGES = 10
-IOCTL_ALLOCATE_TLB = 11
-IOCTL_FREE_TLB = 12
-IOCTL_CONFIGURE_TLB = 13
+IOCTL_PIN_PAGES = _IO(7)
+IOCTL_UNPIN_PAGES = _IO(10)
+IOCTL_ALLOCATE_TLB = _IO(11)
+IOCTL_FREE_TLB = _IO(12)
+IOCTL_CONFIGURE_TLB = _IO(13)
+
+# --- ioctl structs (match kernel header: /usr/src/tenstorrent-*/ioctl.h) ---
+
+class AllocateTlbIn(S):
+  _pack_ = 1
+  _fields_ = [("size", u64), ("reserved", u64)]
+
+class AllocateTlbOut(S):
+  _pack_ = 1
+  _fields_ = [("id", u32), ("reserved0", u32), ("mmap_offset_uc", u64), ("mmap_offset_wc", u64), ("reserved1", u64)]
+
+class AllocateTlb(S):
+  _pack_ = 1
+  _fields_ = [("input", AllocateTlbIn), ("output", AllocateTlbOut)]
+
+class FreeTlbIn(S):
+  _pack_ = 1
+  _fields_ = [("id", u32)]
+
+class NocTlbConfig(S):
+  _pack_ = 1
+  _fields_ = [
+    ("addr", u64),
+    ("x_end", u16), ("y_end", u16), ("x_start", u16), ("y_start", u16),
+    ("noc", u8), ("mcast", u8), ("ordering", u8), ("linked", u8),
+    ("static_vc", u8), ("reserved0", u8 * 3),
+    ("reserved1", u32 * 2),
+  ]
+
+class ConfigureTlbIn(S):
+  _pack_ = 1
+  _fields_ = [("id", u32), ("reserved", u32), ("config", NocTlbConfig)]
 
 PIN_PAGES_NOC_DMA = 2
+
+class PinPagesIn(S):
+  _pack_ = 1
+  _fields_ = [("output_size_bytes", u32), ("flags", u32), ("virtual_address", u64), ("size", u64)]
+
+class PinPagesOut(S):
+  _pack_ = 1
+  _fields_ = [("physical_address", u64), ("noc_address", u64)]
+
+class PinPages(S):
+  _pack_ = 1
+  _fields_ = [("input", PinPagesIn), ("output", PinPagesOut)]
+
+class UnpinPagesIn(S):
+  _pack_ = 1
+  _fields_ = [("virtual_address", u64), ("size", u64), ("reserved", u64)]
 
 def as_bytes(obj) -> bytes:
   return ctypes.string_at(ctypes.addressof(obj), ctypes.sizeof(obj))

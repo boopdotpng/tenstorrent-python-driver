@@ -70,6 +70,7 @@ class Program:
   reader_recv_kernel: str = ""
   writer_recv_kernel: str = ""
   grid: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+  profile: bool = True
 
 @dataclass
 class McastWrite:

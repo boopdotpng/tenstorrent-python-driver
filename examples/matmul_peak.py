@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 
-from device import Device, DramBuffer, Dtype, MathFidelity, untilize
+from device import Device, DramBuffer, Dtype, MathFidelity
 from dispatch import CBConfig, Core, Program
 from autogen import TensixL1
 
@@ -581,7 +581,6 @@ def main():
       out = Path("profiler_data.json")
       out.write_text(json.dumps(device.last_profile))
       print(f"Profiler data written to {out.resolve()}")
-      device.serve_profile()
 
   finally:
     device.close()
