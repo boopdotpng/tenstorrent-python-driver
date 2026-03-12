@@ -50,15 +50,10 @@ class TLBWindow:
   def close(self):
     self.uc.close()
     self.wc.close()
-    fcntl.ioctl(
-      self.fd, _IO(IOCTL_FREE_TLB), bytearray(struct.pack("<I", self._id)), False
-    )
+    fcntl.ioctl(self.fd, _IO(IOCTL_FREE_TLB), bytearray(struct.pack("<I", self._id)), False)
 
-  def __enter__(self):
-    return self
-
-  def __exit__(self, *_):
-    self.close()
+  def __enter__(self): return self
+  def __exit__(self, *_): self.close()
 
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
 
@@ -153,6 +148,19 @@ class DramBuffer:
   @property
   def size(self) -> int:
     return self.num_tiles * self.page_size
+
+@dataclass(frozen=True)
+class LayoutTransferPlan:
+  shape: Shape
+  logical_bytes: int
+  tile_rows: int
+  tile_cols: int
+  block_tile_cols: int
+  blocks_per_row: int
+  row_bytes: int
+  block_width_bytes: int
+  n_cores: int
+  tile_rows_per_core: int
 
 class Allocator:
   def __init__(self, fd: int, bank_tiles: list):
@@ -949,13 +957,184 @@ class Device:
     self.dram_write(buf, data)
     return buf
 
-  def _ensure_dram_sysmem(self):
-    if self._dram_sysmem is None:
-      self._dram_sysmem = Sysmem(self.fd, size=128 * 1024 * 1024)
+  def _ensure_dram_sysmem(self, size: int = 128 * 1024 * 1024):
+    need = align_up(size, os.sysconf("SC_PAGE_SIZE"))
+    if self._dram_sysmem is not None and self._dram_sysmem.size >= need:
+      return
+    if self._dram_sysmem is not None:
+      self._dram_sysmem.close()
+    self._dram_sysmem = Sysmem(self.fd, size=max(128 * 1024 * 1024, need))
+
+  def _firmware_src(self, name: str) -> str:
+    return (Path(__file__).parent / "firmware" / name).read_text()
 
   def _compile_dram_kernel(self, name: str):
-    src = (Path(__file__).parent / "firmware" / name).read_text()
-    return self.compiler.compile_dataflow(src, "ncrisc")
+    return self.compiler.compile_dataflow(self._firmware_src(name), "ncrisc")
+
+  def _layout_transfer_plan(self, buf: DramBuffer) -> LayoutTransferPlan:
+    assert buf.shape is not None
+    shape = buf.shape
+    assert len(shape) >= 2
+    rows, cols = shape[-2], shape[-1]
+    assert rows % TILE_R == 0 and cols % TILE_C == 0
+    batch = 1
+    for d in shape[:-2]:
+      batch *= d
+    logical_bytes = batch * rows * cols * buf.dtype.bpe
+    assert logical_bytes == buf.size, f"shape {shape} does not match tiled buffer size {buf.size}"
+    tile_rows = batch * (rows // TILE_R)
+    tile_cols = cols // TILE_C
+    max_block_tile_cols = min(tile_cols, 8)
+    block_tile_cols = max(
+      n for n in range(max_block_tile_cols, 0, -1) if tile_cols % n == 0
+    )
+    blocks_per_row = tile_cols // block_tile_cols
+    n_cores = min(len(self.cores), tile_rows)
+    tile_rows_per_core = (tile_rows + n_cores - 1) // n_cores
+    return LayoutTransferPlan(
+      shape=shape,
+      logical_bytes=logical_bytes,
+      tile_rows=tile_rows,
+      tile_cols=tile_cols,
+      block_tile_cols=block_tile_cols,
+      blocks_per_row=blocks_per_row,
+      row_bytes=cols * buf.dtype.bpe,
+      block_width_bytes=block_tile_cols * TILE_C * buf.dtype.bpe,
+      n_cores=n_cores,
+      tile_rows_per_core=tile_rows_per_core,
+    )
+
+  def _layout_core_range(self, plan: LayoutTransferPlan, core_idx: int) -> tuple[int, int]:
+    start = core_idx * plan.tile_rows_per_core
+    count = min(plan.tile_rows_per_core, plan.tile_rows - start) if start < plan.tile_rows else 0
+    return start, count
+
+  def _tilize_compute_src(self) -> str:
+    return '''#include <cstdint>
+#include "compute_kernel_api/tilize.h"
+
+namespace NAMESPACE {
+void MAIN {
+  constexpr uint32_t cb_id_in0 = tt::CBIndex::c_0;
+  constexpr uint32_t cb_id_out0 = tt::CBIndex::c_16;
+  const uint32_t total_blocks = get_arg_val<uint32_t>(0);
+  const uint32_t block_tile_cols = get_arg_val<uint32_t>(1);
+  compute_kernel_hw_startup(cb_id_in0, cb_id_out0);
+  tilize_init(cb_id_in0, block_tile_cols, cb_id_out0);
+  for (uint32_t b = 0; b < total_blocks; ++b) {
+    cb_wait_front(cb_id_in0, block_tile_cols);
+    cb_reserve_back(cb_id_out0, block_tile_cols);
+    tilize_block(cb_id_in0, block_tile_cols, cb_id_out0);
+    cb_push_back(cb_id_out0, block_tile_cols);
+    cb_pop_front(cb_id_in0, block_tile_cols);
+  }
+}
+}  // namespace NAMESPACE
+'''
+
+  def _untilize_compute_src(self) -> str:
+    return '''#include <cstdint>
+#include "compute_kernel_api/untilize.h"
+
+namespace NAMESPACE {
+void MAIN {
+  constexpr uint32_t src_cb_id = tt::CBIndex::c_0;
+  constexpr uint32_t out_cb_id = tt::CBIndex::c_16;
+  const uint32_t total_blocks = get_arg_val<uint32_t>(0);
+  const uint32_t block_tile_cols = get_arg_val<uint32_t>(1);
+  compute_kernel_hw_startup(src_cb_id, out_cb_id);
+  untilize_init(src_cb_id);
+  for (uint32_t b = 0; b < total_blocks; ++b) {
+    cb_wait_front(src_cb_id, block_tile_cols);
+    cb_reserve_back(out_cb_id, block_tile_cols);
+    untilize_block(src_cb_id, block_tile_cols, out_cb_id);
+    cb_push_back(out_cb_id, block_tile_cols);
+    cb_pop_front(src_cb_id, block_tile_cols);
+  }
+}
+}  // namespace NAMESPACE
+'''
+
+  def _build_tilize_transfer_program(self, buf: DramBuffer, plan: LayoutTransferPlan) -> Program:
+    sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
+
+    def reader_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
+      return [
+        Sysmem.PCIE_NOC_XY, sysmem_offset, start_tile_row, num_tile_rows,
+        plan.row_bytes, plan.block_width_bytes, plan.blocks_per_row, plan.block_tile_cols,
+      ]
+
+    def writer_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
+      return [
+        buf.addr,
+        start_tile_row * plan.tile_cols,
+        num_tile_rows * plan.blocks_per_row,
+        plan.block_tile_cols,
+      ]
+
+    def compute_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      _, num_tile_rows = self._layout_core_range(plan, core_idx)
+      return [num_tile_rows * plan.blocks_per_row, plan.block_tile_cols]
+
+    return Program(
+      cores=plan.n_cores,
+      name="dram_fill_tilize",
+      reader_kernel=self._firmware_src("rm_sysmem_reader.cc"),
+      compute_kernel=self._tilize_compute_src(),
+      writer_kernel=self._firmware_src("tiled_dram_writer.cc"),
+      cbs=[
+        CBConfig(index=0, dtype=buf.dtype, tiles=plan.block_tile_cols),
+        CBConfig(index=16, dtype=buf.dtype, tiles=plan.block_tile_cols),
+      ],
+      reader_args=reader_args,
+      writer_args=writer_args,
+      compute_args=compute_args,
+    )
+
+  def _build_untilize_transfer_program(self, buf: DramBuffer, plan: LayoutTransferPlan) -> Program:
+    sysmem_offset = self._dram_sysmem.noc_addr & ((1 << 36) - 1)
+
+    def reader_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
+      return [
+        buf.addr,
+        start_tile_row * plan.tile_cols,
+        num_tile_rows * plan.blocks_per_row,
+        plan.block_tile_cols,
+      ]
+
+    def writer_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      start_tile_row, num_tile_rows = self._layout_core_range(plan, core_idx)
+      return [
+        Sysmem.PCIE_NOC_XY, sysmem_offset, start_tile_row, num_tile_rows,
+        plan.row_bytes, plan.block_width_bytes, plan.blocks_per_row, plan.block_tile_cols,
+      ]
+
+    def compute_args(core_idx: int, core_xy: Core, num_cores: int) -> list[int]:
+      _, num_tile_rows = self._layout_core_range(plan, core_idx)
+      return [num_tile_rows * plan.blocks_per_row, plan.block_tile_cols]
+
+    return Program(
+      cores=plan.n_cores,
+      name="dram_drain_untilize",
+      reader_kernel=self._firmware_src("tiled_dram_reader.cc"),
+      compute_kernel=self._untilize_compute_src(),
+      writer_kernel=self._firmware_src("rm_sysmem_writer.cc"),
+      cbs=[
+        CBConfig(index=0, dtype=buf.dtype, tiles=plan.block_tile_cols),
+        CBConfig(index=16, dtype=buf.dtype, tiles=plan.block_tile_cols),
+      ],
+      reader_args=reader_args,
+      writer_args=writer_args,
+      compute_args=compute_args,
+    )
+
+  def _run_transfer_program(self, program: Program):
+    assert not self._programs, "queue must be empty for DRAM transfers"
+    self.queue(program)
+    self.run()
 
   def _run_dram_transfer(self, buf: DramBuffer, kernel, extra_args: list[int] | None = None):
     self._ensure_dram_sysmem()
@@ -997,10 +1176,17 @@ class Device:
 
   def dram_write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
+    if self._use_fast_dispatch and buf.shape is not None:
+      plan = self._layout_transfer_plan(buf)
+      assert len(data) == plan.logical_bytes
+      self._ensure_dram_sysmem(plan.logical_bytes)
+      self._dram_sysmem.buf[:len(data)] = data
+      self._run_transfer_program(self._build_tilize_transfer_program(buf, plan))
+      return
     if buf.shape is not None:
       data = tilize(data, buf.dtype.bpe, buf.shape)
     if self._use_fast_dispatch:
-      self._ensure_dram_sysmem()
+      self._ensure_dram_sysmem(len(data))
       self._dram_sysmem.buf[:len(data)] = data
       kernel = self._compile_dram_kernel("dram_fill.cc")
       self._run_dram_transfer(buf, kernel)
@@ -1008,8 +1194,13 @@ class Device:
       self.dram.write(buf, data)
 
   def dram_read(self, buf: DramBuffer) -> bytes:
+    if self._use_fast_dispatch and buf.shape is not None:
+      plan = self._layout_transfer_plan(buf)
+      self._ensure_dram_sysmem(plan.logical_bytes)
+      self._run_transfer_program(self._build_untilize_transfer_program(buf, plan))
+      return bytes(self._dram_sysmem.buf[:plan.logical_bytes])
     if self._use_fast_dispatch:
-      self._ensure_dram_sysmem()
+      self._ensure_dram_sysmem(buf.size)
       kernel = self._compile_dram_kernel("dram_drain.cc")
       self._run_dram_transfer(buf, kernel, extra_args=[0])
       result = bytes(self._dram_sysmem.buf[:buf.size])
