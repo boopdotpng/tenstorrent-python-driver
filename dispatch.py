@@ -4,6 +4,20 @@ from enum import Enum
 from typing import Callable, Literal
 
 from autogen import (
+  CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
+  CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE,
+  CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK,
+  CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS,
+  CQ_DISPATCH_CMD_SEND_GO_SIGNAL,
+  CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA,
+  CQ_DISPATCH_CMD_TIMESTAMP,
+  CQ_DISPATCH_CMD_WAIT,
+  CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM,
+  CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
+  CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST,
+  CQ_DISPATCH_CMD_WRITE_PACKED,
+  CQ_DISPATCH_CMD_WRITE_PACKED_LARGE,
+  CQ_PREFETCH_CMD_RELAY_INLINE,
   DevMsgs,
   FastDispatch,
   GoMsg,
@@ -299,6 +313,75 @@ def noc_xy(x: int, y: int) -> int:
   return ((y << 6) | x) & 0xFFFF
 
 CQ_CMD_SIZE = 16  # all prefetch/dispatch commands are 16 bytes
+
+class CQ:
+  """Command queue stream builder. Builds prefetch/dispatch commands into a byte stream."""
+
+  def __init__(self):
+    self.stream = bytearray()
+    self.sizes: list[int] = []  # sizes in 16-byte units
+
+  def clear(self):
+    self.stream.clear()
+    self.sizes.clear()
+
+  def _relay_inline(self, inner: bytes):
+    stride = align_up(CQ_CMD_SIZE + len(inner), FastDispatch.PCIE_ALIGNMENT)
+    hdr = struct.pack("<BBHII", CQ_PREFETCH_CMD_RELAY_INLINE, 0, 0, len(inner), stride).ljust(CQ_CMD_SIZE, b"\0")
+    record = hdr + inner.ljust(stride - CQ_CMD_SIZE, b"\0")
+    self.stream.extend(record)
+    self.sizes.append(len(record) >> 4)
+
+  def _cmd(self, cmd_id, payload=b""):
+    self._relay_inline(bytes([cmd_id]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0"))
+
+  def write_packed(self, cores: list[Core], addr: int, data: bytes | list[bytes]):
+    uniform = isinstance(data, bytes)
+    payload_size = len(data) if uniform else len(data[0])
+    flags = CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE if uniform else 0
+    l1a = FastDispatch.L1_ALIGNMENT
+    hdr = struct.pack("<BBHHHI", CQ_DISPATCH_CMD_WRITE_PACKED, flags, len(cores), 0, payload_size, addr)
+    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
+    noc_addrs = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores).ljust(align_up(len(cores) * 4, l1a), b"\0")
+    if uniform:
+      body = bytes(data).ljust(align_up(payload_size, l1a), b"\0")
+    else:
+      stride = align_up(payload_size, l1a)
+      body = b"".join(d.ljust(stride, b"\0") for d in data)
+    self._relay_inline(hdr + noc_addrs + body)
+
+  def write_packed_large(self, rects: list[Rect], addr: int, data: bytes):
+    l1a = FastDispatch.L1_ALIGNMENT
+    data_padded = bytes(data).ljust(align_up(len(data), l1a), b"\0")
+    max_batch = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS
+    for batch_start in range(0, len(rects), max_batch):
+      batch = rects[batch_start : batch_start + max_batch]
+      hdr = struct.pack("<BBHHH", CQ_DISPATCH_CMD_WRITE_PACKED_LARGE, 2, len(batch), l1a, 0).ljust(CQ_CMD_SIZE, b"\0")
+      sub = b"".join(
+        struct.pack("<IIHBB", noc_mcast_xy(r)[0], addr, len(data) - 1, noc_mcast_xy(r)[1],
+                    CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK) for r in batch
+      ).ljust(align_up(len(batch) * 12, l1a), b"\0")
+      self._relay_inline(hdr + sub + data_padded * len(batch))
+
+  def set_go_signal_noc_data(self, cores: list[Core]):
+    hdr = struct.pack("<BBHI", CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA, 0, 0, len(cores)).ljust(CQ_CMD_SIZE, b"\0")
+    self._relay_inline(hdr + b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores))
+
+  def send_go_signal(self, go_word: int, stream: int, count: int, num_unicast: int):
+    self._cmd(CQ_DISPATCH_CMD_SEND_GO_SIGNAL,
+      struct.pack("<IBBBII", go_word, CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET, num_unicast, 0, count, stream))
+
+  def wait_stream(self, stream: int, count: int, clear: bool = True):
+    flags = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | (CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM if clear else 0)
+    self._cmd(CQ_DISPATCH_CMD_WAIT, struct.pack("<BHII", flags, stream, 0, count))
+
+  def host_event(self, event_id: int):
+    payload = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(FastDispatch.L1_ALIGNMENT, b"\0")
+    hdr = struct.pack("<BBHIQ", CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST, 1, 0, 0, CQ_CMD_SIZE + len(payload))
+    self._relay_inline(hdr + payload)
+
+  def timestamp(self, noc_xy_addr: int, addr: int):
+    self._cmd(CQ_DISPATCH_CMD_TIMESTAMP, struct.pack("<xHII", 0, noc_xy_addr, addr))
 
 def slow_dispatch(win, commands: list[Command]):
   for cmd in commands:

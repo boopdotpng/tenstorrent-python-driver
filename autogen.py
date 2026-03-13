@@ -1,12 +1,16 @@
 import ctypes
 from ctypes import (
-  LittleEndianStructure as _S,
   c_uint8 as _u8,
   c_uint16 as _u16,
   c_uint32 as _u32,
   c_uint64 as _u64,
 )
-S, u8, u16, u32, u64 = _S, _u8, _u16, _u32, _u64
+u8, u16, u32, u64 = _u8, _u16, _u32, _u64
+
+class S(ctypes.LittleEndianStructure):
+  def __init__(self, **kw):
+    super().__init__()
+    for k, v in kw.items(): setattr(self, k, v)
 
 DRAM_BARRIER_BASE = 0x0
 DRAM_ALIGNMENT = 64
@@ -114,15 +118,24 @@ class Profiler:
   HOST_BUF_BYTES_PER_RISC = TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC
   HOST_BUF_WORDS_PER_RISC = HOST_BUF_BYTES_PER_RISC // 4
 
-TENSTORRENT_IOCTL_MAGIC = 0xFA
-def _IO(nr: int) -> int: return (TENSTORRENT_IOCTL_MAGIC << 8) | nr
-IOCTL_PIN_PAGES = _IO(7)
-IOCTL_UNPIN_PAGES = _IO(10)
-IOCTL_ALLOCATE_TLB = _IO(11)
-IOCTL_FREE_TLB = _IO(12)
-IOCTL_CONFIGURE_TLB = _IO(13)
-
 # --- ioctl structs (match kernel header: /usr/src/tenstorrent-*/ioctl.h) ---
+
+import fcntl as _fcntl, functools as _functools
+
+def _tt_ioctl(nr, in_t, out_t=None):
+  """Create a callable ioctl for the Tenstorrent KMD (magic=0xFA, no direction/size bits)."""
+  cmd = (0xFA << 8) | nr
+  @_functools.wraps(_tt_ioctl)
+  def call(fd, **kwargs):
+    buf = bytearray(ctypes.sizeof(in_t) + (ctypes.sizeof(out_t) if out_t else 0))
+    inp = in_t.from_buffer(buf)
+    if out_t and hasattr(in_t, 'output_size_bytes'):
+      inp.output_size_bytes = ctypes.sizeof(out_t)
+    for k, v in kwargs.items():
+      setattr(inp, k, v)
+    _fcntl.ioctl(fd, cmd, buf, True)
+    return out_t.from_buffer_copy(buf, ctypes.sizeof(in_t)) if out_t else None
+  return call
 
 class AllocateTlbIn(S):
   _pack_ = 1
@@ -131,10 +144,6 @@ class AllocateTlbIn(S):
 class AllocateTlbOut(S):
   _pack_ = 1
   _fields_ = [("id", u32), ("reserved0", u32), ("mmap_offset_uc", u64), ("mmap_offset_wc", u64), ("reserved1", u64)]
-
-class AllocateTlb(S):
-  _pack_ = 1
-  _fields_ = [("input", AllocateTlbIn), ("output", AllocateTlbOut)]
 
 class FreeTlbIn(S):
   _pack_ = 1
@@ -164,13 +173,15 @@ class PinPagesOut(S):
   _pack_ = 1
   _fields_ = [("physical_address", u64), ("noc_address", u64)]
 
-class PinPages(S):
-  _pack_ = 1
-  _fields_ = [("input", PinPagesIn), ("output", PinPagesOut)]
-
 class UnpinPagesIn(S):
   _pack_ = 1
   _fields_ = [("virtual_address", u64), ("size", u64), ("reserved", u64)]
+
+IOCTL_ALLOCATE_TLB = _tt_ioctl(11, AllocateTlbIn, AllocateTlbOut)
+IOCTL_CONFIGURE_TLB = _tt_ioctl(13, ConfigureTlbIn)
+IOCTL_FREE_TLB = _tt_ioctl(12, FreeTlbIn)
+IOCTL_PIN_PAGES = _tt_ioctl(7, PinPagesIn, PinPagesOut)
+IOCTL_UNPIN_PAGES = _tt_ioctl(10, UnpinPagesIn)
 
 def as_bytes(obj) -> bytes:
   return ctypes.string_at(ctypes.addressof(obj), ctypes.sizeof(obj))

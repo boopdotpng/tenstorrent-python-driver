@@ -1,11 +1,11 @@
-import ctypes, time, fcntl, mmap, os, struct
+import ctypes, time, mmap, os, struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal
 import numpy as np
 from autogen import *
-from dispatch import CBConfig, CQ_CMD_SIZE, Core, CoreArgs, Dtype, MathFidelity, Program, Rect, FAST_CQ_NUM_CIRCULAR_BUFFERS
+from dispatch import CBConfig, CQ, CQ_CMD_SIZE, Core, CoreArgs, Dtype, MathFidelity, Program, Rect, FAST_CQ_NUM_CIRCULAR_BUFFERS
 from dispatch import Go, McastWrite, SetGoSignalNocData, UnicastWrite, Wait
 from dispatch import build_commands, fast_enqueue, mcast_rects, noc_mcast_xy, noc_xy, resolve_args, slow_dispatch
 from kernels import TILIZE_READER, TILIZE_COMPUTE, TILIZE_WRITER, UNTILIZE_READER, UNTILIZE_COMPUTE, UNTILIZE_WRITER
@@ -22,25 +22,18 @@ class TLBWindow:
   def __init__(self, fd: int, start: Core, end: Core | None = None, addr: int = 0,
                mode: NocOrdering = NocOrdering.STRICT, size: int = SIZE_2M):
     self.fd, self.size = fd, size
-    req = AllocateTlb()
-    req.input.size = size
-    fcntl.ioctl(fd, IOCTL_ALLOCATE_TLB, req, True)
-    self._id = req.output.id
+    out = IOCTL_ALLOCATE_TLB(fd, size=size)
+    self._id = out.id
     rw = mmap.PROT_READ | mmap.PROT_WRITE
-    self.uc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=req.output.mmap_offset_uc)
-    self.wc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=req.output.mmap_offset_wc)
+    self.uc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=out.mmap_offset_uc)
+    self.wc = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=rw, offset=out.mmap_offset_wc)
     self.target(start, end, addr=addr, mode=mode)
 
   def target(self, start: Core, end: Core | None = None, addr: int = 0, mode: NocOrdering = NocOrdering.STRICT):
     end = end or start
-    req = ConfigureTlbIn()
-    req.id = self._id
-    req.config.addr = addr
-    req.config.x_end, req.config.y_end = end
-    req.config.x_start, req.config.y_start = start
-    req.config.mcast = int(end != start)
-    req.config.ordering = mode.value
-    fcntl.ioctl(self.fd, IOCTL_CONFIGURE_TLB, req, False)
+    IOCTL_CONFIGURE_TLB(self.fd, id=self._id, config=NocTlbConfig(
+      addr=addr, x_start=start[0], y_start=start[1], x_end=end[0], y_end=end[1],
+      mcast=int(end != start), ordering=mode.value))
 
   def read32(self, offset: int) -> int:
     return int.from_bytes(self.uc[offset : offset + 4], "little")
@@ -55,8 +48,7 @@ class TLBWindow:
   def close(self):
     self.uc.close()
     self.wc.close()
-    req = FreeTlbIn(id=self._id)
-    fcntl.ioctl(self.fd, IOCTL_FREE_TLB, req, False)
+    IOCTL_FREE_TLB(self.fd, id=self._id)
 
   def __enter__(self): return self
   def __exit__(self, *_): self.close()
@@ -73,17 +65,11 @@ class Sysmem:
     self.buf = mmap.mmap(-1, self.size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
                          prot=mmap.PROT_READ | mmap.PROT_WRITE)
     self._va = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
-    req = PinPages()
-    req.input.output_size_bytes = ctypes.sizeof(PinPagesOut)
-    req.input.flags = PIN_PAGES_NOC_DMA
-    req.input.virtual_address = self._va
-    req.input.size = self.size
-    fcntl.ioctl(self.fd, IOCTL_PIN_PAGES, req, True)
-    self.noc_addr = req.output.noc_address
+    out = IOCTL_PIN_PAGES(self.fd, flags=PIN_PAGES_NOC_DMA, virtual_address=self._va, size=self.size)
+    self.noc_addr = out.noc_address
 
   def close(self):
-    req = UnpinPagesIn(virtual_address=self._va, size=self.size)
-    fcntl.ioctl(self.fd, IOCTL_UNPIN_PAGES, req, False)
+    IOCTL_UNPIN_PAGES(self.fd, virtual_address=self._va, size=self.size)
     self.buf.close()
 
 Shape = tuple[int, ...]
@@ -176,37 +162,26 @@ class Allocator:
 
   def write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
-    view = memoryview(data)
-    num_banks = len(self.bank_tiles)
-    pages = (len(data) + buf.page_size - 1) // buf.page_size
-    for bank_idx, (_, x, y) in enumerate(self.bank_tiles):
-      if bank_idx >= pages:
-        break
+    view, ps, nb = memoryview(data), buf.page_size, len(self.bank_tiles)
+    n_pages = (len(data) + ps - 1) // ps
+    for bi, (_, x, y) in enumerate(self.bank_tiles):
+      bank_data = b''.join(bytes(view[p * ps : p * ps + ps]) for p in range(bi, n_pages, nb))
+      if not bank_data: continue
       self.win.target((x, y), mode=NocOrdering.POSTED)
-      local_page = 0
-      for page_idx in range(bank_idx, pages, num_banks):
-        addr = buf.addr + local_page * buf.page_size
-        off = page_idx * buf.page_size
-        page = view[off : off + buf.page_size]
-        self.win.wc[addr : addr + len(page)] = page
-        local_page += 1
+      self.win.wc[buf.addr : buf.addr + len(bank_data)] = bank_data
     self.barrier()
 
   def read(self, buf: DramBuffer) -> bytes:
-    result = bytearray(buf.size)
-    num_banks = len(self.bank_tiles)
-    pages = (buf.size + buf.page_size - 1) // buf.page_size
-    for bank_idx, (_, x, y) in enumerate(self.bank_tiles):
-      if bank_idx >= pages:
-        break
+    result, ps, nb = bytearray(buf.size), buf.page_size, len(self.bank_tiles)
+    n_pages = (buf.size + ps - 1) // ps
+    for bi, (_, x, y) in enumerate(self.bank_tiles):
+      bank_pages = list(range(bi, n_pages, nb))
+      if not bank_pages: continue
       self.win.target((x, y), mode=NocOrdering.RELAXED)
-      local_page = 0
-      for page_idx in range(bank_idx, pages, num_banks):
-        addr = buf.addr + local_page * buf.page_size
-        off = page_idx * buf.page_size
-        n = min(buf.page_size, buf.size - off)
-        result[off : off + n] = self.win.wc[addr : addr + n]
-        local_page += 1
+      bank_data = self.win.wc[buf.addr : buf.addr + len(bank_pages) * ps]
+      for i, p in enumerate(bank_pages):
+        n = min(ps, buf.size - p * ps)
+        result[p * ps : p * ps + n] = bank_data[i * ps : i * ps + n]
     return bytes(result)
 
   def read_raw_bank_pages(self, addr: int, page_size: int) -> bytes:
@@ -225,65 +200,46 @@ class TileGrid:
   TENSIX_X = (*range(1, 8), *range(10, 15))
   WORKER_CORES = [(x, y) for x in TENSIX_X for y in range(2, 12)]
 
-class CQ:
+class CQSysmem:
+  """Host-side sysmem + TLB windows for fast dispatch. Handles flush, completion, and device communication."""
+
   def __init__(self, fd: int, prefetch_win: TLBWindow, dispatch_win: TLBWindow):
     self.fd = fd
+    self._prefetch_win = prefetch_win
+    self._dispatch_win = dispatch_win
     flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS
     if hasattr(mmap, "MAP_POPULATE"):
       flags |= mmap.MAP_POPULATE
-    self.sysmem = mmap.mmap(
-      -1, HOST_SYSMEM_SIZE, flags=flags, prot=mmap.PROT_READ | mmap.PROT_WRITE
-    )
+    self.sysmem = mmap.mmap(-1, HOST_SYSMEM_SIZE, flags=flags, prot=mmap.PROT_READ | mmap.PROT_WRITE)
     self._sysmem_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.sysmem))
     if (self._sysmem_addr % PAGE_SIZE) != 0 or (HOST_SYSMEM_SIZE % PAGE_SIZE) != 0:
       raise RuntimeError("CQ sysmem must be page-aligned and page-sized")
-
-    req = PinPages()
-    req.input.output_size_bytes = ctypes.sizeof(PinPagesOut)
-    req.input.flags = PIN_PAGES_NOC_DMA
-    req.input.virtual_address = self._sysmem_addr
-    req.input.size = HOST_SYSMEM_SIZE
-    fcntl.ioctl(self.fd, IOCTL_PIN_PAGES, req, True)
-    self.noc_addr = req.output.noc_address
+    out = IOCTL_PIN_PAGES(self.fd, flags=PIN_PAGES_NOC_DMA, virtual_address=self._sysmem_addr, size=HOST_SYSMEM_SIZE)
+    self.noc_addr = out.noc_address
     if (self.noc_addr & FastDispatch.PCIE_NOC_BASE) != FastDispatch.PCIE_NOC_BASE:
       raise RuntimeError(f"bad NOC sysmem address: 0x{self.noc_addr:x}")
     self.noc_local = self.noc_addr - FastDispatch.PCIE_NOC_BASE
     if self.noc_local > 0xFFFF_FFFF:
       raise RuntimeError(f"CQ sysmem NOC offset too large: 0x{self.noc_local:x}")
-    self._stream = bytearray()
-    self._sizes = []
     self._issue_wr = 0
     self._prefetch_q_wr_idx = 0
     self._event_id = 0
-    self._completion_base_16b = (
-      (self.noc_local + HOST_COMPLETION_BASE) >> 4
-    ) & 0x7FFF_FFFF
+    self._completion_base_16b = ((self.noc_local + HOST_COMPLETION_BASE) >> 4) & 0x7FFF_FFFF
     self._completion_page_16b = PAGE_SIZE >> 4
-    self._completion_end_16b = self._completion_base_16b + (
-      HOST_COMPLETION_SIZE >> 4
-    )
+    self._completion_end_16b = self._completion_base_16b + (HOST_COMPLETION_SIZE >> 4)
     self._completion_rd_16b = self._completion_base_16b
     self._completion_rd_toggle = 0
-    self._prefetch_win = prefetch_win
-    self._dispatch_win = dispatch_win
 
-  def _relay_inline(self, inner: bytes):
-    stride = align_up(CQ_CMD_SIZE + len(inner), FastDispatch.PCIE_ALIGNMENT)
-    hdr = struct.pack("<BBHII", CQ_PREFETCH_CMD_RELAY_INLINE, 0, 0, len(inner), stride).ljust(CQ_CMD_SIZE, b"\0")
-    record = hdr + inner.ljust(stride - CQ_CMD_SIZE, b"\0")
-    self._stream.extend(record)
-    self._sizes.append(len(record) >> 4)
+  def _sysmem_read32(self, off):
+    return struct.unpack("<I", self.sysmem[off : off + 4])[0]
 
-  def _cmd(self, cmd_id, payload=b""):
-    self._relay_inline(bytes([cmd_id]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0"))
-
-  def _read_prefetch_entry(self, idx: int) -> int:
-    off = DEV_PREFETCH_Q_BASE + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
-    return struct.unpack("<H", self._prefetch_win.uc[off : off + 2])[0]
+  def _sysmem_write32(self, off, val):
+    self.sysmem[off : off + 4] = struct.pack("<I", val)
 
   def _wait_prefetch_slot_free(self, idx: int, timeout_s: float = 1.0):
+    off = DEV_PREFETCH_Q_BASE + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
     deadline = time.perf_counter() + timeout_s
-    while self._read_prefetch_entry(idx) != 0:
+    while struct.unpack("<H", self._prefetch_win.uc[off : off + 2])[0] != 0:
       if time.perf_counter() > deadline:
         raise TimeoutError("timeout waiting for prefetch queue slot")
 
@@ -298,70 +254,15 @@ class CQ:
     self._wait_prefetch_slot_free(idx)
     off = DEV_PREFETCH_Q_BASE + idx * FastDispatch.PREFETCH_Q_ENTRY_BYTES
     self._prefetch_win.uc[off : off + 2] = struct.pack("<H", len(record) >> 4)
-    entries = DEV_PREFETCH_Q_SIZE // FastDispatch.PREFETCH_Q_ENTRY_BYTES
-    self._prefetch_q_wr_idx = (idx + 1) % entries
+    self._prefetch_q_wr_idx = (idx + 1) % (DEV_PREFETCH_Q_SIZE // FastDispatch.PREFETCH_Q_ENTRY_BYTES)
 
-  def write_packed(self, cores: list[Core], addr: int, data: bytes | list[bytes]):
-    uniform = isinstance(data, bytes)
-    payload_size = len(data) if uniform else len(data[0])
-    flags = CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NO_STRIDE if uniform else 0
-    l1a = FastDispatch.L1_ALIGNMENT
-    hdr = struct.pack("<BBHHHI", CQ_DISPATCH_CMD_WRITE_PACKED, flags, len(cores), 0, payload_size, addr).ljust(CQ_CMD_SIZE, b"\0")
-    noc_addrs = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores).ljust(align_up(len(cores) * 4, l1a), b"\0")
-    if uniform:
-      body = bytes(data).ljust(align_up(payload_size, l1a), b"\0")
-    else:
-      stride = align_up(payload_size, l1a)
-      body = b"".join(d.ljust(stride, b"\0") for d in data)
-    self._relay_inline(hdr + noc_addrs + body)
-
-  def write_packed_large(self, rects: list[Rect], addr: int, data: bytes):
-    l1a = FastDispatch.L1_ALIGNMENT
-    data_padded = bytes(data).ljust(align_up(len(data), l1a), b"\0")
-    max_batch = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS
-    for batch_start in range(0, len(rects), max_batch):
-      batch = rects[batch_start : batch_start + max_batch]
-      hdr = struct.pack("<BBHHH", CQ_DISPATCH_CMD_WRITE_PACKED_LARGE, 2, len(batch), l1a, 0).ljust(CQ_CMD_SIZE, b"\0")
-      sub = b"".join(
-        struct.pack("<IIHBB", noc_mcast_xy(r)[0], addr, len(data) - 1, noc_mcast_xy(r)[1],
-                    CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK) for r in batch
-      ).ljust(align_up(len(batch) * 12, l1a), b"\0")
-      self._relay_inline(hdr + sub + data_padded * len(batch))
-
-  def set_go_signal_noc_data(self, cores: list[Core]):
-    hdr = struct.pack("<BBHI", CQ_DISPATCH_CMD_SET_GO_SIGNAL_NOC_DATA, 0, 0, len(cores)).ljust(CQ_CMD_SIZE, b"\0")
-    self._relay_inline(hdr + b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in cores))
-
-  def send_go_signal(self, go_word: int, stream: int, count: int, num_unicast: int):
-    self._cmd(CQ_DISPATCH_CMD_SEND_GO_SIGNAL,
-      struct.pack("<IBBBII", go_word, CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET, num_unicast, 0, count, stream))
-
-  def wait_stream(self, stream: int, count: int, clear: bool = True):
-    flags = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | (CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM if clear else 0)
-    self._cmd(CQ_DISPATCH_CMD_WAIT, struct.pack("<BHII", flags, stream, 0, count))
-
-  def host_event(self, event_id: int):
-    payload = struct.pack("<I", event_id & 0xFFFFFFFF).ljust(FastDispatch.L1_ALIGNMENT, b"\0")
-    hdr = struct.pack("<BBHIQ", CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST, 1, 0, 0, CQ_CMD_SIZE + len(payload))
-    self._relay_inline(hdr + payload)
-
-  def timestamp(self, noc_xy_addr: int, addr: int):
-    self._cmd(CQ_DISPATCH_CMD_TIMESTAMP, struct.pack("<xHII", 0, noc_xy_addr, addr))
-
-  def flush(self):
+  def flush(self, cq: 'CQ'):
     offset = 0
-    for size_16b in self._sizes:
+    for size_16b in cq.sizes:
       size = size_16b << 4
-      self._issue_write(self._stream[offset : offset + size])
+      self._issue_write(cq.stream[offset : offset + size])
       offset += size
-    self._stream.clear()
-    self._sizes.clear()
-
-  def _sysmem_read32(self, off):
-    return struct.unpack("<I", self.sysmem[off : off + 4])[0]
-
-  def _sysmem_write32(self, off, val):
-    self.sysmem[off : off + 4] = struct.pack("<I", val)
+    cq.clear()
 
   def wait_completion(self, event_id: int, timeout_s: float = 10.0):
     deadline = time.perf_counter() + timeout_s
@@ -388,8 +289,6 @@ class CQ:
   def reset_run_state(self):
     self._issue_wr = 0
     self._prefetch_q_wr_idx = 0
-    self._stream.clear()
-    self._sizes.clear()
     self._prefetch_win.write32(DEV_PREFETCH_Q_RD_PTR_ADDR, DEV_PREFETCH_Q_BASE + DEV_PREFETCH_Q_SIZE)
     self._prefetch_win.write32(DEV_PREFETCH_Q_PCIE_RD_PTR_ADDR, (self.noc_local + HOST_ISSUE_BASE) & 0xFFFFFFFF)
     for i in range(FastDispatch.PREFETCH_Q_ENTRIES_WORKER_DEFAULT):
@@ -405,8 +304,7 @@ class CQ:
   def close(self):
     self._prefetch_win.close()
     self._dispatch_win.close()
-    req = UnpinPagesIn(virtual_address=self._sysmem_addr, size=HOST_SYSMEM_SIZE)
-    fcntl.ioctl(self.fd, IOCTL_UNPIN_PAGES, req, False)
+    IOCTL_UNPIN_PAGES(self.fd, virtual_address=self._sysmem_addr, size=HOST_SYSMEM_SIZE)
     self.sysmem.close()
 
 _INIT_SCRATCH = {
@@ -461,9 +359,10 @@ class Device:
     self._upload_firmware()
 
     self._dram_sysmem = Sysmem(self.fd) if self._use_fast_dispatch else None
-    self.cq = None
+    self.cq = CQ()
+    self._cq_hw = None
     if self._use_fast_dispatch:
-      self.cq = CQ(
+      self._cq_hw = CQSysmem(
         self.fd,
         prefetch_win=TLBWindow(self.fd, start=self._prefetch_core),
         dispatch_win=TLBWindow(self.fd, start=self._dispatch_core),
@@ -842,7 +741,7 @@ class Device:
     ncrisc_off = align_up(kernel_off + len(cq_kernels["dispatch_brisc"].xip), l1a)
     disp_launch = self._build_cq_launch(kernel_off, ncrisc_off, sem_off=l1a)
 
-    self.cq.reset_run_state()
+    self._cq_hw.reset_run_state()
     self._upload_cq_core(
       self._prefetch_core,
       pref_img,
@@ -881,7 +780,7 @@ class Device:
 
   def _init_dispatch_core_state(self, win: TLBWindow):
     l1a = FastDispatch.L1_ALIGNMENT
-    base_16b = self.cq._completion_base_16b
+    base_16b = self._cq_hw._completion_base_16b
     win.write32(DEV_COMPLETION_Q_WR_PTR_ADDR, base_16b)
     win.write32(DEV_COMPLETION_Q_RD_PTR_ADDR, base_16b)
     win.write32(DEV_COMPLETION_Q0_LAST_EVENT_PTR_ADDR, 0)
@@ -899,9 +798,9 @@ class Device:
     init: Callable[[TLBWindow], None] | None = None,
   ):
     win = (
-      self.cq._prefetch_win
+      self._cq_hw._prefetch_win
       if core == self._prefetch_core
-      else self.cq._dispatch_win
+      else self._cq_hw._dispatch_win
     )
     win.target(core)
     if init is not None:
@@ -1160,10 +1059,10 @@ class Device:
           fast_enqueue(self.cq, commands, self._go_word())
           if timing and ts_slot + 1 < TIMESTAMP_MAX_SLOTS:
             self.cq.timestamp(*self._ts_noc_dest(ts_slot + 1))
-        self.cq._event_id += 1
-        self.cq.host_event(self.cq._event_id)
-        self.cq.flush()
-        self.cq.wait_completion(self.cq._event_id)
+        self._cq_hw._event_id += 1
+        self.cq.host_event(self._cq_hw._event_id)
+        self._cq_hw.flush(self.cq)
+        self._cq_hw.wait_completion(self._cq_hw._event_id)
 
         if profiling:
           programs_info = self._programs_info()
@@ -1238,7 +1137,7 @@ class Device:
     finally:
       if self._dram_sysmem is not None:
         self._dram_sysmem.close()
-      if self.cq is not None:
-        self.cq.close()
+      if self._cq_hw is not None:
+        self._cq_hw.close()
       self.dram.close()
       os.close(self.fd)
