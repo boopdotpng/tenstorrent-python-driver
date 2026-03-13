@@ -261,10 +261,20 @@ class CompiledKernel:
   xip: bytes
   xip_text_bytes: int
 
+_INIT_SCRATCH_BASE = TensixL1.KERNEL_CONFIG_BASE
+_INIT_SCRATCH = {
+  "brisc":  _INIT_SCRATCH_BASE,
+  "ncrisc": _INIT_SCRATCH_BASE + 0x2000,
+  "trisc0": _INIT_SCRATCH_BASE + 0x4000,
+  "trisc1": _INIT_SCRATCH_BASE + 0x5000,
+  "trisc2": _INIT_SCRATCH_BASE + 0x6000,
+}
+
 @dataclass(frozen=True)
 class CompiledFirmware:
   elf_bytes: bytes
   segments: list[PTLoad]
+  scratch_base: int
 
   @property
   def text_base(self) -> int: return self.segments[0].paddr
@@ -330,7 +340,7 @@ def compile_firmware(profile: bool = PROFILER) -> dict[str, CompiledFirmware]:
     fw_link_args = [opt, *_CFLAGS, *_LFLAGS, *mcpu, "-mno-tt-tensix-optimize-replay", f"-T{ld}", *link_objs]
     elf = _compile_and_link(cc=cc, src=src, compile_args=compile_args, link_args=fw_link_args, tmp_prefix=f"tt-fw-{target}-")
     segs = list(iter_pt_load(elf))
-    result[target] = CompiledFirmware(elf_bytes=elf, segments=segs)
+    result[target] = CompiledFirmware(elf_bytes=elf, segments=segs, scratch_base=_INIT_SCRATCH[target])
 
   new_zones = {k: v for k, v in _zone_map.items() if k not in zones_before}
   _cache_store(key, {"result": result, "zones": new_zones})

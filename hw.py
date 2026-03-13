@@ -2,35 +2,28 @@ import ctypes, fcntl, functools, mmap, os, struct, time
 from ctypes import c_uint8 as u8, c_uint16 as u16, c_uint32 as u32, c_uint64 as u64
 from enum import Enum
 
-
 Core = tuple[int, int]
 PAGE_SIZE = 4096
 L1_ALIGN = 16
 PCIE_ALIGN = 64
 
-
 def align_up(value: int, align: int) -> int:
   return (value + align - 1) // align * align
-
 
 def align_down(value: int, alignment: int) -> tuple[int, int]:
   base = value & ~(alignment - 1)
   return base, value - base
 
-
 def as_bytes(obj) -> bytes:
   return ctypes.string_at(ctypes.addressof(obj), ctypes.sizeof(obj))
 
-
 def noc_xy(x: int, y: int) -> int:
   return ((y << 6) | x) & 0xFFFF
-
 
 class S(ctypes.LittleEndianStructure):
   def __init__(self, **kw):
     super().__init__()
     for k, v in kw.items(): setattr(self, k, v)
-
 
 class TensixL1:
   SIZE = 0x180000
@@ -42,13 +35,7 @@ class TensixL1:
   DATA_BUFFER_SPACE_BASE = 0x037000
   PROFILER_CONTROL = 0x0009C0              # 32 x u32 = 128 bytes
   PROFILER_HOST_BUFFER_BYTES_PER_RISC = 65536
-  BRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x0082B0
-  NCRISC_INIT_LOCAL_L1_BASE_SCRATCH = 0x00A2B0
-  TRISC0_INIT_LOCAL_L1_BASE_SCRATCH = 0x00C2B0
-  TRISC1_INIT_LOCAL_L1_BASE_SCRATCH = 0x00D2B0
-  TRISC2_INIT_LOCAL_L1_BASE_SCRATCH = 0x00E2B0
   MEM_BANK_TO_NOC_SCRATCH = 0x0112B0
-
 
 class TensixMMIO:
   LOCAL_RAM_START = 0xFFB00000
@@ -61,14 +48,12 @@ class TensixMMIO:
   SOFT_RESET_ALL = 0x47800                 # all 5 RISC-V cores
   SOFT_RESET_BRISC_ONLY_RUN = 0x47000      # keep TRISC/NCRISC in reset, release BRISC
 
-
 class Arc:
   NOC_BASE = 0x80000000
   RESET_UNIT_OFFSET = 0x30000
   SCRATCH_RAM_13 = RESET_UNIT_OFFSET + 0x434
   TAG_GDDR_ENABLED = 36
   DEFAULT_GDDR_ENABLED = 0xFF
-
 
 class Dram:
   BANK_COUNT = 8
@@ -82,7 +67,6 @@ class Dram:
     4: (0, 1, 11), 5: (2, 3, 10), 6: (4, 8, 9), 7: (5, 6, 7),
   }
   BANK_X = {b: 0 if b < 4 else 9 for b in range(8)}
-
 
 def _tt_ioctl(nr, in_t, out_t=None):
   cmd = (0xFA << 8) | nr
@@ -99,7 +83,6 @@ def _tt_ioctl(nr, in_t, out_t=None):
     fcntl.ioctl(fd, cmd, buf, True)
     return out_t.from_buffer_copy(buf, ctypes.sizeof(in_t)) if out_t else None
   return call
-
 
 class _AllocIn(S):
   _pack_ = 1
@@ -155,12 +138,10 @@ _ioctl_unpin_pages = _tt_ioctl(10, _UnpinIn)
 _ioctl_set_power_state = _tt_ioctl(15, _PowerStateIn)
 _PIN_NOC_DMA = 2
 
-
 class NocOrdering(Enum):
   RELAXED = 0
   STRICT = 1
   POSTED = 2
-
 
 class TLBWindow:
   SIZE_2M = 1 << 21
@@ -200,7 +181,6 @@ class TLBWindow:
   def __enter__(self): return self
   def __exit__(self, *_): self.close()
 
-
 class Sysmem:
   PCIE_NOC_XY = (24 << 6) | 19
 
@@ -218,7 +198,6 @@ class Sysmem:
     _ioctl_unpin_pages(self.fd, virtual_address=self._va, size=self.size)
     self.buf.close()
 
-
 _CQ_L1 = 0x196C0
 
 CQ_PREFETCH_Q_RD_PTR    = _CQ_L1 + 0x00
@@ -234,7 +213,6 @@ CQ_PREFETCH_Q_ENTRY_SZ  = 2
 CQ_PREFETCH_Q_SIZE      = CQ_PREFETCH_Q_ENTRIES * CQ_PREFETCH_Q_ENTRY_SZ
 CQ_DISPATCH_CB_PAGES    = (512 * 1024) >> 12
 
-
 _PCIE_NOC_BASE = 1 << 60
 
 # Host sysmem layout
@@ -247,7 +225,6 @@ _HOST_CQ_WR_OFF        = 2 * PCIE_ALIGN
 _HOST_CQ_RD_OFF        = 3 * PCIE_ALIGN
 
 assert _HOST_COMPLETION_BASE + _HOST_COMPLETION_SIZE <= _HOST_SYSMEM_SIZE
-
 
 class CQSysmem:
   def __init__(self, fd: int, prefetch_win: TLBWindow, dispatch_win: TLBWindow):
@@ -354,15 +331,12 @@ class CQSysmem:
     _ioctl_unpin_pages(self.fd, virtual_address=self._sysmem_addr, size=_HOST_SYSMEM_SIZE)
     self.sysmem.close()
 
-
 class TileGrid:
   ARC = (8, 0)
   TENSIX_X = (*range(1, 8), *range(10, 15))
   WORKER_CORES = [(x, y) for x in TENSIX_X for y in range(2, 12)]
 
-
 USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
-
 
 def build_bank_noc_table(harvested_dram: int, worker_cores: list[Core]) -> bytes:
   NOCS, DRAM_BANKS, L1_BANKS, PORTS = 2, 7, 110, 3

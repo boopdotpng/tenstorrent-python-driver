@@ -7,14 +7,11 @@ from hw import *
 from dispatch import *
 from kernels import TILIZE_READER, TILIZE_COMPUTE, TILIZE_WRITER, UNTILIZE_READER, UNTILIZE_COMPUTE, UNTILIZE_WRITER
 
-
 Shape = tuple[int, ...]
 TILE_R, TILE_C, FACE_R, FACE_C = 32, 32, 16, 16
 
-
 def _np_dtype(bpe: int) -> np.dtype:
   return {2: np.dtype('uint16'), 4: np.dtype('uint32')}[bpe]
-
 
 def tilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   rows, cols = shape[-2], shape[-1]
@@ -27,7 +24,6 @@ def tilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   a = a.reshape(-1, 2, FACE_R, 2, FACE_C).transpose(0, 1, 3, 2, 4) # face: (n_tiles, 2, 2, 16, 16)
   return a.tobytes()
 
-
 def untilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   rows, cols = shape[-2], shape[-1]
   assert rows % TILE_R == 0 and cols % TILE_C == 0
@@ -39,7 +35,6 @@ def untilize(data: bytes, bpe: int, shape: Shape) -> bytes:
   a = a.transpose(0, 1, 3, 2, 4).reshape(batch, tr, tc, TILE_R, TILE_C)
   a = a.transpose(0, 1, 3, 2, 4).reshape(batch, rows, cols)
   return a.tobytes()
-
 
 @dataclass
 class DramBuffer:
@@ -56,7 +51,6 @@ class DramBuffer:
   @property
   def size(self) -> int:
     return self.num_tiles * self.page_size
-
 
 def build_transfer_program(
   buf: DramBuffer, direction: str, n_cores: int, sysmem_noc_addr: int,
@@ -102,7 +96,6 @@ def build_transfer_program(
     cbs=[CBConfig(index=0, dtype=buf.dtype, tiles=1), CBConfig(index=16, dtype=buf.dtype, tiles=1)],
     reader_args=tile_args, writer_args=tile_args, compute_args=compute_args, profile=False,
   ), logical_bytes
-
 
 class Allocator:
   def __init__(self, fd: int, bank_tiles: list):

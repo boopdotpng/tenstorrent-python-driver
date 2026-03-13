@@ -1,11 +1,10 @@
-import ctypes, struct, time
+import ctypes, os, struct, time
 from ctypes import c_uint8 as u8, c_uint16 as u16, c_uint32 as u32
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Literal
 
 from hw import *
-
 
 class DevMsgs:
   RUN_MSG_INIT = 0x40
@@ -17,11 +16,9 @@ class DevMsgs:
   ProgrammableCoreType_COUNT = 3
   MaxProcessorsPerCoreType = 5
 
-
 class _RtaOffset(S):
   _pack_ = 1
   _fields_ = [("rta_offset", u16), ("crta_offset", u16)]
-
 
 class _KernelConfigMsg(S):
   _pack_ = 1
@@ -49,11 +46,9 @@ class _KernelConfigMsg(S):
     ("preload", u8),
   ]
 
-
 class LaunchMsg(S):
   _pack_ = 1
   _fields_ = [("kernel_config", _KernelConfigMsg)]
-
 
 class _GoMsgBits(S):
   _pack_ = 1
@@ -64,11 +59,9 @@ class _GoMsgBits(S):
     ("signal", u8),
   ]
 
-
 class GoMsg(ctypes.Union):
   _pack_ = 1
   _fields_ = [("all", u32), ("bits", _GoMsgBits)]
-
 
 _RELAY_INLINE       = 5   # prefetch: relay inline
 _WRITE_PACKED       = 5   # dispatch: write to multiple cores
@@ -79,7 +72,6 @@ _GO_SIGNAL          = 14  # dispatch: send go signal
 _SET_GO_NOC_DATA    = 17  # dispatch: set go signal NOC addresses
 _TIMESTAMP          = 18  # dispatch: write timestamp
 
-
 Rect = tuple[int, int, int, int]  # (x0, x1, y0, y1)
 Args = list[int]
 RtArgs = Args | Callable[[int, Core, int], Args]
@@ -88,7 +80,6 @@ CoreArgs = tuple[Args, Args, Args]  # (writer, reader, compute) per core
 FAST_CQ_NUM_CIRCULAR_BUFFERS = 32
 CQ_CMD_SIZE = 16  # dispatch command header size
 DONE_STREAM = 48  # stream index workers signal completion on
-
 
 class Dtype(Enum):
   Float32 = 0
@@ -108,20 +99,17 @@ class Dtype(Enum):
   def tile_size(self) -> int:
     return 32 * 32 * self.bpe
 
-
 class MathFidelity(Enum):
   LoFi = 0
   HiFi2 = 2
   HiFi3 = 3
   HiFi4 = 4
 
-
 @dataclass
 class CBConfig:
   index: int
   dtype: Dtype
   tiles: int = 2
-
 
 @dataclass
 class Program:
@@ -144,11 +132,9 @@ class Program:
   grid: tuple[tuple[int, ...], tuple[int, ...]] | None = None
   profile: bool = True
 
-
 def noc_mcast_xy(rect: Rect) -> tuple[int, int]:
   x0, x1, y0, y1 = rect
   return (y1 << 18) | (x1 << 12) | (y0 << 6) | x0, (x1 - x0 + 1) * (y1 - y0 + 1)
-
 
 def mcast_rects(cores: list[Core]) -> list[Rect]:
   if not cores:
@@ -169,21 +155,17 @@ def mcast_rects(cores: list[Core]) -> list[Rect]:
     rects.append((x0, x1, y0, y1))
   return rects
 
-
 @dataclass
 class Write:
   cores: list[Core]
   addr: int
   data: bytes | list[bytes]
 
-
 @dataclass
 class Launch:
   cores: list[Core]
 
-
 IRCommand = Write | Launch
-
 
 @dataclass
 class CQWritePackedLarge:
@@ -206,7 +188,6 @@ class CQWritePackedLarge:
       records.append(hdr + subs + padded * len(batch))
     return records
 
-
 @dataclass
 class CQWritePacked:
   cores: list[Core]
@@ -228,7 +209,6 @@ class CQWritePacked:
       body = b"".join(d.ljust(stride, b"\0") for d in self.data)
     return [hdr + nocs + body]
 
-
 @dataclass
 class CQSetGoSignalNocData:
   cores: list[Core]
@@ -237,7 +217,6 @@ class CQSetGoSignalNocData:
     hdr = struct.pack("<BBHI", _SET_GO_NOC_DATA, 0, 0, len(self.cores))
     hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
     return [hdr + b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in self.cores)]
-
 
 @dataclass
 class CQSendGoSignal:
@@ -251,7 +230,6 @@ class CQSendGoSignal:
                           self.num_unicast, 0, self.count, self.stream)
     cmd = bytes([_GO_SIGNAL]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0")
     return [cmd]
-
 
 @dataclass
 class CQWaitStream:
@@ -267,7 +245,6 @@ class CQWaitStream:
     cmd = bytes([_WAIT]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0")
     return [cmd]
 
-
 @dataclass
 class CQHostEvent:
   event_id: int
@@ -276,7 +253,6 @@ class CQHostEvent:
     payload = struct.pack("<I", self.event_id & 0xFFFFFFFF).ljust(L1_ALIGN, b"\0")
     hdr = struct.pack("<BBHIQ", _WRITE_LINEAR_HOST, 1, 0, 0, CQ_CMD_SIZE + len(payload))
     return [hdr + payload]
-
 
 @dataclass
 class CQTimestamp:
@@ -288,16 +264,13 @@ class CQTimestamp:
     cmd = bytes([_TIMESTAMP]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0")
     return [cmd]
 
-
 CQCommand = CQWritePackedLarge | CQWritePacked | CQSetGoSignalNocData | CQSendGoSignal | CQWaitStream | CQHostEvent | CQTimestamp
-
 
 def _relay_inline(payload: bytes) -> bytes:
   stride = align_up(CQ_CMD_SIZE + len(payload), PCIE_ALIGN)
   hdr = struct.pack("<BBHII", _RELAY_INLINE, 0, 0, len(payload), stride)
   hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
   return hdr + payload.ljust(stride - CQ_CMD_SIZE, b"\0")
-
 
 class CommandQueue:
   def __init__(self):
@@ -318,10 +291,8 @@ class CommandQueue:
     for cmd in cmds:
       self.append(cmd)
 
-
 def resolve_args(args: RtArgs, core_idx: int, core_xy: Core, num_cores: int) -> Args:
   return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
-
 
 def pack_rta(writer_args: Args, reader_args: Args, compute_args: Args, num_sems: int, sem_off: int) -> bytes:
   pack = lambda xs: b"".join(int(x & 0xFFFFFFFF).to_bytes(4, "little") for x in xs)
@@ -331,7 +302,6 @@ def pack_rta(writer_args: Args, reader_args: Args, compute_args: Args, num_sems:
       rta = rta.ljust(sem_off, b"\0")
     rta += b"\0" * (num_sems * 16)
   return rta
-
 
 def build_cb_blob(program: Program) -> tuple[int, bytes]:
   if not program.cbs:
@@ -356,9 +326,7 @@ def build_cb_blob(program: Program) -> tuple[int, bytes]:
     struct.pack_into("<IIII", arr, cb.index * 16, cb_addr, size, cb.tiles, page_size)
   return mask, bytes(arr)
 
-
 Role = tuple[list[Core], object, object]  # (cores, reader_kernel, writer_kernel)
-
 
 def build_payload(
   program: Program, reader, writer, compute: tuple | None,
@@ -416,7 +384,6 @@ def build_payload(
   cfg.host_assigned_id = host_assigned_id
   return shared_addr, bytes(shared), as_bytes(launch)
 
-
 def build_ir(
   program: Program, roles: list[Role], compute: tuple | None,
   all_cores: list[Core], per_core_args: list[CoreArgs],
@@ -453,8 +420,7 @@ def build_ir(
   commands.append(Launch(all_cores))
   return commands
 
-
-def lower_fast(commands: list[IRCommand], go_word: int) -> list[CQCommand]:
+def _lower_ir(commands: list[IRCommand], go_word: int) -> list[CQCommand]:
   result: list[CQCommand] = []
   for cmd in commands:
     match cmd:
@@ -469,6 +435,41 @@ def lower_fast(commands: list[IRCommand], go_word: int) -> list[CQCommand]:
         result.append(CQWaitStream(DONE_STREAM, len(cores)))
   return result
 
+def lower_fast(
+  programs: list[tuple[list[IRCommand], bool]],
+  go_word: int, cores: list[Core],
+  timestamps: list[tuple[int, int]] | None = None,
+  profiler_flat_ids: dict | None = None,
+  profiler_dram_addr: int = 0, profiler_core_count_per_dram: int = 0,
+) -> list[CQCommand]:
+  profiling = os.environ.get("PROFILE") == "1" and profiler_flat_ids is not None
+  result: list[CQCommand] = []
+  if profiling:
+    rects = mcast_rects(cores)
+    prof_cores = sorted(profiler_flat_ids, key=lambda xy: (xy[0], xy[1]))
+    blobs = []
+    for core in prof_cores:
+      x, y = core
+      ctrl = [0] * 32
+      ctrl[12] = profiler_dram_addr
+      ctrl[14], ctrl[15] = x, y
+      ctrl[16] = profiler_flat_ids[core]
+      ctrl[17] = profiler_core_count_per_dram
+      blobs.append(struct.pack("<32I", *ctrl))
+    result.append(CQWritePacked(prof_cores, TensixL1.PROFILER_CONTROL, blobs))
+    result.append(CQWritePackedLarge(rects, TensixL1.PROFILER_CONTROL, b"\0" * (5 * 4)))
+  for i, (ir, profiled) in enumerate(programs):
+    if profiling and profiled:
+      base = TensixL1.PROFILER_CONTROL
+      result.append(CQWritePackedLarge(rects, base + 5 * 4, b"\0" * (5 * 4)))
+      result.append(CQWritePackedLarge(rects, base + 19 * 4, b"\0" * 4))
+    ts = 2 * i
+    if timestamps and ts + 1 < len(timestamps):
+      result.append(CQTimestamp(*timestamps[ts]))
+    result.extend(_lower_ir(ir, go_word))
+    if timestamps and ts + 1 < len(timestamps):
+      result.append(CQTimestamp(*timestamps[ts + 1]))
+  return result
 
 def slow_dispatch(win, commands: list[IRCommand]):
   for cmd in commands:

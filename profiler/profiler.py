@@ -5,7 +5,6 @@ from compiler import hash16
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
-
 class P:
   HOST_BUF_END = 0             # per RISC (indices 0-4)
   GUARANTEED_FW_START = 4

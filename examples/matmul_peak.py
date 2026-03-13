@@ -558,7 +558,7 @@ def main():
 
     a_buf = device.alloc_write(a_bytes, dtype=IO_DTYPE, shape=(Mp, Kp), name="A")
     b_buf = device.alloc_write(b_bytes, dtype=IO_DTYPE, shape=(Kp, Np), name="B")
-    c_buf = device.alloc(plan.mt * plan.nt, dtype=IO_DTYPE, name="C", shape=(Mp, Np))
+    c_buf = device.dram.alloc(plan.mt * plan.nt, dtype=IO_DTYPE, name="C", shape=(Mp, Np))
 
     prog = build_matmul_program(plan, a_buf, b_buf, c_buf, io_dtype=IO_DTYPE, math_fidelity=MATH_FIDELITY, f32_acc=F32_ACC)
 

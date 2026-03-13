@@ -1,4 +1,4 @@
-import os, struct, time
+import functools, os, struct, time
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -7,21 +7,20 @@ from hw import _ioctl_set_power_state
 from dispatch import *
 from dram import DramBuffer, Allocator, Shape, tilize, untilize, build_transfer_program
 
-_INIT_SCRATCH = {
-  "brisc": TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
-  "ncrisc": TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH,
-  "trisc0": TensixL1.TRISC0_INIT_LOCAL_L1_BASE_SCRATCH,
-  "trisc1": TensixL1.TRISC1_INIT_LOCAL_L1_BASE_SCRATCH,
-  "trisc2": TensixL1.TRISC2_INIT_LOCAL_L1_BASE_SCRATCH,
-}
-
 _TS_PAGE_SIZE = 64
 _TS_STRIDE = 16
 _TS_MAX_SLOTS = 512
 
 class Device:
-  _CQ_PREFETCH_CORE = (14, 2)
-  _CQ_DISPATCH_CORE = (14, 3)
+  _PREFETCH_CORE: Core = (14, 2)
+  _DISPATCH_CORE: Core = (14, 3)
+  _CQ_CORES = {_PREFETCH_CORE, _DISPATCH_CORE}
+
+  @functools.cached_property
+  def cores(self) -> list[Core]:
+    if self._use_fast_dispatch:
+      return [c for c in TileGrid.WORKER_CORES if c not in self._CQ_CORES]
+    return list(TileGrid.WORKER_CORES)
 
   def __init__(self, device: int = 0):
     self.device = device
@@ -39,10 +38,6 @@ class Device:
     self._init_timestamp_dram()
     self._dispatch_mode = DevMsgs.DISPATCH_MODE_HOST if USE_USB_DISPATCH else DevMsgs.DISPATCH_MODE_DEV
     self._use_fast_dispatch = not USE_USB_DISPATCH
-    self.cores = list(TileGrid.WORKER_CORES)
-    if self._use_fast_dispatch:
-      self._prefetch_core, self._dispatch_core = self._select_dispatch_core_pair()
-      self.cores = [c for c in self.cores if c not in {self._prefetch_core, self._dispatch_core}]
 
     from compiler import Compiler
     self.compiler = Compiler()
@@ -54,28 +49,21 @@ class Device:
     if self._use_fast_dispatch:
       self._cq_hw = CQSysmem(
         self.fd,
-        prefetch_win=TLBWindow(self.fd, start=self._prefetch_core),
-        dispatch_win=TLBWindow(self.fd, start=self._dispatch_core),
+        prefetch_win=TLBWindow(self.fd, start=self._PREFETCH_CORE),
+        dispatch_win=TLBWindow(self.fd, start=self._DISPATCH_CORE),
       )
       self._start_dispatch_cores()
 
     self._programs = []
     self.last_profile = None
-    self._profiler_initialized = False
 
     from compiler import PROFILER
     self._profiler = PROFILER and self._use_fast_dispatch
     self._profiler_flat_ids = {}
     self._profiler_core_count_per_dram = 0
+    self._profiler_dram_addr = 0
     if self._profiler:
       self._init_profiler_dram()
-
-  def _select_dispatch_core_pair(self) -> tuple[Core, Core]:
-    pair = (self._CQ_PREFETCH_CORE, self._CQ_DISPATCH_CORE)
-    missing = [core for core in pair if core not in self.cores]
-    if missing:
-      raise RuntimeError(f"fixed CQ cores unavailable: {missing}")
-    return pair
 
   def _init_dram_tiles(self):
     with TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE) as arc:
@@ -92,7 +80,6 @@ class Device:
       off = tag_to_offset.get(Arc.TAG_GDDR_ENABLED)
       gddr_enabled = Arc.DEFAULT_GDDR_ENABLED if off is None else arc.read32(data_base + off * 4)
     harvested = [bank for bank in range(Dram.BANK_COUNT) if ((gddr_enabled >> bank) & 1) == 0]
-    assert len(harvested) == 1, f"expected 1 harvested dram bank, got {harvested}"
     self.harvested_dram = harvested[0]
     self.dram_tiles = [
       (bank, Dram.BANK_X[bank], y)
@@ -110,7 +97,7 @@ class Device:
     reset_off = TensixMMIO.RISCV_DEBUG_REG_SOFT_RESET_0 - mmio_base
     staged = {}
     for name, cfw in fw.items():
-      scratch = _INIT_SCRATCH[name]
+      scratch = cfw.scratch_base
       spans = []
       for s in cfw.segments:
         if not s.data and s.memsz == 0:
@@ -126,10 +113,8 @@ class Device:
     brisc_base = TensixL1.BRISC_FIRMWARE_BASE
     jal = ((brisc_base & 0xFF000) | ((brisc_base & 0x800) << 9) | ((brisc_base & 0x7FE) << 20) | 0x6F).to_bytes(4, "little")
     go_init = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
-    bank_table = build_bank_noc_table(self.harvested_dram, self.cores)
-    all_cores = list(self.cores)
-    if self._use_fast_dispatch:
-      all_cores += [self._prefetch_core, self._dispatch_core]
+    all_cores = list(TileGrid.WORKER_CORES)
+    bank_table = build_bank_noc_table(self.harvested_dram, all_cores)
 
     with TLBWindow(self.fd, start=all_cores[0]) as win:
       for core in all_cores:
@@ -164,20 +149,8 @@ class Device:
           raise TimeoutError(f"firmware not ready on {probe} -- try tt-smi -r")
         time.sleep(0.001)
 
-  def _wait_core_done(self, core: Core, timeout_s: float = 2.0):
-    deadline = time.perf_counter() + timeout_s
-    with TLBWindow(self.fd, start=core) as win:
-      while win.uc[TensixL1.GO_MSG + 3] != DevMsgs.RUN_MSG_DONE:
-        if time.perf_counter() > deadline:
-          go = win.uc[TensixL1.GO_MSG + 3]
-          raise TimeoutError(f"core {core} firmware init timeout (GO_MSG signal=0x{go:02x}) -- try tt-smi -r")
-        time.sleep(0.001)
-
   def _start_dispatch_cores(self):
     cq_kernels = self.compiler.compile_cq_kernels()
-
-    self._wait_core_done(self._prefetch_core)
-    self._wait_core_done(self._dispatch_core)
 
     kernel_off = L1_ALIGN + 2 * L1_ALIGN
     pref_img = b"\0" * L1_ALIGN + struct.pack("<I", CQ_DISPATCH_CB_PAGES).ljust(L1_ALIGN, b"\0") + b"\0" * L1_ALIGN
@@ -189,11 +162,11 @@ class Device:
 
     self._cq_hw.reset_run_state()
     self._upload_cq_core(
-      self._prefetch_core, pref_img, pref_launch,
+      self._PREFETCH_CORE, pref_img, pref_launch,
       [(kernel_off, cq_kernels["prefetch_brisc"].xip)],
     )
     self._upload_cq_core(
-      self._dispatch_core, disp_img, disp_launch,
+      self._DISPATCH_CORE, disp_img, disp_launch,
       [(kernel_off, cq_kernels["dispatch_brisc"].xip),
        (ncrisc_off, cq_kernels["dispatch_s_ncrisc"].xip)],
       init=self._init_dispatch_core_state,
@@ -226,7 +199,7 @@ class Device:
 
   def _upload_cq_core(self, core: Core, img: bytes, launch: LaunchMsg,
                       kernels: list[tuple[int, bytes]], init: Callable[[TLBWindow], None] | None = None):
-    win = self._cq_hw._prefetch_win if core == self._prefetch_core else self._cq_hw._dispatch_win
+    win = self._cq_hw._prefetch_win if core == self._PREFETCH_CORE else self._cq_hw._dispatch_win
     win.target(core)
     if init is not None:
       init(win)
@@ -241,7 +214,7 @@ class Device:
   def _go_word(self) -> int:
     go = GoMsg()
     go.bits.signal = DevMsgs.RUN_MSG_GO
-    go.bits.master_x, go.bits.master_y = self._dispatch_core
+    go.bits.master_x, go.bits.master_y = self._DISPATCH_CORE
     go.bits.dispatch_message_offset = 0
     return go.all
 
@@ -292,62 +265,32 @@ class Device:
     self._profiler_dram_addr = addr
     self._profiler_page_size = page_size
 
-  def _profiler_control_blob(self, core: Core) -> bytes:
-    x, y = core
-    ctrl = [0] * 32
-    ctrl[12] = self._profiler_dram_addr
-    ctrl[14] = x
-    ctrl[15] = y
-    ctrl[16] = self._profiler_flat_ids[core]
-    ctrl[17] = self._profiler_core_count_per_dram
-    return struct.pack("<32I", *ctrl)
-
-  def _enqueue_profiler_init(self):
-    cores = sorted(self._profiler_flat_ids, key=lambda xy: (xy[0], xy[1]))
-    self.cq.append(CQWritePacked(cores, TensixL1.PROFILER_CONTROL,
-      [self._profiler_control_blob(c) for c in cores]))
-
-  def _enqueue_profiler_reset(self, rects: list[Rect]):
-    base = TensixL1.PROFILER_CONTROL
-    self.cq.append(CQWritePackedLarge(rects, base + 5 * 4, b"\0" * (5 * 4)))   # DEVICE_BUFFER_END x 5
-    self.cq.append(CQWritePackedLarge(rects, base + 19 * 4, b"\0" * 4))        # PROFILER_DONE
-
-  def _read_profiler_dram(self) -> bytes:
-    return self.dram.read_raw_bank_pages(self._profiler_dram_addr, self._profiler_page_size)
-
-  def _read_profiler_ctrl(self, cores: list[Core]) -> dict[Core, bytes]:
-    ctrl = {}
-    for core in cores:
-      with TLBWindow(self.fd, start=core) as win:
-        ctrl[core] = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
-    return ctrl
-
-  def _programs_info(self) -> list[dict]:
-    info = []
+  def _collect_profiler_data(self):
+    programs_info = []
     for i, prog in enumerate(self._programs):
-      if not prog.profile:
-        continue
-      cores = self._program_cores(prog)
+      if not prog.profile: continue
       sources = {}
       if prog.reader_kernel: sources["reader"] = prog.reader_kernel
       if prog.writer_kernel: sources["writer"] = prog.writer_kernel
       if prog.compute_kernel: sources["compute"] = prog.compute_kernel
-      info.append({"index": i, "name": prog.name or None, "cores": cores, "sources": sources})
-    return info
-
-  def _collect_profiler_data(self):
-    programs_info = self._programs_info()
-    if not programs_info:
-      return
+      if prog.grid is not None:
+        rows, cols = prog.grid
+        cores = sorted([(x, y) for x in cols for y in rows], key=lambda c: (c[0], c[1]))
+      else:
+        cores = self.cores if prog.cores == "all" else self.cores[:prog.cores]
+      programs_info.append({"index": i, "name": prog.name or None, "cores": cores, "sources": sources})
+    if not programs_info: return
     self.dram.barrier()
+    needed = sorted({c for info in programs_info for c in info["cores"]})
+    ctrl_regs = {}
+    for core in needed:
+      with TLBWindow(self.fd, start=core) as win:
+        ctrl_regs[core] = bytes(win.uc[TensixL1.PROFILER_CONTROL : TensixL1.PROFILER_CONTROL + 128])
     import profiler
-    needed = set()
-    for info in programs_info:
-      needed.update(info["cores"])
-    raw_dram = self._read_profiler_dram()
-    ctrl_regs = self._read_profiler_ctrl(sorted(needed))
     self.last_profile = profiler.collect(
-      programs_info, raw_dram, ctrl_regs,
+      programs_info,
+      self.dram.read_raw_bank_pages(self._profiler_dram_addr, self._profiler_page_size),
+      ctrl_regs,
       flat_ids=self._profiler_flat_ids,
       page_size=self._profiler_page_size,
       core_count_per_dram=self._profiler_core_count_per_dram,
@@ -355,21 +298,10 @@ class Device:
     )
     profiler.print_summary(self.last_profile)
 
-  def alloc(self, num_tiles: int, dtype: Dtype, name: str = "", shape: Shape | None = None) -> DramBuffer:
-    return self.dram.alloc(num_tiles, dtype, name, shape)
-
   def alloc_write(self, data: bytes, dtype: Dtype, shape: Shape, name: str = "") -> DramBuffer:
     buf = self.dram.alloc(len(data) // dtype.tile_size, dtype, name, shape)
     self.dram_write(buf, data)
     return buf
-
-  def _ensure_dram_sysmem(self, size: int = 128 * 1024 * 1024):
-    need = align_up(size, os.sysconf("SC_PAGE_SIZE"))
-    if self._dram_sysmem is not None and self._dram_sysmem.size >= need:
-      return
-    if self._dram_sysmem is not None:
-      self._dram_sysmem.close()
-    self._dram_sysmem = Sysmem(self.fd, size=max(128 * 1024 * 1024, need))
 
   def _run_transfer(self, buf: DramBuffer, direction: str):
     prog, _ = build_transfer_program(buf, direction, len(self.cores), self._dram_sysmem.noc_addr)
@@ -380,7 +312,7 @@ class Device:
   def dram_write(self, buf: DramBuffer, data: bytes):
     assert len(data) <= buf.size
     if self._use_fast_dispatch and buf.shape is not None:
-      self._ensure_dram_sysmem(buf.size)
+      assert buf.size <= self._dram_sysmem.size, f"transfer {buf.size} exceeds sysmem {self._dram_sysmem.size}"
       self._dram_sysmem.buf[:len(data)] = data
       self._run_transfer(buf, "tilize")
       return
@@ -390,27 +322,14 @@ class Device:
 
   def dram_read(self, buf: DramBuffer) -> bytes:
     if self._use_fast_dispatch and buf.shape is not None:
-      self._ensure_dram_sysmem(buf.size)
+      assert buf.size <= self._dram_sysmem.size, f"transfer {buf.size} exceeds sysmem {self._dram_sysmem.size}"
       self._run_transfer(buf, "untilize")
       return bytes(self._dram_sysmem.buf[:buf.size])
     result = self.dram.read(buf)
-    if buf.shape is not None:
-      return untilize(result, buf.dtype.bpe, buf.shape)
+    if buf.shape is not None: return untilize(result, buf.dtype.bpe, buf.shape)
     return result
 
-  def _resolve_cores(self, spec: int | Literal["all"]) -> list[Core]:
-    if spec == "all":
-      return list(self.cores)
-    return self.cores[:spec]
-
-  def _program_cores(self, program: Program) -> list[Core]:
-    if program.grid is not None:
-      rows, cols = program.grid
-      return sorted([(x, y) for x in cols for y in rows], key=lambda c: (c[0], c[1]))
-    return self._resolve_cores(program.cores)
-
-  def queue(self, program: Program):
-    self._programs.append(program)
+  def queue(self, program: Program): self._programs.append(program)
 
   def _compile_ir(self, program: Program, dispatch_mode, host_assigned_id: int = 0) -> list:
     writer = self.compiler.compile_dataflow(program.writer_kernel, "brisc") if program.writer_kernel else None
@@ -437,7 +356,7 @@ class Device:
         (top_left, reader, writer), (top_row, r_recv, writer), (left_col, reader, w_recv), (interior, r_recv, w_recv),
       ] if cs]
     else:
-      cores = self._resolve_cores(program.cores)
+      cores = self.cores if program.cores == "all" else self.cores[:program.cores]
       all_cores = cores
       n = len(cores)
       per_core_args = [
@@ -450,49 +369,42 @@ class Device:
     return build_ir(program, roles, compute, all_cores, per_core_args, dispatch_mode, host_assigned_id=host_assigned_id)
 
   def run(self) -> list[dict] | None:
-    if not self._programs:
-      return None
     self._set_power(True)
     try:
-      if self._use_fast_dispatch:
-        return self._run_fast_dispatch()
-      else:
-        return self._run_slow_dispatch()
+      if self._use_fast_dispatch: return self._run_fast_dispatch()
+      else: return self._run_slow_dispatch()
     finally:
       self._programs.clear()
       self._set_power(False)
 
   def _run_fast_dispatch(self) -> list[dict] | None:
     timing = os.environ.get("TIMING") == "1"
-    profiling = self._profiler
     n = len(self._programs)
 
-    if profiling:
-      all_rects = mcast_rects(self.cores)
-      if not self._profiler_initialized:
-        self._enqueue_profiler_init()
-        self._profiler_initialized = True
-      self.cq.append(CQWritePackedLarge(all_rects, TensixL1.PROFILER_CONTROL, b"\0" * (5 * 4)))
-
+    programs = []
     for i, program in enumerate(self._programs):
-      prof_this = profiling and program.profile
-      if prof_this:
-        self._enqueue_profiler_reset(all_rects)
-      ts_slot = 2 * i
-      if timing and ts_slot + 1 < _TS_MAX_SLOTS:
-        self.cq.append(CQTimestamp(*self._ts_noc_dest(ts_slot)))
-      prof_id = (i + 1) if prof_this else 0
+      profiled = program.profile
+      prof_id = (i + 1) if self._profiler and profiled else 0
       ir = self._compile_ir(program, self._dispatch_mode, host_assigned_id=prof_id)
-      self.cq.extend(lower_fast(ir, self._go_word()))
-      if timing and ts_slot + 1 < _TS_MAX_SLOTS:
-        self.cq.append(CQTimestamp(*self._ts_noc_dest(ts_slot + 1)))
+      programs.append((ir, profiled))
 
+    timestamps = None
+    if timing:
+      timestamps = [self._ts_noc_dest(s) for s in range(min(2 * n, _TS_MAX_SLOTS))]
+
+    self.cq.extend(lower_fast(
+      programs, self._go_word(), self.cores,
+      timestamps=timestamps,
+      profiler_flat_ids=self._profiler_flat_ids or None,
+      profiler_dram_addr=self._profiler_dram_addr,
+      profiler_core_count_per_dram=self._profiler_core_count_per_dram,
+    ))
     self._cq_hw._event_id += 1
     self.cq.append(CQHostEvent(self._cq_hw._event_id))
     self._cq_hw.flush(self.cq)
     self._cq_hw.wait_completion(self._cq_hw._event_id)
 
-    if profiling:
+    if self._profiler:
       self._collect_profiler_data()
     if not timing:
       return None
