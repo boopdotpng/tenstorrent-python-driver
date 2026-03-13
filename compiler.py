@@ -3,7 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from autogen import TensixL1
+from hw import *
 from dispatch import Dtype, MathFidelity, Program
 
 PROFILER = os.environ.get("PROFILE") == "1"
@@ -156,7 +156,6 @@ def iter_pt_load(elf: bytes):
     yield PTLoad(paddr=paddr, data=elf[p_offset:p_offset + p_filesz], memsz=p_memsz, flags=p_flags)
 
 def _xipify_riscv32_elf(elf: bytes) -> bytes:
-  """Convert ABS HI20/LO12 references to text symbols into PCREL-style encodings."""
   data = bytearray(elf)
   e_phoff = struct.unpack_from("<I", data, 28)[0]
   e_shoff = struct.unpack_from("<I", data, 32)[0]

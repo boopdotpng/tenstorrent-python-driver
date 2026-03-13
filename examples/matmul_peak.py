@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Matmul peak throughput benchmark."""
 import os, sys
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 
+from hw import *
+from dispatch import *
 from device import Device, DramBuffer, Dtype, MathFidelity
-from dispatch import CBConfig, Core, Program
-from autogen import TensixL1
 
 F32_ACC = os.environ.get("F32_ACC") == "1"
 IO_MODE = "f16" if os.environ.get("F16") == "1" else "bf16"

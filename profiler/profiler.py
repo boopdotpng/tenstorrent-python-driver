@@ -1,12 +1,26 @@
 import re, struct
 
-from autogen import Profiler as P
+from hw import *
 from compiler import hash16
 
 RISC_NAMES = ("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2")
 
-_HOST_BUF_BYTES_PER_RISC = P.HOST_BUF_BYTES_PER_RISC
-_HOST_BUF_WORDS_PER_RISC = P.HOST_BUF_WORDS_PER_RISC
+
+class P:
+  HOST_BUF_END = 0             # per RISC (indices 0-4)
+  GUARANTEED_FW_START = 4
+  GUARANTEED_FW_END = 6
+  GUARANTEED_KERN_START = 8
+  GUARANTEED_KERN_END = 10
+  CUSTOM_START = 12
+  ZONE_START = 0
+  ZONE_END = 1
+  ZONE_TOTAL = 2
+  TS_DATA = 3
+  TS_DATA_16B = 5
+
+_HOST_BUF_BYTES_PER_RISC = TensixL1.PROFILER_HOST_BUFFER_BYTES_PER_RISC
+_HOST_BUF_WORDS_PER_RISC = _HOST_BUF_BYTES_PER_RISC // 4
 
 _ZONE_RE = re.compile(r'DeviceZoneScopedN\s*\(\s*"([^"]+)"')
 
