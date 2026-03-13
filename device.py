@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from hw import *
+from hw import _ioctl_set_power_state
 from dispatch import *
 from dram import DramBuffer, Allocator, Shape, tilize, untilize, build_transfer_program
 
@@ -108,63 +109,8 @@ class Device:
     assert len(dram_off) == 1, f"expected 1 harvested dram bank, got {dram_off}"
     return dram_off[0]
 
-  def arc_msg(self, msg: int, arg0: int = 0, arg1: int = 0, queue: int = 0, timeout_ms: int = 1000) -> list[int]:
-    MSG_QUEUE_SIZE, REQUEST_MSG_LEN, RESPONSE_MSG_LEN = 4, 8, 8
-    MSG_QUEUE_POINTER_WRAP = 2 * MSG_QUEUE_SIZE
-    HEADER_BYTES = 8 * 4
-    REQUEST_BYTES, RESPONSE_BYTES = REQUEST_MSG_LEN * 4, RESPONSE_MSG_LEN * 4
-    QUEUE_STRIDE = HEADER_BYTES + MSG_QUEUE_SIZE * REQUEST_BYTES + MSG_QUEUE_SIZE * RESPONSE_BYTES
-    ARC_MISC_CNTL = Arc.RESET_UNIT_OFFSET + 0x100
-    IRQ0_TRIG = 1 << 16
-
-    with TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE) as arc:
-      info_ptr = arc.read32(Arc.SCRATCH_RAM_11)
-      if info_ptr == 0:
-        raise RuntimeError("msgqueue not initialized (SCRATCH_RAM_11 == 0) -- try tt-smi -r")
-      info_base, info_off = align_down(info_ptr, TLBWindow.SIZE_2M)
-      arc.target(TileGrid.ARC, addr=info_base)
-      queues_ptr = arc.read32(info_off)
-      q_base, q_off = align_down(queues_ptr, TLBWindow.SIZE_2M)
-      arc.target(TileGrid.ARC, addr=q_base)
-      q = q_off + queue * QUEUE_STRIDE
-
-      wptr = arc.read32(q)
-      req = q + HEADER_BYTES + (wptr % MSG_QUEUE_SIZE) * REQUEST_BYTES
-      words = [msg & 0xFF, arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF] + [0] * (REQUEST_MSG_LEN - 3)
-      for i, w in enumerate(words):
-        arc.write32(req + i * 4, w)
-      arc.write32(q, (wptr + 1) % MSG_QUEUE_POINTER_WRAP)
-
-      arc.target(TileGrid.ARC, addr=Arc.NOC_BASE)
-      arc.write32(ARC_MISC_CNTL, arc.read32(ARC_MISC_CNTL) | IRQ0_TRIG)
-
-      arc.target(TileGrid.ARC, addr=q_base)
-      rptr = arc.read32(q + 4)
-      deadline = time.monotonic() + timeout_ms / 1000
-      while time.monotonic() < deadline:
-        if arc.read32(q + 20) != rptr:
-          resp = q + HEADER_BYTES + MSG_QUEUE_SIZE * REQUEST_BYTES + (rptr % MSG_QUEUE_SIZE) * RESPONSE_BYTES
-          out = [arc.read32(resp + i * 4) for i in range(RESPONSE_MSG_LEN)]
-          arc.write32(q + 4, (rptr + 1) % MSG_QUEUE_POINTER_WRAP)
-          return out
-        time.sleep(0.001)
-      raise TimeoutError(f"arc_msg timeout ({timeout_ms} ms) -- try tt-smi -r")
-
-  def _set_power_busy(self, timeout_s: float = 2.0):
-    self.arc_msg(Arc.MSG_AICLK_GO_BUSY, 0, 0, timeout_ms=1000)
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-      aiclk = self._read_arc_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK)
-      if aiclk > Arc.DEFAULT_AICLK:
-        return
-      time.sleep(0.001)
-    raise RuntimeError(f"AICLK failed to reach busy state (last={aiclk} MHz)")
-
-  def _set_power_idle(self):
-    try:
-      self.arc_msg(Arc.MSG_AICLK_GO_LONG_IDLE, 0, 0, timeout_ms=1000)
-    except (TimeoutError, RuntimeError):
-      pass
+  def _set_power(self, busy: bool):
+    _ioctl_set_power_state(self.fd, validity=1, power_flags=int(busy))
 
   def _upload_firmware(self):
     fw = self.compiler._fw
@@ -515,7 +461,7 @@ class Device:
   def run(self) -> list[dict] | None:
     if not self._programs:
       return None
-    self._set_power_busy()
+    self._set_power(True)
     try:
       if self._use_fast_dispatch:
         return self._run_fast_dispatch()
@@ -523,7 +469,7 @@ class Device:
         return self._run_slow_dispatch()
     finally:
       self._programs.clear()
-      self._set_power_idle()
+      self._set_power(False)
 
   def _run_fast_dispatch(self) -> list[dict] | None:
     timing = os.environ.get("TIMING") == "1"
@@ -599,7 +545,7 @@ class Device:
 
   def close(self):
     try:
-      self._set_power_idle()
+      self._set_power(False)
     finally:
       if self._dram_sysmem is not None:
         self._dram_sysmem.close()

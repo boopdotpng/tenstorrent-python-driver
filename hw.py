@@ -65,10 +65,7 @@ class TensixMMIO:
 class Arc:
   NOC_BASE = 0x80000000
   RESET_UNIT_OFFSET = 0x30000
-  SCRATCH_RAM_11 = RESET_UNIT_OFFSET + 0x42C
   SCRATCH_RAM_13 = RESET_UNIT_OFFSET + 0x434
-  MSG_AICLK_GO_BUSY = 0x52
-  MSG_AICLK_GO_LONG_IDLE = 0x54
   TAG_AICLK = 14
   TAG_GDDR_ENABLED = 36
   DEFAULT_AICLK = 800
@@ -97,6 +94,8 @@ def _tt_ioctl(nr, in_t, out_t=None):
     inp = in_t.from_buffer(buf)
     if out_t and hasattr(in_t, 'output_size_bytes'):
       inp.output_size_bytes = ctypes.sizeof(out_t)
+    if hasattr(in_t, 'argsz'):
+      inp.argsz = ctypes.sizeof(in_t)
     for k, v in kwargs.items():
       setattr(inp, k, v)
     fcntl.ioctl(fd, cmd, buf, True)
@@ -142,11 +141,20 @@ class _UnpinIn(S):
   _pack_ = 1
   _fields_ = [("virtual_address", u64), ("size", u64), ("reserved", u64)]
 
+class _PowerStateIn(S):
+  _pack_ = 1
+  _fields_ = [
+    ("argsz", u32), ("flags", u32),
+    ("reserved0", u8), ("validity", u8),
+    ("power_flags", u16), ("power_settings", u16 * 14),
+  ]
+
 _ioctl_alloc_tlb = _tt_ioctl(11, _AllocIn, _AllocOut)
 _ioctl_config_tlb = _tt_ioctl(13, _ConfigIn)
 _ioctl_free_tlb = _tt_ioctl(12, _FreeIn)
 _ioctl_pin_pages = _tt_ioctl(7, _PinIn, _PinOut)
 _ioctl_unpin_pages = _tt_ioctl(10, _UnpinIn)
+_ioctl_set_power_state = _tt_ioctl(15, _PowerStateIn)
 _PIN_NOC_DMA = 2
 
 
