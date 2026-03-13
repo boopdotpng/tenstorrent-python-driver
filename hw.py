@@ -66,9 +66,7 @@ class Arc:
   NOC_BASE = 0x80000000
   RESET_UNIT_OFFSET = 0x30000
   SCRATCH_RAM_13 = RESET_UNIT_OFFSET + 0x434
-  TAG_AICLK = 14
   TAG_GDDR_ENABLED = 36
-  DEFAULT_AICLK = 800
   DEFAULT_GDDR_ENABLED = 0xFF
 
 
@@ -367,58 +365,39 @@ USE_USB_DISPATCH = os.environ.get("TT_USB") == "1"
 
 
 def build_bank_noc_table(harvested_dram: int, worker_cores: list[Core]) -> bytes:
-  NUM_NOCS, NUM_DRAM_BANKS, NUM_L1_BANKS = 2, 7, 110
-  WORKER_EP_LOGICAL = {
-    0: [2, 1], 1: [0, 1], 2: [0, 1], 3: [0, 1],
-    4: [2, 1], 5: [2, 1], 6: [2, 1], 7: [2, 1],
-  }
+  NOCS, DRAM_BANKS, L1_BANKS, PORTS = 2, 7, 110, 3
+  # per-bank NOC port selection: bank -> [noc0_port, noc1_port]
+  BANK_PORT = [[2,1],[0,1],[0,1],[0,1],[2,1],[2,1],[2,1],[2,1]]
 
-  def dram_translated_map(harvested_bank: int) -> dict[tuple[int, int], Core]:
-    START_X, START_Y, PORTS, TOTAL_BANKS = 17, 12, 3, 8
-    m: dict[tuple[int, int], Core] = {}
+  # 7 logical DRAM banks mapped to translated coords on x=17/18, 3 ports each, y from 12
+  # harvested bank's mirror gets pushed to the last slot on its column
+  h, half = harvested_dram, 4
+  mirror = h + half - 1 if h < half else h - half
+  if h < half:
+    right = list(range(half - 1))
+    left = [b for b in range(half - 1, DRAM_BANKS) if b != mirror] + [mirror]
+  else:
+    left = [b for b in range(half) if b != mirror] + [mirror]
+    right = list(range(half, DRAM_BANKS))
+  bank_xy = {}
+  for i, b in enumerate(right):
+    bank_xy[b] = (18, 12 + i * PORTS)
+  for i, b in enumerate(left):
+    bank_xy[b] = (17, 12 + i * PORTS)
 
-    def map_banks(start, end, x, y0=START_Y):
-      y = y0
-      for bank in range(start, end):
-        for port in range(PORTS):
-          m[(bank, port)] = (x, y)
-          y += 1
+  # DRAM section: noc_xy per (noc, bank), selecting the right port
+  dram = []
+  for noc in range(NOCS):
+    for b in range(DRAM_BANKS):
+      x, y0 = bank_xy[b]
+      dram.append(noc_xy(x, y0 + BANK_PORT[b][noc]))
 
-    half = TOTAL_BANKS // 2
-    if harvested_bank < half:
-      mirror = harvested_bank + half - 1
-      map_banks(0, half - 1, START_X + 1)
-      map_banks(half - 1, mirror, START_X)
-      map_banks(mirror + 1, TOTAL_BANKS - 1, START_X, START_Y + (mirror - (half - 1)) * PORTS)
-      map_banks(mirror, mirror + 1, START_X, START_Y + (half - 1) * PORTS)
-    else:
-      mirror = harvested_bank - half
-      map_banks(0, mirror, START_X)
-      map_banks(mirror + 1, half, START_X, START_Y + mirror * PORTS)
-      map_banks(mirror, mirror + 1, START_X, START_Y + (half - 1) * PORTS)
-      map_banks(half, TOTAL_BANKS - 1, START_X + 1)
-    return m
+  # L1 section: worker cores in column-major order, same for both NOCs
+  cols = sorted({x for x, _ in worker_cores})
+  l1 = []
+  for _ in range(NOCS):
+    for i in range(L1_BANKS):
+      l1.append(noc_xy(cols[i % len(cols)], 2 + (i // len(cols)) % 10))
 
-  dram_translated = dram_translated_map(harvested_dram)
-  dram_xy = []
-  for noc in range(NUM_NOCS):
-    for bank in range(NUM_DRAM_BANKS):
-      port = WORKER_EP_LOGICAL[bank][noc]
-      x, y = dram_translated[(bank, port)]
-      dram_xy.append(noc_xy(x, y))
+  return struct.pack(f"<{len(dram)}H{len(l1)}H{DRAM_BANKS + L1_BANKS}i", *dram, *l1, *([0] * (DRAM_BANKS + L1_BANKS)))
 
-  tensix_cols = sorted({x for x, _ in worker_cores})
-  l1_xy = []
-  for _ in range(NUM_NOCS):
-    for bank_id in range(NUM_L1_BANKS):
-      col_idx = bank_id % len(tensix_cols)
-      row_idx = bank_id // len(tensix_cols)
-      x = tensix_cols[col_idx]
-      y = 2 + (row_idx % 10)
-      l1_xy.append(noc_xy(x, y))
-
-  blob = struct.pack(f"<{len(dram_xy)}H", *dram_xy)
-  blob += struct.pack(f"<{len(l1_xy)}H", *l1_xy)
-  blob += struct.pack(f"<{NUM_DRAM_BANKS}i", *([0] * NUM_DRAM_BANKS))
-  blob += struct.pack(f"<{NUM_L1_BANKS}i", *([0] * NUM_L1_BANKS))
-  return blob

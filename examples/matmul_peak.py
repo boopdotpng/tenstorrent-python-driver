@@ -576,10 +576,7 @@ def main():
     _validate(a_ref, b_ref, c_raw, M, N, Mp, Np)
 
     if device.last_profile is not None:
-      import json
-      out = Path("profiler_data.json")
-      out.write_text(json.dumps(device.last_profile))
-      print(f"Profiler data written to {out.resolve()}")
+      device.serve_profile()
 
   finally:
     device.close()

@@ -7,7 +7,6 @@ from hw import _ioctl_set_power_state
 from dispatch import *
 from dram import DramBuffer, Allocator, Shape, tilize, untilize, build_transfer_program
 
-
 _INIT_SCRATCH = {
   "brisc": TensixL1.BRISC_INIT_LOCAL_L1_BASE_SCRATCH,
   "ncrisc": TensixL1.NCRISC_INIT_LOCAL_L1_BASE_SCRATCH,
@@ -19,7 +18,6 @@ _INIT_SCRATCH = {
 _TS_PAGE_SIZE = 64
 _TS_STRIDE = 16
 _TS_MAX_SLOTS = 512
-
 
 class Device:
   _CQ_PREFETCH_CORE = (14, 2)
@@ -36,8 +34,7 @@ class Device:
       os.close(self.fd)
       raise SystemExit(f"unsupported blackhole device {self.arch}; p100a only for now")
 
-    self.harvested_dram = self._get_harvested_dram_bank()
-    self._set_active_dram_tiles()
+    self._init_dram_tiles()
     self.dram = Allocator(self.fd, self.dram_tiles)
     self._init_timestamp_dram()
     self._dispatch_mode = DevMsgs.DISPATCH_MODE_HOST if USE_USB_DISPATCH else DevMsgs.DISPATCH_MODE_DEV
@@ -80,15 +77,7 @@ class Device:
       raise RuntimeError(f"fixed CQ cores unavailable: {missing}")
     return pair
 
-  def _set_active_dram_tiles(self):
-    self.dram_tiles = [
-      (bank, Dram.BANK_X[bank], y)
-      for bank in range(Dram.BANK_COUNT)
-      if bank != self.harvested_dram
-      for y in Dram.BANK_TILE_YS[bank]
-    ]
-
-  def _read_arc_tag(self, tag: int, default: int) -> int:
+  def _init_dram_tiles(self):
     with TLBWindow(self.fd, start=TileGrid.ARC, addr=Arc.NOC_BASE) as arc:
       telem_ptr = arc.read32(Arc.SCRATCH_RAM_13)
       csm_base, csm_off = align_down(telem_ptr, TLBWindow.SIZE_2M)
@@ -100,14 +89,17 @@ class Device:
       for i in range(entry_count):
         tag_offset = arc.read32(tags_base + i * 4)
         tag_to_offset[tag_offset & 0xFFFF] = (tag_offset >> 16) & 0xFFFF
-      off = tag_to_offset.get(tag)
-      return default if off is None else arc.read32(data_base + off * 4)
-
-  def _get_harvested_dram_bank(self) -> int:
-    gddr_enabled = self._read_arc_tag(Arc.TAG_GDDR_ENABLED, Arc.DEFAULT_GDDR_ENABLED)
-    dram_off = [bank for bank in range(Dram.BANK_COUNT) if ((gddr_enabled >> bank) & 1) == 0]
-    assert len(dram_off) == 1, f"expected 1 harvested dram bank, got {dram_off}"
-    return dram_off[0]
+      off = tag_to_offset.get(Arc.TAG_GDDR_ENABLED)
+      gddr_enabled = Arc.DEFAULT_GDDR_ENABLED if off is None else arc.read32(data_base + off * 4)
+    harvested = [bank for bank in range(Dram.BANK_COUNT) if ((gddr_enabled >> bank) & 1) == 0]
+    assert len(harvested) == 1, f"expected 1 harvested dram bank, got {harvested}"
+    self.harvested_dram = harvested[0]
+    self.dram_tiles = [
+      (bank, Dram.BANK_X[bank], y)
+      for bank in range(Dram.BANK_COUNT)
+      if bank != self.harvested_dram
+      for y in Dram.BANK_TILE_YS[bank]
+    ]
 
   def _set_power(self, busy: bool):
     _ioctl_set_power_state(self.fd, validity=1, power_flags=int(busy))
@@ -135,7 +127,6 @@ class Device:
     jal = ((brisc_base & 0xFF000) | ((brisc_base & 0x800) << 9) | ((brisc_base & 0x7FE) << 20) | 0x6F).to_bytes(4, "little")
     go_init = struct.pack("<BBBB", 0, 0, 0, DevMsgs.RUN_MSG_INIT)
     bank_table = build_bank_noc_table(self.harvested_dram, self.cores)
-
     all_cores = list(self.cores)
     if self._use_fast_dispatch:
       all_cores += [self._prefetch_core, self._dispatch_core]
@@ -521,7 +512,7 @@ class Device:
 
   def _collect_timing_data(self, n: int) -> list[dict]:
     self.dram.barrier()
-    freq_mhz = self._read_arc_tag(Arc.TAG_AICLK, Arc.DEFAULT_AICLK)
+    freq_mhz = 1350
     timings = []
     for i in range(n):
       ts_slot = 2 * i
@@ -536,20 +527,15 @@ class Device:
     self.last_device_timing = timings
     return timings
 
-  def serve_profile(self, port: int = 8000):
-    if self.last_profile is None:
-      print("No profiler data to serve")
-      return
+  def serve_profile(self, port: int = int(os.environ.get("PORT", 8000))):
     from profiler import ui as profiler_ui
     profiler_ui.serve(self.last_profile, port=port)
 
   def close(self):
-    try:
-      self._set_power(False)
-    finally:
-      if self._dram_sysmem is not None:
-        self._dram_sysmem.close()
-      if self._cq_hw is not None:
-        self._cq_hw.close()
-      self.dram.close()
-      os.close(self.fd)
+    self._set_power(False)
+    if self._dram_sysmem is not None:
+      self._dram_sysmem.close()
+    if self._cq_hw is not None:
+      self._cq_hw.close()
+    self.dram.close()
+    os.close(self.fd)
