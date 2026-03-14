@@ -1,4 +1,4 @@
-import ctypes, os, struct, time
+import ctypes, struct, time
 from ctypes import c_uint8 as u8, c_uint16 as u16, c_uint32 as u32
 from dataclasses import dataclass, field
 from enum import Enum
@@ -63,23 +63,12 @@ class GoMsg(ctypes.Union):
   _pack_ = 1
   _fields_ = [("all", u32), ("bits", _GoMsgBits)]
 
-_RELAY_INLINE       = 5   # prefetch: relay inline
-_WRITE_PACKED       = 5   # dispatch: write to multiple cores
-_WRITE_PACKED_LARGE = 6   # dispatch: multicast write via rects
-_WRITE_LINEAR_HOST  = 3   # dispatch: write to host sysmem
-_WAIT               = 7   # dispatch: wait for stream
-_GO_SIGNAL          = 14  # dispatch: send go signal
-_SET_GO_NOC_DATA    = 17  # dispatch: set go signal NOC addresses
-_TIMESTAMP          = 18  # dispatch: write timestamp
-
 Rect = tuple[int, int, int, int]  # (x0, x1, y0, y1)
 Args = list[int]
 RtArgs = Args | Callable[[int, Core, int], Args]
 CoreArgs = tuple[Args, Args, Args]  # (writer, reader, compute) per core
 
 FAST_CQ_NUM_CIRCULAR_BUFFERS = 32
-CQ_CMD_SIZE = 16  # dispatch command header size
-DONE_STREAM = 48  # stream index workers signal completion on
 
 class Dtype(Enum):
   Float32 = 0
@@ -166,130 +155,6 @@ class Launch:
   cores: list[Core]
 
 IRCommand = Write | Launch
-
-@dataclass
-class CQWritePackedLarge:
-  rects: list[Rect]
-  addr: int
-  data: bytes
-
-  def to_bytes(self) -> list[bytes]:
-    padded = bytes(self.data).ljust(align_up(len(self.data), L1_ALIGN), b"\0")
-    records = []
-    for i in range(0, len(self.rects), 35):  # max 35 sub-commands per batch
-      batch = self.rects[i:i + 35]
-      hdr = struct.pack("<BBHHH", _WRITE_PACKED_LARGE, 2, len(batch), L1_ALIGN, 0)
-      hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-      subs = b"".join(
-        struct.pack("<IIHBB", noc_mcast_xy(r)[0], self.addr, len(self.data) - 1,
-                    noc_mcast_xy(r)[1], 0x01)  # UNLINK flag
-        for r in batch
-      ).ljust(align_up(len(batch) * 12, L1_ALIGN), b"\0")
-      records.append(hdr + subs + padded * len(batch))
-    return records
-
-@dataclass
-class CQWritePacked:
-  cores: list[Core]
-  addr: int
-  data: bytes | list[bytes]
-
-  def to_bytes(self) -> list[bytes]:
-    uniform = isinstance(self.data, bytes)
-    size = len(self.data) if uniform else len(self.data[0])
-    flags = 0x02 if uniform else 0  # NO_STRIDE flag
-    hdr = struct.pack("<BBHHHI", _WRITE_PACKED, flags, len(self.cores), 0, size, self.addr)
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    nocs = b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in self.cores)
-    nocs = nocs.ljust(align_up(len(self.cores) * 4, L1_ALIGN), b"\0")
-    if uniform:
-      body = bytes(self.data).ljust(align_up(size, L1_ALIGN), b"\0")
-    else:
-      stride = align_up(size, L1_ALIGN)
-      body = b"".join(d.ljust(stride, b"\0") for d in self.data)
-    return [hdr + nocs + body]
-
-@dataclass
-class CQSetGoSignalNocData:
-  cores: list[Core]
-
-  def to_bytes(self) -> list[bytes]:
-    hdr = struct.pack("<BBHI", _SET_GO_NOC_DATA, 0, 0, len(self.cores))
-    hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-    return [hdr + b"".join(struct.pack("<I", noc_xy(x, y)) for x, y in self.cores)]
-
-@dataclass
-class CQSendGoSignal:
-  go_word: int
-  stream: int
-  count: int
-  num_unicast: int
-
-  def to_bytes(self) -> list[bytes]:
-    payload = struct.pack("<IBBBII", self.go_word, 0xFF,  # NO_MULTICAST_OFFSET
-                          self.num_unicast, 0, self.count, self.stream)
-    cmd = bytes([_GO_SIGNAL]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0")
-    return [cmd]
-
-@dataclass
-class CQWaitStream:
-  stream: int
-  count: int
-  clear: bool = True
-
-  def to_bytes(self) -> list[bytes]:
-    flags = 0x08  # WAIT_STREAM
-    if self.clear:
-      flags |= 0x10  # CLEAR_STREAM
-    payload = struct.pack("<BHII", flags, self.stream, 0, self.count)
-    cmd = bytes([_WAIT]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0")
-    return [cmd]
-
-@dataclass
-class CQHostEvent:
-  event_id: int
-
-  def to_bytes(self) -> list[bytes]:
-    payload = struct.pack("<I", self.event_id & 0xFFFFFFFF).ljust(L1_ALIGN, b"\0")
-    hdr = struct.pack("<BBHIQ", _WRITE_LINEAR_HOST, 1, 0, 0, CQ_CMD_SIZE + len(payload))
-    return [hdr + payload]
-
-@dataclass
-class CQTimestamp:
-  noc_xy_addr: int
-  addr: int
-
-  def to_bytes(self) -> list[bytes]:
-    payload = struct.pack("<xHII", 0, self.noc_xy_addr, self.addr)
-    cmd = bytes([_TIMESTAMP]) + payload.ljust(CQ_CMD_SIZE - 1, b"\0")
-    return [cmd]
-
-CQCommand = CQWritePackedLarge | CQWritePacked | CQSetGoSignalNocData | CQSendGoSignal | CQWaitStream | CQHostEvent | CQTimestamp
-
-def _relay_inline(payload: bytes) -> bytes:
-  stride = align_up(CQ_CMD_SIZE + len(payload), PCIE_ALIGN)
-  hdr = struct.pack("<BBHII", _RELAY_INLINE, 0, 0, len(payload), stride)
-  hdr = hdr.ljust(CQ_CMD_SIZE, b"\0")
-  return hdr + payload.ljust(stride - CQ_CMD_SIZE, b"\0")
-
-class CommandQueue:
-  def __init__(self):
-    self.stream = bytearray()
-    self.sizes: list[int] = []
-
-  def clear(self):
-    self.stream.clear()
-    self.sizes.clear()
-
-  def append(self, cmd: CQCommand):
-    for payload in cmd.to_bytes():
-      record = _relay_inline(payload)
-      self.stream.extend(record)
-      self.sizes.append(len(record) >> 4)
-
-  def extend(self, cmds: list[CQCommand]):
-    for cmd in cmds:
-      self.append(cmd)
 
 def resolve_args(args: RtArgs, core_idx: int, core_xy: Core, num_cores: int) -> Args:
   return args if isinstance(args, list) else args(core_idx, core_xy, num_cores)
@@ -419,57 +284,6 @@ def build_ir(
 
   commands.append(Launch(all_cores))
   return commands
-
-def _lower_ir(commands: list[IRCommand], go_word: int) -> list[CQCommand]:
-  result: list[CQCommand] = []
-  for cmd in commands:
-    match cmd:
-      case Write(cores=cores, addr=addr, data=data) if isinstance(data, list):
-        result.append(CQWritePacked(cores, addr, data))
-      case Write(cores=cores, addr=addr, data=data):
-        result.append(CQWritePackedLarge(mcast_rects(cores), addr, data))
-      case Launch(cores=cores):
-        result.append(CQSetGoSignalNocData(cores))
-        result.append(CQWaitStream(DONE_STREAM, 0))
-        result.append(CQSendGoSignal(go_word, DONE_STREAM, 0, len(cores)))
-        result.append(CQWaitStream(DONE_STREAM, len(cores)))
-  return result
-
-def lower_fast(
-  programs: list[tuple[list[IRCommand], bool]],
-  go_word: int, cores: list[Core],
-  timestamps: list[tuple[int, int]] | None = None,
-  profiler_flat_ids: dict | None = None,
-  profiler_dram_addr: int = 0, profiler_core_count_per_dram: int = 0,
-) -> list[CQCommand]:
-  profiling = os.environ.get("PROFILE") == "1" and profiler_flat_ids is not None
-  result: list[CQCommand] = []
-  if profiling:
-    rects = mcast_rects(cores)
-    prof_cores = sorted(profiler_flat_ids, key=lambda xy: (xy[0], xy[1]))
-    blobs = []
-    for core in prof_cores:
-      x, y = core
-      ctrl = [0] * 32
-      ctrl[12] = profiler_dram_addr
-      ctrl[14], ctrl[15] = x, y
-      ctrl[16] = profiler_flat_ids[core]
-      ctrl[17] = profiler_core_count_per_dram
-      blobs.append(struct.pack("<32I", *ctrl))
-    result.append(CQWritePacked(prof_cores, TensixL1.PROFILER_CONTROL, blobs))
-    result.append(CQWritePackedLarge(rects, TensixL1.PROFILER_CONTROL, b"\0" * (5 * 4)))
-  for i, (ir, profiled) in enumerate(programs):
-    if profiling and profiled:
-      base = TensixL1.PROFILER_CONTROL
-      result.append(CQWritePackedLarge(rects, base + 5 * 4, b"\0" * (5 * 4)))
-      result.append(CQWritePackedLarge(rects, base + 19 * 4, b"\0" * 4))
-    ts = 2 * i
-    if timestamps and ts + 1 < len(timestamps):
-      result.append(CQTimestamp(*timestamps[ts]))
-    result.extend(_lower_ir(ir, go_word))
-    if timestamps and ts + 1 < len(timestamps):
-      result.append(CQTimestamp(*timestamps[ts + 1]))
-  return result
 
 def slow_dispatch(win, commands: list[IRCommand]):
   for cmd in commands:

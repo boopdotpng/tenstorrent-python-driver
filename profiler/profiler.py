@@ -210,13 +210,37 @@ def _resolve_zone_names(programs_info):
     names.setdefault(h, name)
   return names
 
+def init_layout(cores, bank_count):
+  cores = sorted(cores, key=lambda xy: (xy[0], xy[1]))
+  core_count_per_dram = max(1, (len(cores) + bank_count - 1) // bank_count)
+  page_size = _HOST_BUF_BYTES_PER_RISC * 5 * core_count_per_dram
+  return {
+    "flat_ids": {core: i for i, core in enumerate(cores)},
+    "core_count_per_dram": core_count_per_dram,
+    "page_size": page_size,
+  }
+
+def build_programs_info(programs, device_cores):
+  result = []
+  for i, prog in enumerate(programs):
+    if not prog.profile: continue
+    sources = {}
+    if prog.reader_kernel: sources["reader"] = prog.reader_kernel
+    if prog.writer_kernel: sources["writer"] = prog.writer_kernel
+    if prog.compute_kernel: sources["compute"] = prog.compute_kernel
+    if prog.grid is not None:
+      rows, cols = prog.grid
+      cores = sorted([(x, y) for x in cols for y in rows], key=lambda c: (c[0], c[1]))
+    else:
+      cores = device_cores if prog.cores == "all" else device_cores[:prog.cores]
+    result.append({"index": i, "name": prog.name or None, "cores": cores, "sources": sources})
+  return result
+
 def collect(
   programs_info,
   raw_dram,
   ctrl_regs,
-  flat_ids,
-  page_size,
-  core_count_per_dram,
+  layout,
   harvested_dram_bank,
 ):
   program_ids = {info["index"] + 1 for info in programs_info}
@@ -229,6 +253,10 @@ def collect(
   # Parse all RISC data from DRAM, keyed by (core, prog_id)
   # core_data[core][prog_id] = list of (risc_name, fw, kern, kern_start, kern_end, zones)
   core_data = {}
+
+  flat_ids = layout["flat_ids"]
+  core_count_per_dram = layout["core_count_per_dram"]
+  page_size = layout["page_size"]
 
   for core in sorted(needed):
     flat_id = flat_ids[core]

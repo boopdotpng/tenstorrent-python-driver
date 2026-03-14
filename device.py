@@ -1,10 +1,11 @@
 import functools, os, struct, time
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 from hw import *
 from hw import _ioctl_set_power_state
 from dispatch import *
+from cq import *
 from dram import DramBuffer, Allocator, Shape, tilize, untilize, build_transfer_program
 
 _TS_STRIDE = 16
@@ -168,16 +169,23 @@ class Device:
     ncrisc_off = align_up(kernel_off + len(cq_kernels["dispatch_brisc"].xip), L1_ALIGN)
     disp_launch = self._build_cq_launch(kernel_off, ncrisc_off, sem_off=L1_ALIGN)
 
-    self._cq_hw.reset_run_state()
     self._upload_cq_core(
       self._PREFETCH_CORE, pref_img, pref_launch,
       [(kernel_off, cq_kernels["prefetch_brisc"].xip)],
     )
+    # init dispatch core L1 state before launching firmware
+    dwin = self._cq_hw._dispatch_win
+    dwin.target(self._DISPATCH_CORE)
+    base_16b = self._cq_hw._completion_base_16b
+    dwin.write32(CQ_COMPLETION_WR_PTR, base_16b)
+    dwin.write32(CQ_COMPLETION_RD_PTR, base_16b)
+    dwin.write32(CQ_COMPLETION_Q0_EVENT, 0)
+    dwin.write32(CQ_COMPLETION_Q1_EVENT, 0)
+    dwin.uc[CQ_DISPATCH_SYNC_SEM : CQ_DISPATCH_SYNC_SEM + 8 * L1_ALIGN] = b"\0" * (8 * L1_ALIGN)
     self._upload_cq_core(
       self._DISPATCH_CORE, disp_img, disp_launch,
       [(kernel_off, cq_kernels["dispatch_brisc"].xip),
        (ncrisc_off, cq_kernels["dispatch_s_ncrisc"].xip)],
-      init=self._init_dispatch_core_state,
     )
 
   @staticmethod
@@ -197,20 +205,9 @@ class Device:
     kc.min_remote_cb_start_index = FAST_CQ_NUM_CIRCULAR_BUFFERS
     return launch
 
-  def _init_dispatch_core_state(self, win: TLBWindow):
-    base_16b = self._cq_hw._completion_base_16b
-    win.write32(CQ_COMPLETION_WR_PTR, base_16b)
-    win.write32(CQ_COMPLETION_RD_PTR, base_16b)
-    win.write32(CQ_COMPLETION_Q0_EVENT, 0)
-    win.write32(CQ_COMPLETION_Q1_EVENT, 0)
-    win.uc[CQ_DISPATCH_SYNC_SEM : CQ_DISPATCH_SYNC_SEM + 8 * L1_ALIGN] = b"\0" * (8 * L1_ALIGN)
-
-  def _upload_cq_core(self, core: Core, img: bytes, launch: LaunchMsg,
-                      kernels: list[tuple[int, bytes]], init: Callable[[TLBWindow], None] | None = None):
+  def _upload_cq_core(self, core: Core, img: bytes, launch: LaunchMsg, kernels: list[tuple[int, bytes]]):
     win = self._cq_hw._prefetch_win if core == self._PREFETCH_CORE else self._cq_hw._dispatch_win
     win.target(core)
-    if init is not None:
-      init(win)
     win.write(TensixL1.KERNEL_CONFIG_BASE, img)
     for off, xip in kernels:
       win.write(TensixL1.KERNEL_CONFIG_BASE + off, xip)
