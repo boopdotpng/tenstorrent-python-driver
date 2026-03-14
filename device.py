@@ -34,11 +34,7 @@ class Device:
 
     self._init_dram_tiles()
     self.dram = Allocator(self.fd, self.dram_tiles)
-    # can't use (0,0) — noc_xy(0,0)=0 which the NOC treats as "local tile", so writes land in dispatch L1 instead of DRAM
-    _, x, y = next((b, x, y) for b, x, y in self.dram.bank_tiles if y != 0)
-    self._ts_noc_xy, self._ts_tile = noc_xy(x, y), (x, y)
-    self._ts_addr = self.dram.next
-    self.dram.next = align_up(self._ts_addr + _TS_MAX_SLOTS * _TS_STRIDE, Dram.ALIGNMENT)
+    self._init_timestamp_dram()
     self._dispatch_mode = DevMsgs.DISPATCH_MODE_HOST if USE_USB_DISPATCH else DevMsgs.DISPATCH_MODE_DEV
     self._use_fast_dispatch = not USE_USB_DISPATCH
 
@@ -119,18 +115,26 @@ class Device:
     all_cores = list(TileGrid.WORKER_CORES)
     bank_table = build_bank_noc_table(self.harvested_dram, all_cores)
 
+    rects = mcast_rects(all_cores)
     with TLBWindow(self.fd, start=all_cores[0]) as win:
-      for core in all_cores:
-        win.target(core, addr=mmio_base)
+      # assert soft reset on all cores via multicast
+      for x0, x1, y0, y1 in rects:
+        win.target((x0, y0), (x1, y1), addr=mmio_base)
         win.write32(reset_off, TensixMMIO.SOFT_RESET_ALL)
-        win.target(core, mode=NocOrdering.RELAXED)
+
+      # upload firmware segments + bootstrap to all cores via multicast
+      for x0, x1, y0, y1 in rects:
+        win.target((x0, y0), (x1, y1))
         for spans in staged.values():
           for addr, data in spans:
             win.write(addr, data)
         win.write(0, jal)
         win.write(TensixL1.GO_MSG, go_init)
         win.write(TensixL1.MEM_BANK_TO_NOC_SCRATCH, bank_table)
-        win.target(core, addr=mmio_base)
+
+      # set subordinate reset PCs on all cores via multicast
+      for x0, x1, y0, y1 in rects:
+        win.target((x0, y0), (x1, y1), addr=mmio_base)
         for reg, text_base in [
           (TensixMMIO.RISCV_DEBUG_REG_NCRISC_RESET_PC, fw["ncrisc"].text_base),
           (TensixMMIO.RISCV_DEBUG_REG_TRISC0_RESET_PC, fw["trisc0"].text_base),
@@ -139,9 +143,10 @@ class Device:
         ]:
           win.write32(reg - mmio_base, text_base)
 
-      for core in all_cores:
-        win.target(core, addr=mmio_base)
-        win.read32(reset_off)  # fence
+      # release BRISC from reset on all cores via multicast
+      # all prior writes used STRICT ordering, so data has landed on every core
+      for x0, x1, y0, y1 in rects:
+        win.target((x0, y0), (x1, y1), addr=mmio_base)
         win.write32(reset_off, TensixMMIO.SOFT_RESET_BRISC_ONLY_RUN)
 
       probe = (1, 2) if (1, 2) in all_cores else all_cores[0]
@@ -220,6 +225,23 @@ class Device:
     go.bits.master_x, go.bits.master_y = self._DISPATCH_CORE
     go.bits.dispatch_message_offset = 0
     return go.all
+
+  def _init_timestamp_dram(self):
+    _, x, y = next((b, x, y) for b, x, y in self.dram.bank_tiles if y != 0)
+    self._ts_noc_xy = noc_xy(x, y)
+    self._ts_bank_tile = (x, y)
+    self._ts_addr = self.dram.next
+    self.dram.next = align_up(self._ts_addr + _TS_MAX_SLOTS * _TS_STRIDE, Dram.ALIGNMENT)
+
+  def _ts_noc_dest(self, slot: int) -> tuple[int, int]:
+    return self._ts_noc_xy, self._ts_addr + slot * _TS_STRIDE
+
+  def _read_ts_slot(self, slot: int) -> int:
+    self.dram.win.target(self._ts_bank_tile, mode=NocOrdering.RELAXED)
+    addr = self._ts_addr + slot * _TS_STRIDE
+    lo = self.dram.win.read32(addr)
+    hi = self.dram.win.read32(addr + 4)
+    return (hi << 32) | lo
 
   def _init_profiler_dram(self):
     cores = sorted(self.cores, key=lambda xy: (xy[0], xy[1]))
@@ -358,7 +380,7 @@ class Device:
 
     timestamps = None
     if timing:
-      timestamps = [(self._ts_noc_xy, self._ts_addr + s * _TS_STRIDE) for s in range(min(2 * n, _TS_MAX_SLOTS))]
+      timestamps = [self._ts_noc_dest(s) for s in range(min(2 * n, _TS_MAX_SLOTS))]
 
     self.cq.extend(lower_fast(
       programs, self._go_word(), self.cores,
@@ -392,14 +414,15 @@ class Device:
 
   def _collect_timing_data(self, n: int) -> list[dict]:
     self.dram.barrier()
-    self.dram.win.target(self._ts_tile, mode=NocOrdering.RELAXED)
-    def _read_ts(slot: int) -> int:
-      addr = self._ts_addr + slot * _TS_STRIDE
-      return (self.dram.win.read32(addr + 4) << 32) | self.dram.win.read32(addr)
     freq_mhz = 1350
     timings = []
-    for i in range(min(n, _TS_MAX_SLOTS // 2)):
-      cycles = _read_ts(2 * i + 1) - _read_ts(2 * i)
+    for i in range(n):
+      ts_slot = 2 * i
+      if ts_slot + 1 >= _TS_MAX_SLOTS:
+        break
+      t0 = self._read_ts_slot(ts_slot)
+      t1 = self._read_ts_slot(ts_slot + 1)
+      cycles = t1 - t0
       timings.append({"cycles": cycles, "us": cycles / freq_mhz, "freq_mhz": freq_mhz})
     for i, t in enumerate(timings):
       print(f"  [{i}] {t['us']:.1f} us ({t['cycles']} cycles)")
