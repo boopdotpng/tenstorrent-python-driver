@@ -5,7 +5,7 @@ import numpy as np
 
 from hw import *
 from dispatch import *
-from kernels import TILIZE_READER, TILIZE_COMPUTE, TILIZE_WRITER, UNTILIZE_READER, UNTILIZE_COMPUTE, UNTILIZE_WRITER
+from kernels import tilize_reader, TILIZE_COMPUTE, tilize_writer, untilize_reader, UNTILIZE_COMPUTE, untilize_writer
 
 Shape = tuple[int, ...]
 TILE_R, TILE_C, FACE_R, FACE_C = 32, 32, 16, 16
@@ -69,13 +69,8 @@ def build_transfer_program(
   tpc = (total_tiles + n - 1) // n
 
   pcie_base = (Sysmem.PCIE_NOC_XY << 36) | (1 << 60) | (sysmem_noc_addr & ((1 << 36) - 1))
-  sysmem_defs = (
-    f"#define PCIE_BASE 0x{pcie_base:x}ULL\n"
-    f"#define TILE_ROW_BYTES {TILE_C * buf.dtype.bpe}\n"
-    f"#define TILE_COLS {tile_cols}\n"
-    f"#define ROW_BYTES {cols * buf.dtype.bpe}\n"
-  )
-  dram_defs = f"#define DRAM_ADDR {buf.addr}\n"
+  tile_row_bytes = TILE_C * buf.dtype.bpe
+  row_bytes = cols * buf.dtype.bpe
 
   def tile_args(ci, _xy, _n):
     start = ci * tpc
@@ -85,11 +80,13 @@ def build_transfer_program(
     return [min(tpc, total_tiles - start) if start < total_tiles else 0]
 
   if direction == "tilize":
-    rk, wk, ck = sysmem_defs + TILIZE_READER, dram_defs + TILIZE_WRITER, TILIZE_COMPUTE
-    name = "dram_fill_tilize"
+    rk = tilize_reader(pcie_base, tile_row_bytes, tile_cols, row_bytes)
+    wk = tilize_writer(buf.addr)
+    ck, name = TILIZE_COMPUTE, "dram_fill_tilize"
   else:
-    rk, wk, ck = dram_defs + UNTILIZE_READER, sysmem_defs + UNTILIZE_WRITER, UNTILIZE_COMPUTE
-    name = "dram_drain_untilize"
+    rk = untilize_reader(buf.addr)
+    wk = untilize_writer(pcie_base, tile_row_bytes, tile_cols, row_bytes)
+    ck, name = UNTILIZE_COMPUTE, "dram_drain_untilize"
 
   return Program(
     cores=n, name=name, reader_kernel=rk, compute_kernel=ck, writer_kernel=wk,

@@ -1,9 +1,22 @@
-# Inline kernel sources for tilize/untilize data transfer programs.
-# Defines injected at build time: PCIE_BASE, TILE_ROW_BYTES, TILE_COLS, ROW_BYTES, DRAM_ADDR
+# Kernel sources for tilize/untilize data transfer programs.
+# Each function returns a complete C++ source string with all defines baked in.
 
-TILIZE_READER = """\
+_A = '#define A(n) get_arg_val<uint32_t>(n)\n'
+
+def _sysmem_defs(pcie_base: int, tile_row_bytes: int, tile_cols: int, row_bytes: int) -> str:
+  return (
+    f"#define PCIE_BASE 0x{pcie_base:x}ULL\n"
+    f"#define TILE_ROW_BYTES {tile_row_bytes}\n"
+    f"#define TILE_COLS {tile_cols}\n"
+    f"#define ROW_BYTES {row_bytes}\n"
+  )
+
+def _dram_defs(dram_addr: int) -> str:
+  return f"#define DRAM_ADDR {dram_addr}\n"
+
+def tilize_reader(pcie_base: int, tile_row_bytes: int, tile_cols: int, row_bytes: int) -> str:
+  return _sysmem_defs(pcie_base, tile_row_bytes, tile_cols, row_bytes) + _A + """\
 #include <cstdint>
-#define A(n) get_arg_val<uint32_t>(n)
 
 void kernel_main() {
   for (uint32_t t = 0; t < A(1); ++t) {
@@ -43,9 +56,9 @@ void MAIN {
 }  // namespace NAMESPACE
 """
 
-TILIZE_WRITER = """\
+def tilize_writer(dram_addr: int) -> str:
+  return _dram_defs(dram_addr) + _A + """\
 #include <cstdint>
-#define A(n) get_arg_val<uint32_t>(n)
 
 void kernel_main() {
   const InterleavedAddrGenFast<true> dram = {
@@ -62,9 +75,9 @@ void kernel_main() {
 }
 """
 
-UNTILIZE_READER = """\
+def untilize_reader(dram_addr: int) -> str:
+  return _dram_defs(dram_addr) + _A + """\
 #include <cstdint>
-#define A(n) get_arg_val<uint32_t>(n)
 
 void kernel_main() {
   const InterleavedAddrGenFast<true> dram = {
@@ -102,9 +115,9 @@ void MAIN {
 }  // namespace NAMESPACE
 """
 
-UNTILIZE_WRITER = """\
+def untilize_writer(pcie_base: int, tile_row_bytes: int, tile_cols: int, row_bytes: int) -> str:
+  return _sysmem_defs(pcie_base, tile_row_bytes, tile_cols, row_bytes) + _A + """\
 #include <cstdint>
-#define A(n) get_arg_val<uint32_t>(n)
 
 void kernel_main() {
   for (uint32_t t = 0; t < A(1); ++t) {
