@@ -7,7 +7,6 @@ from hw import _ioctl_set_power_state
 from dispatch import *
 from dram import DramBuffer, Allocator, Shape, tilize, untilize, build_transfer_program
 
-_TS_PAGE_SIZE = 64
 _TS_STRIDE = 16
 _TS_MAX_SLOTS = 512
 
@@ -35,7 +34,11 @@ class Device:
 
     self._init_dram_tiles()
     self.dram = Allocator(self.fd, self.dram_tiles)
-    self._init_timestamp_dram()
+    # can't use (0,0) — noc_xy(0,0)=0 which the NOC treats as "local tile", so writes land in dispatch L1 instead of DRAM
+    _, x, y = next((b, x, y) for b, x, y in self.dram.bank_tiles if y != 0)
+    self._ts_noc_xy, self._ts_tile = noc_xy(x, y), (x, y)
+    self._ts_addr = self.dram.next
+    self.dram.next = align_up(self._ts_addr + _TS_MAX_SLOTS * _TS_STRIDE, Dram.ALIGNMENT)
     self._dispatch_mode = DevMsgs.DISPATCH_MODE_HOST if USE_USB_DISPATCH else DevMsgs.DISPATCH_MODE_DEV
     self._use_fast_dispatch = not USE_USB_DISPATCH
 
@@ -218,41 +221,6 @@ class Device:
     go.bits.dispatch_message_offset = 0
     return go.all
 
-  def _init_timestamp_dram(self):
-    self._ts_bank_tiles = list(self.dram.bank_tiles)
-    self._ts_bank_count = len(self._ts_bank_tiles)
-    self._ts_slots_per_page = _TS_PAGE_SIZE // _TS_STRIDE
-    self._ts_active_bank_indices = [i for i, (_, _, y) in enumerate(self._ts_bank_tiles) if y != 0]
-    if not self._ts_active_bank_indices:
-      self._ts_active_bank_indices = list(range(self._ts_bank_count))
-    ts_pages = (_TS_MAX_SLOTS + self._ts_slots_per_page - 1) // self._ts_slots_per_page
-    ts_local_pages = (ts_pages + len(self._ts_active_bank_indices) - 1) // len(self._ts_active_bank_indices)
-    ts_addr = self.dram.next
-    self.dram.next = align_up(ts_addr + ts_local_pages * _TS_PAGE_SIZE, Dram.ALIGNMENT)
-    self._ts_addr = ts_addr
-
-  def _ts_slot_layout(self, slot: int) -> tuple[int, int, int]:
-    page = slot // self._ts_slots_per_page
-    within_page = (slot % self._ts_slots_per_page) * _TS_STRIDE
-    active_bank_pos = page % len(self._ts_active_bank_indices)
-    bank_idx = self._ts_active_bank_indices[active_bank_pos]
-    local_page = page // len(self._ts_active_bank_indices)
-    return bank_idx, local_page, within_page
-
-  def _ts_noc_dest(self, slot: int) -> tuple[int, int]:
-    bank_idx, local_page, within_page = self._ts_slot_layout(slot)
-    _, x, y = self._ts_bank_tiles[bank_idx]
-    return noc_xy(x, y), self._ts_addr + local_page * _TS_PAGE_SIZE + within_page
-
-  def _read_ts_slot(self, slot: int) -> int:
-    bank_idx, local_page, within_page = self._ts_slot_layout(slot)
-    _, x, y = self._ts_bank_tiles[bank_idx]
-    self.dram.win.target((x, y), mode=NocOrdering.RELAXED)
-    addr = self._ts_addr + local_page * _TS_PAGE_SIZE + within_page
-    lo = self.dram.win.read32(addr)
-    hi = self.dram.win.read32(addr + 4)
-    return (hi << 32) | lo
-
   def _init_profiler_dram(self):
     cores = sorted(self.cores, key=lambda xy: (xy[0], xy[1]))
     self._profiler_flat_ids = {core: i for i, core in enumerate(cores)}
@@ -390,7 +358,7 @@ class Device:
 
     timestamps = None
     if timing:
-      timestamps = [self._ts_noc_dest(s) for s in range(min(2 * n, _TS_MAX_SLOTS))]
+      timestamps = [(self._ts_noc_xy, self._ts_addr + s * _TS_STRIDE) for s in range(min(2 * n, _TS_MAX_SLOTS))]
 
     self.cq.extend(lower_fast(
       programs, self._go_word(), self.cores,
@@ -424,15 +392,14 @@ class Device:
 
   def _collect_timing_data(self, n: int) -> list[dict]:
     self.dram.barrier()
+    self.dram.win.target(self._ts_tile, mode=NocOrdering.RELAXED)
+    def _read_ts(slot: int) -> int:
+      addr = self._ts_addr + slot * _TS_STRIDE
+      return (self.dram.win.read32(addr + 4) << 32) | self.dram.win.read32(addr)
     freq_mhz = 1350
     timings = []
-    for i in range(n):
-      ts_slot = 2 * i
-      if ts_slot + 1 >= _TS_MAX_SLOTS:
-        break
-      t0 = self._read_ts_slot(ts_slot)
-      t1 = self._read_ts_slot(ts_slot + 1)
-      cycles = t1 - t0
+    for i in range(min(n, _TS_MAX_SLOTS // 2)):
+      cycles = _read_ts(2 * i + 1) - _read_ts(2 * i)
       timings.append({"cycles": cycles, "us": cycles / freq_mhz, "freq_mhz": freq_mhz})
     for i, t in enumerate(timings):
       print(f"  [{i}] {t['us']:.1f} us ({t['cycles']} cycles)")
