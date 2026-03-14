@@ -25,8 +25,10 @@ body{background:#111;color:#ccc;font:14px/1.4 'SF Mono',Menlo,monospace;display:
 .cell.active rect:hover{stroke:#fff;stroke-width:2}
 .cell.active rect.selected{stroke:#4af;stroke-width:2}
 .cell text{pointer-events:none;font-family:'SF Mono',Menlo,monospace;font-size:11px;font-weight:600;fill:rgba(0,0,0,.75)}
-#dock{background:#1a1a1a;border-top:1px solid #333;height:0;overflow:hidden;transition:height .15s ease;flex-shrink:0}
-#dock.open{height:220px;overflow-y:auto}
+#dock{background:#1a1a1a;border-top:1px solid #333;height:0;overflow:hidden;transition:height .15s ease;flex-shrink:0;position:relative}
+#dock.open{overflow-y:auto}
+#dock-drag{position:absolute;left:0;right:0;top:-3px;height:6px;cursor:row-resize;z-index:10}
+#dock-drag:hover{background:rgba(74,136,255,.3)}
 #dock-inner{padding:10px 16px;display:flex;gap:16px;align-items:start}
 #dock-content{flex:1;min-width:0}
 .dock-close{border:1px solid #444;background:#222;color:#aaa;border-radius:3px;padding:1px 7px;cursor:pointer;font:12px/1.2 inherit;flex-shrink:0;align-self:start}
@@ -66,7 +68,7 @@ pre.src code{font-size:12px;line-height:1.4;padding:10px!important;display:block
   <div id="stats-bar"></div>
   <div id="grid-wrap"><svg id="grid-svg"></svg></div>
   <button id="code-toggle">code</button>
-  <div id="dock"><div id="dock-inner">
+  <div id="dock"><div id="dock-drag"></div><div id="dock-inner">
     <div id="dock-content"><div id="dock-tables"></div><div id="dock-warn"></div></div>
     <button class="dock-close" id="dock-close-btn">&times;</button>
   </div></div>
@@ -95,7 +97,7 @@ for (const t of DRAM_TILES) for (const y of t.ys) DRAM_MAP.set(`${t.x},${y}`, t)
 const PCIE_TILES = new Set(['2,0','11,0']);
 const ARC_TILE = '8,0';
 
-let D, selProg=0, selCore=null, rpanelWidth=500, rpanelOpen=false;
+let D, selProg=0, selCore=null, rpanelWidth=500, rpanelOpen=false, dockHeight=220;
 
 fetch('/api/data').then(r=>r.json()).then(d=>{ D=d; init() });
 
@@ -105,6 +107,7 @@ function init(){
   d3.select('#rpanel-close-btn').on('click', closePanel);
   d3.select('#code-toggle').on('click', ()=>{ openPanel(); showSources(); });
   initPanelDrag();
+  initDockDrag();
   selectProgram(0);
 }
 
@@ -136,7 +139,9 @@ function buildSidebar(){
 function selectProgram(idx){
   selProg=idx; selCore=null;
   d3.selectAll('.prog-btn').classed('active', (_,i)=> i===idx);
-  d3.select('#dock').classed('open', false);
+  const dock = document.getElementById('dock');
+  dock.classList.remove('open');
+  dock.style.height = '0';
   buildGrid();
   updateStats();
   showSources();
@@ -244,18 +249,37 @@ function selectCore(key){
 function clearSelection(){
   selCore = null;
   d3.selectAll('.cell rect').classed('selected', false);
-  d3.select('#dock').classed('open', false);
+  const dock = document.getElementById('dock');
+  dock.classList.remove('open');
+  dock.style.height = '0';
   showSources();
 }
 
+// --- role helpers (4-role grid) ---
+function coreRole(key){
+  const prog = D.programs[selProg];
+  if (!prog.profiles[key] || !prog.profiles[key].sources) return null;
+  const xs = new Set(prog.cores.map(c=>c[0])), ys = new Set(prog.cores.map(c=>c[1]));
+  const minX = Math.min(...xs), minY = Math.min(...ys);
+  const [x, y] = key.split(',').map(Number);
+  return {readerSender: x === minX, writerSender: y === minY};
+}
+
 // --- zone helpers ---
-function sourceOrder(prog){
+function activeSources(key){
+  const prog = D.programs[selProg];
+  if (key && prog.profiles && prog.profiles[key] && prog.profiles[key].sources)
+    return prog.profiles[key].sources;
+  return prog.sources;
+}
+
+function sourceOrder(srcs){
   const ordered = ['reader','compute','writer'];
-  const all = [...ordered.filter(k=>prog.sources&&prog.sources[k]), ...Object.keys(prog.sources||{}).filter(k=>!ordered.includes(k))];
+  const all = [...ordered.filter(k=>srcs&&srcs[k]), ...Object.keys(srcs||{}).filter(k=>!ordered.includes(k))];
   const order = {};
   let idx = 0;
   for (const label of all) {
-    const src = prog.sources[label];
+    const src = srcs[label];
     if (!src) continue;
     const re = /DeviceZoneScopedN\s*\(\s*"([^"]+)"/g;
     let m;
@@ -275,7 +299,7 @@ function getCoreZones(key){
       zones.push({name, risc: r.name, ...stats});
     }
   }
-  const order = sourceOrder(prog);
+  const order = sourceOrder(activeSources(key));
   zones.sort((a,b) => (order[a.name]??999) - (order[b.name]??999));
   zones.forEach((z,i) => z.color = ZONE_COLORS[i % ZONE_COLORS.length]);
   return zones;
@@ -300,11 +324,14 @@ function getZoneAvgs(){
 // --- bottom dock (per-core RISC + zone tables) ---
 function showDock(key){
   const prog = D.programs[selProg], p = prog.profiles[key];
-  if(!p){ d3.select('#dock').classed('open',false); return }
+  if(!p){ const dk=document.getElementById('dock'); dk.classList.remove('open'); dk.style.height='0'; return }
   const riscOrder = { BRISC: 0, TRISC0: 1, TRISC1: 2, TRISC2: 3, NCRISC: 4 };
   const riscs = [...p.riscs].sort((a, b) => (riscOrder[a.name] ?? 99) - (riscOrder[b.name] ?? 99));
 
-  let h = `<div style="color:#aaa;font-size:11px;margin-bottom:4px">Core wall time: <b style="color:#fff">${fmtUs(p.total)}</b> (${fmtCyc(p.total)} cycles)</div>`;
+  const role = coreRole(key);
+  const roleStr = role ? `reader ${role.readerSender ? 'sender' : 'recv'} · writer ${role.writerSender ? 'sender' : 'recv'}` : '';
+  const roleTag = roleStr ? `<span style="color:#666;font-size:10px;margin-left:8px">${roleStr}</span>` : '';
+  let h = `<div style="color:#aaa;font-size:11px;margin-bottom:4px">Core (${key}) wall time: <b style="color:#fff">${fmtUs(p.total)}</b> (${fmtCyc(p.total)} cycles)${roleTag}</div>`;
   h += `<div style="color:#666;font-size:10px;margin-bottom:6px">Per-RISC times are total runtimes (RISCs execute in parallel)</div>`;
   h += `<table class="prof"><tr><th>RISC</th><th>FW</th><th>Kernel</th></tr>`;
   for (const r of riscs) {
@@ -328,7 +355,9 @@ function showDock(key){
   }
   d3.select('#dock-tables').html(h);
   d3.select('#dock-warn').html('');
-  d3.select('#dock').classed('open', true);
+  const dock = document.getElementById('dock');
+  dock.style.height = dockHeight + 'px';
+  dock.classList.add('open');
 }
 
 // --- right panel (source code with scope highlighting) ---
@@ -366,9 +395,31 @@ function initPanelDrag(){
   });
 }
 
-function getZoneColors(){
-  const prog = D.programs[selProg];
-  const order = sourceOrder(prog);
+function initDockDrag(){
+  const drag = document.getElementById('dock-drag');
+  const dock = document.getElementById('dock');
+  let startY, startH;
+  drag.addEventListener('mousedown', e=>{
+    e.preventDefault();
+    startY = e.clientY; startH = dock.offsetHeight;
+    dock.style.transition = 'none';
+    const onMove = e2 => {
+      const h = Math.max(100, Math.min(600, startH + (startY - e2.clientY)));
+      dock.style.height = h + 'px';
+      dockHeight = h;
+    };
+    const onUp = () => {
+      dock.style.transition = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function getZoneColors(srcs){
+  const order = sourceOrder(srcs);
   const colors = {};
   for (const [name, idx] of Object.entries(order))
     colors[name] = ZONE_COLORS[idx % ZONE_COLORS.length];
@@ -399,8 +450,9 @@ function findZoneScopes(src){
 
 function showSources(){
   const prog = D.programs[selProg];
+  const srcs = activeSources(selCore);
   const el = d3.select('#source-panel');
-  if(!prog.sources || !Object.keys(prog.sources).length){
+  if(!srcs || !Object.keys(srcs).length){
     el.style('display','none');
     if (rpanelOpen) closePanel();
     d3.select('#code-toggle').style('display','none');
@@ -410,8 +462,8 @@ function showSources(){
   if (!rpanelOpen) d3.select('#code-toggle').style('display','block');
 
   const ordered = ['reader','compute','writer'];
-  const all = [...ordered.filter(k=>prog.sources[k]), ...Object.keys(prog.sources).filter(k=>!ordered.includes(k))];
-  const colors = getZoneColors();
+  const all = [...ordered.filter(k=>srcs[k]), ...Object.keys(srcs).filter(k=>!ordered.includes(k))];
+  const colors = getZoneColors(srcs);
   const zoneByName = {};
   if (selCore && prog.profiles && prog.profiles[selCore]) {
     for (const z of getCoreZones(selCore)) {
@@ -435,14 +487,14 @@ function showSources(){
 
   let h = '';
   for (const label of all)
-    h += `<h4>${label}</h4><pre class="src"><code class="language-cpp">${esc(prog.sources[label])}</code></pre>`;
+    h += `<h4>${label}</h4><pre class="src"><code class="language-cpp">${esc(srcs[label])}</code></pre>`;
   el.html(h).style('display','block');
 
   el.selectAll('code.language-cpp').each(function(){ hljs.highlightElement(this) });
 
   el.selectAll('pre.src').each(function(_, preIdx) {
     const pre = d3.select(this), code = pre.select('code');
-    const rawSrc = prog.sources[all[preIdx]];
+    const rawSrc = srcs[all[preIdx]];
     const scopes = findZoneScopes(rawSrc);
     const htmlLines = code.html().split('\n');
     const declMap = {};

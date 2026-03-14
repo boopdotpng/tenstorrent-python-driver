@@ -260,12 +260,27 @@ class Device:
       if prog.reader_kernel: sources["reader"] = prog.reader_kernel
       if prog.writer_kernel: sources["writer"] = prog.writer_kernel
       if prog.compute_kernel: sources["compute"] = prog.compute_kernel
+      core_sources = None
       if prog.grid is not None:
         rows, cols = prog.grid
         cores = sorted([(x, y) for x in cols for y in rows], key=lambda c: (c[0], c[1]))
+        if prog.reader_recv_kernel or prog.writer_recv_kernel:
+          core_sources = {}
+          for core in cores:
+            cs = {}
+            if prog.compute_kernel: cs["compute"] = prog.compute_kernel
+            c_idx = list(cols).index(core[0])
+            r_idx = list(rows).index(core[1])
+            reader_src = prog.reader_kernel if c_idx == 0 else (prog.reader_recv_kernel or prog.reader_kernel)
+            writer_src = prog.writer_kernel if r_idx == 0 else (prog.writer_recv_kernel or prog.writer_kernel)
+            if reader_src: cs["reader"] = reader_src
+            if writer_src: cs["writer"] = writer_src
+            core_sources[f"{core[0]},{core[1]}"] = cs
       else:
         cores = self.cores if prog.cores == "all" else self.cores[:prog.cores]
-      programs_info.append({"index": i, "name": prog.name or None, "cores": cores, "sources": sources})
+      info = {"index": i, "name": prog.name or None, "cores": cores, "sources": sources}
+      if core_sources is not None: info["core_sources"] = core_sources
+      programs_info.append(info)
     if not programs_info: return
     self.dram.barrier()
     needed = sorted({c for info in programs_info for c in info["cores"]})
@@ -278,9 +293,8 @@ class Device:
       programs_info,
       self.dram.read_raw_bank_pages(self._profiler_dram_addr, self._profiler_page_size),
       ctrl_regs,
-      flat_ids=self._profiler_flat_ids,
-      page_size=self._profiler_page_size,
-      core_count_per_dram=self._profiler_core_count_per_dram,
+      layout={"flat_ids": self._profiler_flat_ids, "page_size": self._profiler_page_size,
+              "core_count_per_dram": self._profiler_core_count_per_dram},
       harvested_dram_bank=self.harvested_dram,
     )
     profiler.print_summary(self.last_profile)

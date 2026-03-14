@@ -2,40 +2,31 @@
 
 A minimal Python driver for the Tenstorrent Blackhole accelerator. Compiles and dispatches RISC-V kernels directly from Python — no TT-Metal runtime required.
 
-> **~7k lines of code** — the entire driver, compiler, firmware, and dispatch stack. TT-Metal's equivalent is ~290k.
+> **~4k lines of code** — the entire driver, compiler, firmware, and dispatch stack. TT-Metal's `tt_metal/` directory alone is ~430k lines of C++.
 
-### Matmul
-
-```python
-from device import Device, Dtype, MathFidelity
-from ops import plan_matmul, MatmulProgram
-
-device = Device()
-M, K, N = 4096, 4096, 4096
-
-plan = plan_matmul(M, K, N, device.cores)
-a_buf = device.alloc_write(a_bytes, Dtype.Float16_b, (M, K), "A")
-b_buf = device.alloc_write(b_bytes, Dtype.Float16_b, (K, N), "B")
-c_buf = device.alloc(plan.mt * plan.nt, Dtype.Float16_b, "C", (M, N))
-
-device.queue(MatmulProgram(plan, a_buf, b_buf, c_buf, Dtype.Float16_b, MathFidelity.HiFi2))
-device.run()
-```
-
-```sh
-PYTHONPATH=. uv run examples/matmul_peak.py
-```
-
-### Requirements
-
-- **Hardware**: Blackhole P100A only (P150A is untested)
-- **Kernel driver**: tt-kmd >= 2.6.0
-- **Firmware**: any version < 15
-- **Python**: 3.10+, numpy
+Does not support P150A or multi-chip / distributed yet.
 
 ### Setup
 
-Run `./setup-deps.sh` to download the SFPI compiler toolchain and TT-Metal headers.
+```sh
+./setup-deps.sh   # downloads SFPI compiler toolchain + TT-Metal headers
+```
+
+### Matmul
+
+```sh
+PYTHONPATH=. uv run examples/matmul_peak.py 4096 4096 4096
+```
+
+### Profiler
+
+Set `PROFILE=1` to capture per-core, per-RISC cycle-level traces. After the run, the profiler serves a web UI at `localhost:8000` with a core heatmap grid, per-RISC timing breakdowns, zone analysis, and annotated kernel source.
+
+```sh
+PYTHONPATH=. PROFILE=1 uv run examples/matmul_peak.py
+```
+
+<p align="center"><img src="docs/profiler.png" alt="profiler" width="100%"></p>
 
 ### Dispatch modes
 
@@ -44,4 +35,12 @@ PYTHONPATH=. uv run examples/matmul_peak.py              # fast dispatch (on-dev
 PYTHONPATH=. TT_USB=1 uv run examples/matmul_peak.py     # slow dispatch (over UT3G USB adapter)
 ```
 
-Fast dispatch uses on-device command queues. Slow dispatch (`TT_USB=1`) drives the chip over the UT3G USB-C adapter via host TLB writes.
+Fast dispatch uses on-device command queues (prefetch + dispatch cores). Slow dispatch (`TT_USB=1`) drives the chip over the UT3G USB-C adapter via host TLB writes.
+
+### Requirements
+
+- **Hardware**: Blackhole P100A only
+- **Kernel driver**: tt-kmd >= 2.6.0
+- **Firmware**: < 19.5
+- **Python**: 3.10+, numpy
+

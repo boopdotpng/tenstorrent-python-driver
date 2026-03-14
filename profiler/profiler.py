@@ -291,6 +291,7 @@ def collect(
   programs = []
   for info in programs_info:
     prog_id = info["index"] + 1
+    core_sources = info.get("core_sources", {})
     profiles = {}
     for core in info["cores"]:
       by_prog = core_data.get(core, {})
@@ -332,7 +333,11 @@ def collect(
         }
         for r in riscs
       ]
-      profiles[f"{core[0]},{core[1]}"] = {"total": total, "riscs": out_riscs}
+      core_key = f"{core[0]},{core[1]}"
+      entry = {"total": total, "riscs": out_riscs}
+      if core_key in core_sources:
+        entry["sources"] = core_sources[core_key]
+      profiles[core_key] = entry
 
     programs.append(
       {
